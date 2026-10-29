@@ -1,11 +1,16 @@
 #pragma once
 #include "weights.h"
+#include "audio_config.h"
 namespace tts {
 struct EncoderConv {
     TensorView weight, bias;
-    int in, out, kernel, stride;
+    int in, out, kernel, stride, dilation;
     bool replicate;
-    EncoderConv(Weights &, const std::string &, int stride = 1, bool replicate = false);
+    EncoderConv(Weights &, const std::string &, int stride = 1, bool replicate = false,
+                int dilation = 1);
+    int rows(int input) const {
+        return input / stride + (input % stride != 0);
+    }
     void run(Backend &, TensorView x, TensorView projected, TensorView out, bool elu = false,
              TensorView residual = {}) const;
 };
@@ -13,11 +18,19 @@ class AudioEncoder {
     struct Layer {
         TensorView pre, pre_bias, post, post_bias, qkv, out, fc1, fc2, attn_scale, mlp_scale;
     };
-    struct Stage {
-        EncoderConv first, second, down;
-        Stage(Weights &, int index, int ratio);
+    struct Residual {
+        EncoderConv first, second;
+        Residual(Weights &, int index, int dilation);
     };
-    EncoderConv first_, last_, downsample_;
+    struct Stage {
+        std::vector<Residual> blocks;
+        EncoderConv down;
+        Stage(Weights &, int index, int ratio, const EncoderConfig &);
+    };
+    struct Storage;
+    EncoderConfig config_;
+    EncoderConv first_, last_;
+    std::unique_ptr<EncoderConv> downsample_;
     std::vector<Stage> stages_;
     std::vector<Layer> layers_;
     TensorView semantic_proj_, acoustic_proj_;
@@ -26,8 +39,8 @@ class AudioEncoder {
     TensorView rope_;
 
   public:
-    AudioEncoder(Weights &, int max_positions);
-    static size_t workspace_bytes(int max_samples);
+    AudioEncoder(Weights &, EncoderConfig);
+    size_t workspace_bytes(int max_samples) const;
     std::vector<int> encode(Backend &, BufferAllocator &, const std::vector<float> &mono) const;
 };
 } // namespace tts

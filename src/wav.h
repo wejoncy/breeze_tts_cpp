@@ -6,7 +6,10 @@
 #include <string>
 #include <vector>
 namespace tts {
-inline void write_wav(const std::string &path, const std::vector<int16_t> &samples) {
+inline void write_wav(const std::string &path, const std::vector<int16_t> &samples,
+                      int sample_rate) {
+    if (sample_rate <= 0 || sample_rate > INT32_MAX / 2)
+        throw std::invalid_argument("invalid WAV sample rate");
     if (samples.size() > (UINT32_MAX - 36) / 2)
         throw std::runtime_error("WAV exceeds RIFF limit");
     std::ofstream out(std::filesystem::u8path(path), std::ios::binary);
@@ -26,8 +29,8 @@ inline void write_wav(const std::string &path, const std::vector<int16_t> &sampl
     u32(16);
     u16(1);
     u16(1);
-    u32(24000);
-    u32(48000);
+    u32(sample_rate);
+    u32(sample_rate * sizeof(int16_t));
     u16(2);
     u16(16);
     out.write("data", 4);

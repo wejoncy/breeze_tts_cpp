@@ -16,8 +16,12 @@ def resolve_model_dir(model, revision=None):
 
 def model_info(model):
     model = Path(model)
-    config = json.loads((model / "config.json").read_text())
-    names = {"config.json"}
+    audio = json.loads((model / "audio_tokenizer/config.json").read_text())
+    names = {
+        "config.json",
+        "audio_tokenizer/config.json",
+        "audio_tokenizer/model.safetensors",
+    }
     index = model / "model.safetensors.index.json"
     if index.exists():
         names.add(index.name)
@@ -38,8 +42,8 @@ def model_info(model):
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 digest.update(block)
     return dict(
-        frame_rate=float(config["codec_config"]["_frame_rate"]),
+        frame_rate=audio["output_sample_rate"] / audio["decode_upsample_rate"],
         model_digest=digest.hexdigest(),
-        max_new_tokens=1500,
+        max_new_tokens=audio["decoder_config"]["max_position_embeddings"],
         max_batch_texts=128,
     )

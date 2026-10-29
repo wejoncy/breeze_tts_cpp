@@ -9,11 +9,11 @@ PreparedBatch prepare_batch(const Tokenizer &tokenizer, const ModelConfig &model
     int batch = int(requests.size());
     if (batch < 1 || batch > max_batch)
         throw std::invalid_argument("batch size outside configured limit");
-    auto valid_sampling = [](float temperature, int k, float p) {
-        return std::isfinite(temperature) && temperature >= 0 && k >= 0 && k <= 2048 &&
-               std::isfinite(p) && p > 0 && p <= 1;
+    auto valid_sampling = [&](float temperature, int k, float p) {
+        return std::isfinite(temperature) && temperature >= 0 && k >= 0 &&
+               k <= model.codec.codebook_size && std::isfinite(p) && p > 0 && p <= 1;
     };
-    if (opt.max_frames < 1 || opt.max_frames > std::min(2000, model.codec.max_positions) ||
+    if (opt.max_frames < 1 || opt.max_frames > model.codec.transformer.max_positions ||
         !valid_sampling(opt.temperature, opt.top_k, opt.top_p) ||
         !valid_sampling(opt.depth_temperature, opt.depth_top_k, opt.depth_top_p) ||
         !std::isfinite(opt.cfg_scale) || opt.cfg_scale <= 0 || !std::isfinite(opt.cfg_scale_ref) ||
@@ -48,19 +48,28 @@ PreparedBatch prepare_batch(const Tokenizer &tokenizer, const ModelConfig &model
             if (req.reference && (branches != 3 || branch == 1)) {
                 check_text(req.reference->text, 65536, "reference transcript");
                 if (req.reference->text.empty() || req.reference->codes.empty() ||
-                    req.reference->codes.size() % model.codebooks)
+                    req.reference->codes.size() % model.codebooks ||
+                    req.reference->codebooks != model.codebooks ||
+                    req.reference->codebook_size != model.codec.codebook_size)
                     throw std::invalid_argument(
                         "reference requires transcript and complete audio frames");
                 for (int code : req.reference->codes)
-                    if (code < 0 || code >= 2048)
+                    if (code < 0 || code >= model.codec.codebook_size)
                         throw std::invalid_argument("invalid reference code");
                 p.reference = req.reference;
                 p.reference_text = tokenizer.encode(prefix + req.reference->text);
                 has_reference = true;
             }
             p.target = tokenizer.encode(
-                prefix + (use_instruction ? "<ins_bos>" + req.instruction + "<ins_eos>" : "") +
+                prefix +
+                (use_instruction ? model.instruction_bos + req.instruction + model.instruction_eos
+                                 : "") +
                 req.text);
+            for (const auto *ids : {&p.reference_text, &p.target})
+                for (int id : *ids)
+                    if (id < 0 || id >= model.text_vocab)
+                        throw std::invalid_argument(
+                            "tokenizer ID exceeds the text embedding vocabulary");
             if (p.length(model.codebooks) + opt.max_frames > context)
                 throw std::invalid_argument("prompt plus max_frames exceeds context");
             maxprompt = std::max(maxprompt, p.length(model.codebooks));

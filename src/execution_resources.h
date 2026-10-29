@@ -1,21 +1,18 @@
 #pragma once
-#include "graph.h"
 #include "kv_cache.h"
-#include "request.h"
 #include <algorithm>
 #include <map>
-#include <tuple>
+#include <memory>
 namespace tts {
 // Owns addresses borrowed by graphs. All growth and invalidation goes through reserve().
-class ExecutionResources {
+// The runner supplies its capture key and graph group; resources know neither model nor options.
+template <class Key, class GraphState> class ExecutionResources {
     cudaStream_t stream_;
     DeviceArena arena_;
     PagedKVCache kv_;
-    using Key = std::tuple<int, int, int, float, float, int, float, float, bool, int, float, float,
-                           bool, float, float, uint64_t>;
     struct Entry {
         uint64_t used;
-        std::unique_ptr<Graphs> graphs;
+        std::unique_ptr<GraphState> graphs;
     };
     std::map<Key, Entry> graphs_;
     uint64_t clock_ = 0;
@@ -48,24 +45,7 @@ class ExecutionResources {
     KVCacheView kv_view() const {
         return kv_.view();
     }
-    Graphs &graphs_for(int batch, int branches, int rows, const GenerationOptions &o,
-                       uint64_t revision) {
-        Key key{batch,
-                branches,
-                rows,
-                o.temperature,
-                o.cfg_scale,
-                o.top_k,
-                o.top_p,
-                o.repetition_penalty,
-                o.do_sample,
-                o.depth_top_k,
-                o.depth_temperature,
-                o.depth_top_p,
-                o.depth_do_sample,
-                o.cfg_scale_ref,
-                o.cfg_scale_ins,
-                revision};
+    GraphState &graphs_for(const Key &key) {
         auto found = graphs_.find(key);
         if (found != graphs_.end()) {
             found->second.used = ++clock_;
@@ -79,7 +59,7 @@ class ExecutionResources {
                 });
             graphs_.erase(oldest);
         }
-        auto graphs = std::make_unique<Graphs>();
+        auto graphs = std::make_unique<GraphState>();
         auto &result = *graphs;
         graphs_.emplace(key, Entry{++clock_, std::move(graphs)});
         return result;

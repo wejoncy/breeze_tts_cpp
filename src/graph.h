@@ -37,7 +37,4 @@ struct Graph {
         CUDA(cudaGraphLaunch(executable, stream));
     }
 };
-struct Graphs {
-    Graph first_depth, decoder, codec;
-};
 } // namespace tts

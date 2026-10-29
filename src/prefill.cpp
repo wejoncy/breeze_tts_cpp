@@ -54,7 +54,7 @@ void prefill(const Model &m, Backend &gpu, BufferAllocator &storage, const Prepa
         {
             Range range("tts.text_encoder");
             gpu.embedding(m.text_embedding, ids.ptr<int>(), h, std::sqrt(float(text.config.hidden)),
-                          m.eoi);
+                          m.eoi, m.config.text_eoi);
             text.forward(gpu, ts, h, zero.ptr<int>(), 1, n, 0, 0);
             gpu.linear(h, m.text_proj, projected);
         }
@@ -83,7 +83,7 @@ void prefill(const Model &m, Backend &gpu, BufferAllocator &storage, const Prepa
         {
             Range range("tts.text_encoder");
             gpu.embedding(m.text_embedding, ids.ptr<int>(), h, std::sqrt(float(text.config.hidden)),
-                          m.eoi);
+                          m.eoi, m.config.text_eoi);
             text.forward(gpu, ts, h, nullptr, p.text_sequences, p.max_text, 0, 0, {}, &tp);
             if (p.has_reference) {
                 for (auto segment : p.segments)
@@ -95,14 +95,14 @@ void prefill(const Model &m, Backend &gpu, BufferAllocator &storage, const Prepa
         for (int lane = 0; lane < lanes; ++lane)
             if (auto ref = p.prompts[lane].reference) {
                 auto codes = ref->codes;
-                codes.resize(codes.size() + m.config.codebooks, 0);
+                codes.resize(codes.size() + m.config.codebooks, m.config.codebook_eos);
                 auto &input = buffers.references[lane];
                 gpu.upload(input.data(), codes.data(), input.size());
                 tts::audio_embedding(
                     gpu.stream, m.audio_embedding, input.ptr<int>(),
                     projected.slice(p.offsets[lane] + p.prompts[lane].reference_text.size(),
                                     codes.size() / m.config.codebooks),
-                    codes.size() / m.config.codebooks, 1);
+                    codes.size() / m.config.codebooks, 1, m.config.codebooks);
                 gpu.sync();
             }
         dump_tensor(gpu, p.has_reference ? h : h.slice(0, p.lengths[0]),

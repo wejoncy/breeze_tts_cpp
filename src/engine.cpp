@@ -12,7 +12,7 @@ struct Engine::Impl {
     uint64_t request_sequence = 0;
     Backend gpu;
     const Model model;
-    ExecutionResources resources;
+    ModelRunner::Resources resources;
     ModelRunner runner;
     int max_batch;
     std::mutex mutex;
@@ -67,6 +67,10 @@ MemoryStats Engine::memory_stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->gpu.memory.sync();
     return impl_->gpu.memory.stats();
+}
+AudioFormat Engine::audio_format() const {
+    const auto &c = impl_->model.config;
+    return {c.sample_rate, c.samples_per_frame, c.codebooks, c.codec.codebook_size};
 }
 int Engine::batch_capacity() const {
     return impl_->max_batch;

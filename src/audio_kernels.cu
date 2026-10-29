@@ -3,39 +3,42 @@
 #include <cmath>
 namespace tts {
 __global__ void audio_embed_kernel(const bf16 *w, const int *codes, bf16 *out, int batch,
-                                   int branches, int cols, int cb, int stride) {
+                                   int branches, int cols, int cb, int stride, int codebooks,
+                                   int vocab) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(batch) * branches * cols)
         return;
     int row = i / cols, b = row % batch, c = i % cols;
     float sum = 0;
-    for (int k = cb < 0 ? 0 : cb; k < (cb < 0 ? 16 : cb + 1); k++)
-        sum += f(w[(size_t(k) * 2051 + codes[b * 16 + k]) * cols + c]);
+    for (int k = cb < 0 ? 0 : cb; k < (cb < 0 ? codebooks : cb + 1); k++)
+        sum += f(w[(size_t(k) * vocab + codes[b * codebooks + k]) * cols + c]);
     out[size_t(row) * stride + c] = r<bf16>(sum);
 }
 void audio_embedding(cudaStream_t stream, TensorView table, const int *codes, TensorView out,
-                     int batch, int branches, int cb) {
+                     int batch, int branches, int codebooks, int cb) {
     size_t n = size_t(out.rows) * out.cols;
     audio_embed_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
-        table.ptr<bf16>(), codes, out.ptr<bf16>(), batch, branches, out.cols, cb, out.ld());
+        table.ptr<bf16>(), codes, out.ptr<bf16>(), batch, branches, out.cols, cb, out.ld(),
+        codebooks, table.rows / codebooks);
 }
 
 __global__ void rvq_kernel(const float *e, const int *codes, float *out, int batch, int first,
-                           int count, int dim) {
+                           int count, int dim, int codebooks, int entries) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= batch * dim)
         return;
     int b = i / dim, d = i % dim;
     float sum = 0;
     for (int k = first; k < first + count; k++)
-        sum += e[(size_t(k - first) * 2048 + codes[b * 16 + k]) * dim + d];
+        sum += e[(size_t(k - first) * entries + codes[b * codebooks + k]) * dim + d];
     out[i] = sum;
 }
 void rvq(cudaStream_t stream, TensorView e, const int *codes, TensorView out, int batch, int first,
-         int count) {
+         int count, int codebooks) {
     int n = batch * out.cols;
     rvq_kernel<<<(n + 255) / 256, 256, 0, stream>>>(e.ptr<float>(), codes, out.ptr<float>(), batch,
-                                                    first, count, out.cols);
+                                                    first, count, out.cols, codebooks,
+                                                    e.rows / count);
 }
 __global__ void snake_kernel(const float *x, const float *a, const float *b, float *y, int n,
                              int cols) {

@@ -17,6 +17,7 @@ class Engine {
     size_t weight_bytes() const;
     MemoryStats memory_stats() const;
     int batch_capacity() const;
+    AudioFormat audio_format() const;
     size_t max_reference_samples() const;
     int generate(const std::vector<Request> &, const GenerationOptions &, AudioCallback, Stats &);
     std::vector<int> encode_audio(const std::vector<float> &mono);

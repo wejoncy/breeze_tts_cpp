@@ -12,8 +12,8 @@ __device__ uint64_t splitmix(uint64_t x) {
 template <class T>
 __device__ float guided_logit(const T *logits, int vocab, int b, int batch, int branches, int cb,
                               int id, float cfg, float cfg_ref, float cfg_ins, float penalty,
-                              const int *seen) {
-    if (!(id < 2048 || (cb == 0 && id == 2051)))
+                              const int *seen, SamplingLayout layout) {
+    if (id >= vocab || !(id < layout.entries || (cb == 0 && id == layout.eos)))
         return -INFINITY;
     float v = f(logits[b * vocab + id]);
     if (branches == 2) {
@@ -25,21 +25,21 @@ __device__ float guided_logit(const T *logits, int vocab, int b, int batch, int 
               ins = f(logits[(2 * batch + b) * vocab + id]);
         v = v + cfg_ref * (r - v) + cfg_ins * (ins - v);
     }
-    if (cb == 0 && id < 2048 && seen && seen[b * 2048 + id])
+    if (cb == 0 && id < layout.entries && seen && seen[b * layout.entries + id])
         v = v < 0 ? v * penalty : v / penalty;
     return v;
 }
 template <class T>
 __global__ void greedy_kernel(const T *logits, int vocab, int *codes, int batch, int branches,
                               int cb, float cfg, int *done, float cfg_ref, float cfg_ins,
-                              float penalty, int *seen) {
+                              float penalty, int *seen, SamplingLayout layout) {
     __shared__ float vals[8];
     __shared__ int ids[8];
     int b = blockIdx.x, id = 0;
     float val = -INFINITY;
     for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
         float v = guided_logit(logits, vocab, b, batch, branches, cb, i, cfg, cfg_ref, cfg_ins,
-                               penalty, seen);
+                               penalty, seen, layout);
         if (v > val || (v == val && i < id)) {
             val = v;
             id = i;
@@ -64,19 +64,20 @@ __global__ void greedy_kernel(const T *logits, int vocab, int *codes, int batch,
                 val = vals[j];
                 id = ids[j];
             }
-        if (cb == 0 && id == 2051) {
+        if (cb == 0 && id == layout.eos) {
             done[b] = 1;
             id = 0;
         }
         if (cb == 0 && !done[b] && seen)
-            seen[b * 2048 + id] = 1;
-        codes[b * 16 + cb] = id;
+            seen[b * layout.entries + id] = 1;
+        codes[b * layout.codebooks + cb] = id;
     }
 }
 template <class T>
 __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *rng, int batch,
                               int branches, int cb, float cfg, float temp, int topk, int *done,
-                              float topp, float cfg_ref, float cfg_ins, float penalty, int *seen) {
+                              float topp, float cfg_ref, float cfg_ins, float penalty, int *seen,
+                              SamplingLayout layout) {
     using Sort = cub::BlockRadixSort<float, 256, 16, int>;
     __shared__ union {
         typename Sort::TempStorage sort;
@@ -93,7 +94,7 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
         int id = threadIdx.x * 16 + j;
         ids[j] = id;
         values[j] = guided_logit(logits, vocab, b, batch, branches, cb, id, cfg, cfg_ref, cfg_ins,
-                                 penalty, seen);
+                                 penalty, seen, layout);
     }
     Sort(storage.sort).SortDescending(values, ids);
     __syncthreads();
@@ -106,7 +107,7 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
     if (!threadIdx.x) {
         auto *v = storage.ordered.values;
         auto *id = storage.ordered.ids;
-        int valid = cb == 0 ? 2049 : 2048, k = topk > 0 ? min(topk, valid) : valid;
+        int valid = layout.entries + (cb == 0 ? 1 : 0), k = topk > 0 ? min(topk, valid) : valid;
         // HF top-k keeps all logits tied at the threshold.
         while (k < valid && v[k] == v[k - 1])
             ++k;
@@ -135,36 +136,41 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
                 break;
             }
         }
-        if (cb == 0 && chosen == 2051) {
+        if (cb == 0 && chosen == layout.eos) {
             done[b] = 1;
             chosen = 0;
         }
         if (cb == 0 && !done[b] && seen)
-            seen[b * 2048 + chosen] = 1;
-        codes[b * 16 + cb] = chosen;
+            seen[b * layout.entries + chosen] = 1;
+        codes[b * layout.codebooks + cb] = chosen;
     }
 }
-void sample(cudaStream_t stream, TensorView logits, int *codes, uint64_t *rng, int batch,
-            int branches, int cb, float cfg, float temp, int topk, int *done, float topp,
-            float cfg_ref, float cfg_ins, float penalty, int *seen) {
+void sample(cudaStream_t stream, TensorView logits, SamplingLayout layout, int *codes,
+            uint64_t *rng, int batch, int branches, int cb, float cfg, float temp, int topk,
+            int *done, float topp, float cfg_ref, float cfg_ins, float penalty, int *seen) {
+    if (layout.codebooks < 1 || cb < 0 || cb >= layout.codebooks || layout.entries < 1 ||
+        layout.entries > logits.cols ||
+        (cb == 0 && (layout.eos < layout.entries || layout.eos >= logits.cols)) ||
+        (temp != 0 && logits.cols > 4096))
+        throw std::invalid_argument("sampling layout exceeds logits or the block-sort capacity");
     if (temp == 0) {
         if (logits.type == Type::BF16)
             greedy_kernel<<<batch, 256, 0, stream>>>(logits.ptr<bf16>(), logits.cols, codes, batch,
                                                      branches, cb, cfg, done, cfg_ref, cfg_ins,
-                                                     penalty, seen);
+                                                     penalty, seen, layout);
         else
             greedy_kernel<<<batch, 256, 0, stream>>>(logits.ptr<float>(), logits.cols, codes, batch,
                                                      branches, cb, cfg, done, cfg_ref, cfg_ins,
-                                                     penalty, seen);
+                                                     penalty, seen, layout);
     } else {
         if (logits.type == Type::BF16)
             sample_kernel<<<batch, 256, 0, stream>>>(logits.ptr<bf16>(), logits.cols, codes, rng,
                                                      batch, branches, cb, cfg, temp, topk, done,
-                                                     topp, cfg_ref, cfg_ins, penalty, seen);
+                                                     topp, cfg_ref, cfg_ins, penalty, seen, layout);
         else
             sample_kernel<<<batch, 256, 0, stream>>>(logits.ptr<float>(), logits.cols, codes, rng,
                                                      batch, branches, cb, cfg, temp, topk, done,
-                                                     topp, cfg_ref, cfg_ins, penalty, seen);
+                                                     topp, cfg_ref, cfg_ins, penalty, seen, layout);
     }
 }
 } // namespace tts

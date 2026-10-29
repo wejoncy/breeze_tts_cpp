@@ -8,6 +8,8 @@ int main(int argc, char **argv) {
     Tokenizer tokenizer(std::string(argv[1]) + "/tokenizer.json");
     auto ref = std::make_shared<Reference>();
     ref->text = "Hello.";
+    ref->codebooks = config.codebooks;
+    ref->codebook_size = config.codec.codebook_size;
     ref->codes.assign(2 * config.codebooks, 7);
     std::vector<Request> requests{{"你好。", "A calm voice.", "S0", ref},
                                   {"Welcome aboard.", "A clear voice.", "S1", {}}};

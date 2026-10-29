@@ -70,9 +70,10 @@ int main(int argc, char **argv) {
         const std::string transcript = plan.at("reference_text");
         if (native) {
             reference_codes = engine->encode_audio(reference_audio);
-            reference_frames = reference_codes.size() / 16;
-            reference =
-                std::make_shared<const tts::Reference>(tts::Reference{transcript, reference_codes});
+            reference_frames = reference_codes.size() / engine->audio_format().codebooks;
+            reference = std::make_shared<const tts::Reference>(
+                tts::Reference{transcript, reference_codes, engine->audio_format().codebooks,
+                               engine->audio_format().codebook_size});
         } else
             reference_codes = codec.encode(reference_audio, reference_frames);
         result["reference_prepare_ms"] = since(ref_start);

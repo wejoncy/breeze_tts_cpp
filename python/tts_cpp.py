@@ -64,6 +64,11 @@ class Engine:
         self._handle = self._module.create(
             str(self.model), device, max_batch, context, quantization or ""
         )
+        self._format = dict(self._module.audio_format(self._handle))
+
+    @property
+    def audio_format(self):
+        return dict(self._format)
 
     @property
     def version(self):
@@ -137,15 +142,26 @@ class Engine:
             or "\0" in transcript
             or len(transcript.encode()) > 65536
             or not codes
-            or len(codes) % 16
+            or len(codes) % self._format["codebooks"]
         ):
             raise ValueError(
-                "reference requires transcript and complete 16-code frames"
+                "reference requires transcript and complete code frames for this model"
             )
-        if any(not isinstance(c, int) or not 0 <= c < 2048 for c in codes):
-            raise ValueError("reference codes must be integers in 0..2047")
+        if any(
+            not isinstance(c, int) or not 0 <= c < self._format["codebook_size"]
+            for c in codes
+        ):
+            raise ValueError(
+                "reference codes must be integers within the model codebook"
+            )
         return Reference(
-            self._module, self._module.reference_from_codes(list(codes), transcript)
+            self._module,
+            self._module.reference_from_codes(
+                list(codes),
+                transcript,
+                self._format["codebooks"],
+                self._format["codebook_size"],
+            ),
         )
 
     def generate(self, requests, options=None, deliver=None):

@@ -5,7 +5,12 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <stdexcept>
+#include <algorithm>
 namespace tts {
+struct AudioFormat {
+    int sample_rate, samples_per_frame, codebooks, codebook_size;
+};
 struct GenerationOptions {
     // Native parameters; public API adapters translate each field explicitly.
     int max_frames = 750, top_k = 50;
@@ -24,6 +29,19 @@ struct GenerationOptions {
 struct Reference {
     std::string text;
     std::vector<int> codes;
+    int codebooks = 0, codebook_size = 0;
+    Reference() = default;
+    Reference(std::string transcript, std::vector<int> values, int books, int entries)
+        : text(std::move(transcript)), codes(std::move(values)), codebooks(books),
+          codebook_size(entries) {
+        if (codebooks < 1 || codebook_size < 1 || codes.empty() || codes.size() % codebooks ||
+            std::any_of(
+                codes.begin(), codes.end(), [&](int v) { return v < 0 || v >= codebook_size; }))
+            throw std::invalid_argument("reference codes do not match their declared layout");
+    }
+    size_t frames() const {
+        return codebooks > 0 ? codes.size() / codebooks : 0;
+    }
 };
 struct Request {
     std::string text, instruction;
