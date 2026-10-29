@@ -1,0 +1,41 @@
+--- a/flash.h
++++ b/flash.h
+@@ -9,7 +9,7 @@
+ #include <cuda.h>
+ #include <vector>
+ 
+-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
++// Native forward-only integration: no ATen/PyTorch RNG state.
+ 
+ namespace FLASH_NAMESPACE {
+ constexpr int TOTAL_DIM = 0;
+@@ -119,7 +119,7 @@
+     float softcap;
+ 
+     // Random state.
+-    at::PhiloxCudaState philox_args;
++    // Dropout is disabled in this inference-only build.
+ 
+     // Pointer to the RNG seed (idx 0) and offset (idx 1).
+     uint64_t * rng_state;
+--- a/flash_fwd_kernel.h
++++ b/flash_fwd_kernel.h
+@@ -5,7 +5,7 @@
+ #pragma once
+ 
+ #include "namespace_config.h"
+-#include "philox_unpack.cuh" // For at::cuda::philox::unpack
++#include <tuple> // Native inference-only integration.
+ 
+ #include <cute/tensor.hpp>
+ 
+@@ -66,7 +66,8 @@
+     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+     constexpr int kNWarps = Kernel_traits::kNWarps;
+ 
+-    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
++    static_assert(!Is_dropout, "native build does not support training/dropout");
++    auto seed_offset = std::make_tuple(uint64_t(0), uint64_t(0));
+     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                            bidb, bidh, tidx, params.h);
+ 

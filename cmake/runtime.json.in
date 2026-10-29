@@ -1,0 +1,5 @@
+{
+  "library": "$<TARGET_FILE_NAME:@target@>",
+  "runtime_libraries": [$<$<BOOL:$<TARGET_RUNTIME_DLLS:@target@>>:"$<JOIN:$<TARGET_RUNTIME_DLLS:@target@>,",">">],
+  "runtime_directories": @runtime_directories@
+}
