@@ -36,10 +36,11 @@ sf_count_t tell(void *u) {
 }
 } // namespace
 std::vector<float> resample_audio(const float *input, size_t frames, int rate, int channels,
-                                  size_t limit) {
-    if (!input || !frames || rate < 1 || rate > 768000 || channels < 1 || channels > 256)
+                                  size_t limit, int output_rate) {
+    if (output_rate < 1 || output_rate > 768000 || !input || !frames || rate < 1 || rate > 768000 ||
+        channels < 1 || channels > 256)
         throw std::invalid_argument("invalid reference PCM");
-    double output_frames = std::ceil(double(frames) * 24000 / rate);
+    double output_frames = std::ceil(double(frames) * output_rate / rate);
     if (output_frames > double(limit))
         throw std::invalid_argument("reference audio exceeds context capacity");
     size_t count = size_t(output_frames);
@@ -54,21 +55,21 @@ std::vector<float> resample_audio(const float *input, size_t frames, int rate, i
         }
         mono[t] = sum / channels;
     }
-    if (rate == 24000)
+    if (rate == output_rate)
         return mono;
     auto quality = soxr_quality_spec(SOXR_HQ, 0);
     std::vector<float> result(count);
     size_t used = 0, written = 0;
-    auto error = soxr_oneshot(rate, 24000, 1, mono.data(), frames, &used, result.data(), count,
-                              &written, nullptr, &quality, nullptr);
+    auto error = soxr_oneshot(rate, output_rate, 1, mono.data(), frames, &used, result.data(),
+                              count, &written, nullptr, &quality, nullptr);
     if (error || used != frames)
         throw std::runtime_error(error ? error : "incomplete audio resampling");
     // librosa fix_length pads the rounded output to ceil(original * ratio).
     std::fill(result.begin() + written, result.end(), 0);
     return result;
 }
-std::vector<float> read_audio(const void *data, size_t bytes, size_t limit) {
-    if (!data || !bytes || bytes > size_t(1) << 30)
+std::vector<float> read_audio(const void *data, size_t bytes, size_t limit, int output_rate) {
+    if (output_rate < 1 || output_rate > 768000 || !data || !bytes || bytes > size_t(1) << 30)
         throw std::invalid_argument("invalid encoded reference audio size");
     Source source{static_cast<const char *>(data), sf_count_t(bytes)};
     SF_VIRTUAL_IO io{length, seek, read, nullptr, tell};
@@ -78,14 +79,15 @@ std::vector<float> read_audio(const void *data, size_t bytes, size_t limit) {
     if (!file)
         throw std::invalid_argument("cannot decode reference audio");
     if (info.frames < 1 || info.channels < 1 || info.channels > 256 || info.samplerate < 1 ||
-        info.samplerate > 768000 || double(info.frames) * 24000 / info.samplerate > limit)
+        info.samplerate > 768000 || double(info.frames) * output_rate / info.samplerate > limit)
         throw std::invalid_argument("invalid or overlong reference audio");
     std::vector<float> input(size_t(info.frames) * info.channels);
     if (sf_readf_float(file.get(), input.data(), info.frames) != info.frames)
         throw std::invalid_argument("truncated reference audio");
-    return resample_audio(input.data(), info.frames, info.samplerate, info.channels, limit);
+    return resample_audio(input.data(), info.frames, info.samplerate, info.channels, limit,
+                          output_rate);
 }
-std::vector<float> read_audio_file(const std::string &path, size_t limit) {
+std::vector<float> read_audio_file(const std::string &path, size_t limit, int output_rate) {
     std::ifstream f(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
     if (!f)
         throw std::runtime_error("cannot open reference audio: " + path);
@@ -96,6 +98,6 @@ std::vector<float> read_audio_file(const std::string &path, size_t limit) {
     f.seekg(0);
     if (!f.read(data.data(), size))
         throw std::runtime_error("cannot read reference audio");
-    return read_audio(data.data(), data.size(), limit);
+    return read_audio(data.data(), data.size(), limit, output_rate);
 }
 } // namespace tts

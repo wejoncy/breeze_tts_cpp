@@ -54,9 +54,12 @@ class FFIFieldsTests(unittest.TestCase):
         # Importing reusable codes needs no model or device allocation.
         engine = Engine.__new__(Engine)
         engine._module = self.module
-        reference = engine.reference_from_codes(list(range(16)), "Reference")
+        engine._format = dict(
+            sample_rate=16000, samples_per_frame=320, codebooks=4, codebook_size=32
+        )
+        reference = engine.reference_from_codes(list(range(4)), "Reference")
         self.assertEqual(reference.frames, 1)
-        self.assertEqual(reference.codes(), list(range(16)))
+        self.assertEqual(reference.codes(), list(range(4)))
         reference.close()
         reference.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):

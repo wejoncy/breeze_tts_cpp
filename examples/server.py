@@ -2,7 +2,7 @@
 """Standard-library HTTP frontend. All model execution is in the native library.
 
 POST /v1/audio/speech: JSON {text, instruction?, stream?:true, ...options}
-  stream=true: chunked mono 24 kHz signed 16-bit little-endian PCM.
+  stream=true: chunked mono signed 16-bit little-endian PCM at the model sample rate.
   stream=false: WAV.
 POST /v1/audio/batch: JSON {requests:[{text,instruction?},...], ...options}
   Returns a ZIP of WAVs and metrics.json. One native GPU batch invocation.
@@ -33,15 +33,16 @@ from model_source import model_info
 from request_schema import validate
 
 
-def wav(pcm):
+def wav(pcm, sample_rate):
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
-        w.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+        w.setparams((1, 2, sample_rate, 0, "NONE", "not compressed"))
         w.writeframes(pcm)
     return buf.getvalue()
 
 
 def make_handler(engine):
+    sample_rate = engine.audio_format["sample_rate"]
     references = OrderedDict()
     metadata = None
 
@@ -176,13 +177,16 @@ def make_handler(engine):
                     {
                         "status": "ready",
                         "engine": engine.version,
-                        "sample_rate": 24000,
+                        "sample_rate": sample_rate,
                         "max_batch": engine.max_batch,
                     },
                 )
             elif self.path == "/v1/model":
                 if metadata is None:
                     metadata = model_info(engine.model)
+                    metadata["max_new_tokens"] = min(
+                        metadata["max_new_tokens"], engine.context - 1
+                    )
                 self.reply(200, metadata)
             else:
                 self.reply(404, {"error": "not found"})
@@ -231,14 +235,13 @@ def make_handler(engine):
                         for t in texts
                     ]
                     frames = payload.get(
-                        "max_new_tokens", payload.get("max_frames", 1500)
+                        "max_new_tokens",
+                        payload.get("max_frames", engine.default_options().max_frames),
                     )
                     if not isinstance(frames, int):
                         raise ValueError("max_new_tokens must be integer")
                     payload.pop("max_new_tokens", None)
-                    payload["max_frames"] = max(1, min(1500, frames))
-                elif form and "max_new_tokens" not in payload:
-                    payload.setdefault("max_frames", 1500)
+                    payload["max_frames"] = frames
                 # Native preparation happens only after acquiring admission.
                 if uploaded:
                     for r in payload.get("requests", [payload]):
@@ -270,11 +273,11 @@ def make_handler(engine):
                             self.send_response(200)
                             self.send_header(
                                 "Content-Type",
-                                "audio/pcm;rate=24000;channels=1;format=s16le",
+                                f"audio/pcm;rate={sample_rate};channels=1;format=s16le",
                             )
                             self.send_header("Transfer-Encoding", "chunked")
                             self.send_header("Cache-Control", "no-store")
-                            self.send_header("X-Sample-Rate", "24000")
+                            self.send_header("X-Sample-Rate", str(sample_rate))
                             self.send_header("X-Sample-Format", "s16le")
                             self.end_headers()
                             started = True
@@ -290,7 +293,10 @@ def make_handler(engine):
                             200,
                             b"",
                             "audio/pcm",
-                            {"X-Sample-Rate": "24000", "X-Sample-Format": "s16le"},
+                            {
+                                "X-Sample-Rate": str(sample_rate),
+                                "X-Sample-Format": "s16le",
+                            },
                         )
                     else:
                         self.wfile.write(b"0\r\n\r\n")
@@ -301,7 +307,7 @@ def make_handler(engine):
                         b"".join(buffers),
                         "audio/pcm",
                         {
-                            "X-Sample-Rate": "24000",
+                            "X-Sample-Rate": str(sample_rate),
                             "X-Sample-Format": "s16le",
                             "X-Segment-Bytes": ",".join(str(len(b)) for b in buffers),
                         },
@@ -310,11 +316,11 @@ def make_handler(engine):
                     result = io.BytesIO()
                     with zipfile.ZipFile(result, "w", zipfile.ZIP_STORED) as z:
                         for i, pcm in enumerate(buffers):
-                            z.writestr(f"{i}.wav", wav(pcm))
+                            z.writestr(f"{i}.wav", wav(pcm, sample_rate))
                         z.writestr("metrics.json", json.dumps(stats))
                     self.reply(200, result.getvalue(), "application/zip")
                 else:
-                    self.reply(200, wav(buffers[0]), "audio/wav")
+                    self.reply(200, wav(buffers[0], sample_rate), "audio/wav")
             except (TimeoutError, BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
             except (ValueError, TypeError) as exc:

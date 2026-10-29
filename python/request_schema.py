@@ -62,16 +62,12 @@ def validate(payload, batch, defaults):
         raise ValueError("both cfg_scale_ref and cfg_scale_ins are required")
     if "cfg_scale_ref" in values:
         opts.dual_cfg = True
-    if (
-        not 1 <= opts.max_frames <= 2000
-        or opts.cfg_scale <= 0
-        or opts.repetition_penalty <= 0
-    ):
+    if opts.max_frames < 1 or opts.cfg_scale <= 0 or opts.repetition_penalty <= 0:
         raise ValueError("generation option outside supported range")
     for prefix in ("", "depth_"):
         if (
             getattr(opts, prefix + "temperature") < 0
-            or not 0 <= getattr(opts, prefix + "top_k") <= 2048
+            or getattr(opts, prefix + "top_k") < 0
             or not 0 < getattr(opts, prefix + "top_p") <= 1
             or getattr(opts, prefix + "do_sample") not in (0, 1)
         ):

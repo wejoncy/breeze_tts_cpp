@@ -151,9 +151,10 @@ int run_cli(int argc, const char *const *argv) {
                 "CLI raw stream supports one request; use ABI for batch streaming");
         tts::Engine engine(model, device, inputs.size(), context, 128,
                            tts::quantization_from_string(quantization));
+        const auto format = engine.audio_format();
         if (!encodefile.empty()) {
-            auto codes = engine.encode_audio(
-                tts::read_audio_file(encodefile, engine.max_reference_samples()));
+            auto codes = engine.encode_audio(tts::read_audio_file(
+                encodefile, engine.max_reference_samples(), format.sample_rate));
             std::ofstream out(std::filesystem::u8path(output), std::ios::binary);
             out.write(reinterpret_cast<const char *>(codes.data()), codes.size() * 4);
             if (!out)
@@ -165,7 +166,7 @@ int run_cli(int argc, const char *const *argv) {
             if (!f)
                 throw std::runtime_error("cannot open codes");
             auto size = f.tellg();
-            if (size < 0 || size % 64)
+            if (size < 0 || size % (format.codebooks * sizeof(int32_t)))
                 throw std::runtime_error("invalid codes length");
             std::vector<int> codes(size / 4);
             f.seekg(0);
@@ -191,9 +192,11 @@ int run_cli(int argc, const char *const *argv) {
             if (!audio.empty()) {
                 auto key = std::make_pair(audio, transcript);
                 if (!references.count(key))
-                    references[key] = std::make_shared<const tts::Reference>(
-                        tts::Reference{transcript, engine.encode_audio(tts::read_audio_file(
-                                                       audio, engine.max_reference_samples()))});
+                    references[key] = std::make_shared<const tts::Reference>(tts::Reference{
+                        transcript,
+                        engine.encode_audio(tts::read_audio_file(
+                            audio, engine.max_reference_samples(), format.sample_rate)),
+                        format.codebooks, format.codebook_size});
                 request.reference = references.at(key);
             }
             requests.push_back(std::move(request));
@@ -224,7 +227,7 @@ int run_cli(int argc, const char *const *argv) {
             for (size_t b = 0; b < audio.size(); b++)
                 tts::write_wav(audio.size() == 1 ? output
                                                  : output + "." + std::to_string(b) + ".wav",
-                               audio[b]);
+                               audio[b], format.sample_rate);
         }
     } catch (const std::exception &e) {
         TTS_LOG(TTS_LOG_ERROR, "cli", "{}", e.what());

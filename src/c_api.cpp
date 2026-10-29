@@ -52,6 +52,15 @@ void tts_destroy(tts_engine *e) {
     if (tts::log::in_callback()) return;
     delete e;
 }
+int tts_get_audio_format(const tts_engine *e, tts_audio_format *out, char *error, size_t cap) {
+    if (!e || !out) {
+        set_error(error, cap, "null audio format argument");
+        return -1;
+    }
+    auto f = e->impl.audio_format();
+    *out = {f.sample_rate, f.samples_per_frame, f.codebooks, f.codebook_size};
+    return 0;
+}
 int tts_get_memory_stats(tts_engine *e, tts_memory_stats *out, char *error, size_t cap) {
     try {
         if (!e || !out)
@@ -121,9 +130,9 @@ std::string transcript(const char *text) {
         throw std::invalid_argument("reference transcript is required (1..65536 bytes)");
     return text;
 }
-tts_reference *reference(std::vector<int> codes, std::string text) {
-    return new tts_reference{
-        std::make_shared<const tts::Reference>(tts::Reference{std::move(text), std::move(codes)})};
+tts_reference *reference(std::vector<int> codes, std::string text, int codebooks, int entries) {
+    return new tts_reference{std::make_shared<const tts::Reference>(
+        tts::Reference{std::move(text), std::move(codes), codebooks, entries})};
 }
 } // namespace
 extern "C" {
@@ -137,8 +146,9 @@ tts_reference *tts_reference_from_audio(tts_engine *e, const void *bytes, size_t
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
         return reference(
-            e->impl.encode_audio(tts::read_audio(bytes, size, e->impl.max_reference_samples())),
-            std::move(t));
+            e->impl.encode_audio(tts::read_audio(bytes, size, e->impl.max_reference_samples(),
+                                                 e->impl.audio_format().sample_rate)),
+            std::move(t), e->impl.audio_format().codebooks, e->impl.audio_format().codebook_size);
     } catch (const std::exception &ex) {
         set_error(error, cap, ex.what());
         return nullptr;
@@ -153,9 +163,11 @@ tts_reference *tts_reference_from_pcm(tts_engine *e, const float *pcm, size_t fr
         if (!e)
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
-        return reference(e->impl.encode_audio(tts::resample_audio(pcm, frames, sr, channels,
-                                                                  e->impl.max_reference_samples())),
-                         std::move(t));
+        return reference(e->impl.encode_audio(tts::resample_audio(
+                             pcm, frames, sr, channels, e->impl.max_reference_samples(),
+                             e->impl.audio_format().sample_rate)),
+                         std::move(t), e->impl.audio_format().codebooks,
+                         e->impl.audio_format().codebook_size);
     } catch (const std::exception &ex) {
         set_error(error, cap, ex.what());
         return nullptr;
@@ -164,17 +176,16 @@ tts_reference *tts_reference_from_pcm(tts_engine *e, const float *pcm, size_t fr
         return nullptr;
     }
 }
-tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, const char *text,
-                                        char *error, size_t cap) {
+tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, int32_t codebooks,
+                                        int32_t entries, const char *text, char *error,
+                                        size_t cap) {
     try {
         auto t = transcript(text);
-        if (!codes || !frames || frames > 8190)
+        if (!codes || !frames || codebooks < 1 || entries < 1 ||
+            frames > SIZE_MAX / sizeof(int) / size_t(codebooks))
             throw std::invalid_argument("invalid reference code count");
-        std::vector<int> c(codes, codes + frames * 16);
-        for (int v : c)
-            if (v < 0 || v >= 2048)
-                throw std::invalid_argument("reference code outside 0..2047");
-        return reference(std::move(c), std::move(t));
+        std::vector<int> c(codes, codes + frames * codebooks);
+        return reference(std::move(c), std::move(t), codebooks, entries);
     } catch (const std::exception &ex) {
         set_error(error, cap, ex.what());
         return nullptr;
@@ -184,13 +195,13 @@ tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, con
     }
 }
 size_t tts_reference_frames(const tts_reference *r) {
-    return r ? r->impl->codes.size() / 16 : 0;
+    return r ? r->impl->frames() : 0;
 }
 size_t tts_reference_codes(const tts_reference *r, int32_t *out, size_t cap) {
     if (!r || !out || cap < r->impl->codes.size())
         return 0;
     std::copy(r->impl->codes.begin(), r->impl->codes.end(), out);
-    return r->impl->codes.size() / 16;
+    return r->impl->frames();
 }
 void tts_reference_destroy(tts_reference *r) {
     delete r;

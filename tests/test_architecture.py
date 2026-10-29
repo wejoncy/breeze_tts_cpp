@@ -47,6 +47,7 @@ class ArchitectureTests(unittest.TestCase):
             "sampling.h",
             "audio_kernels.h",
             "kv_cache.h",
+            "execution_resources.h",
         )
         for name in leaves:
             content = (ROOT / "src" / name).read_text()
@@ -56,6 +57,12 @@ class ArchitectureTests(unittest.TestCase):
         for name in ("engine.h", "prepared_batch.h", "safetensors.h", "mapped_file.h"):
             self.assertNotRegex(
                 (ROOT / "src" / name).read_text(), r"cuda|sys/mman|windows\.h", name
+            )
+        for name in ("graph.h", "execution_resources.h"):
+            self.assertNotRegex(
+                (ROOT / "src" / name).read_text(),
+                r'#include "(?:request|generation_state|model_config)\.h"|\bGenerationOptions\b',
+                name,
             )
         backend = (ROOT / "src/backend.h").read_text()
         self.assertNotRegex(

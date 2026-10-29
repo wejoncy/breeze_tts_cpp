@@ -79,9 +79,41 @@ class Transformer {
             }
             l.attn_scale = weights.optional(p + ".self_attn_layer_scale.scale");
             l.mlp_scale = weights.optional(p + ".mlp_layer_scale.scale");
+            auto vector = [&](TensorView v, int width) {
+                if (v.type != cfg.type || v.numel() != size_t(width))
+                    throw std::invalid_argument(
+                        "transformer vector weight/configuration mismatch: " + p);
+            };
+            auto matrix = [&](TensorView v, int rows, int cols) {
+                if (v.rows != rows || v.cols != cols)
+                    throw std::invalid_argument(
+                        "transformer matrix weight/configuration mismatch: " + p);
+            };
+            vector(l.pre, cfg.hidden);
+            vector(l.post, cfg.hidden);
+            if (cfg.gemma) {
+                vector(l.attn_norm, cfg.hidden);
+                vector(l.ffn_norm, cfg.hidden);
+            }
+            if (cfg.qknorm) {
+                vector(l.qn, cfg.dim);
+                vector(l.kn, cfg.dim);
+            }
+            if (l.attn_scale.data)
+                vector(l.attn_scale, cfg.hidden);
+            if (l.mlp_scale.data)
+                vector(l.mlp_scale, cfg.hidden);
+            bool quantized = cfg.quantization != Quantization::None;
+            matrix(quantized ? l.qkv_quant.values : l.qkv, (cfg.heads + 2 * cfg.kvheads) * cfg.dim,
+                   cfg.hidden);
+            matrix(quantized ? l.out_quant.values : l.out, cfg.hidden, cfg.heads * cfg.dim);
+            matrix(quantized ? l.gateup_quant.values : l.gateup, 2 * cfg.intermediate, cfg.hidden);
+            matrix(quantized ? l.down_quant.values : l.down, cfg.hidden, cfg.intermediate);
             layers.push_back(l);
         }
         final_norm = weights.get(prefix + ".norm.weight");
+        if (final_norm.type != cfg.type || final_norm.numel() != size_t(cfg.hidden))
+            throw std::invalid_argument("transformer final norm weight/configuration mismatch");
         if (cfg.max_positions <= 0 ||
             (cfg.gemma && cfg.full_attention.size() != size_t(cfg.layers)))
             throw std::invalid_argument("invalid transformer position or layer configuration");

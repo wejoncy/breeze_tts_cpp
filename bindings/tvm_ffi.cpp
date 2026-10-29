@@ -28,9 +28,9 @@ struct EngineHandle : ffi::Object {
 struct ReferenceHandle : ffi::Object {
     std::shared_ptr<const Reference> reference;
     TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tts.ReferenceHandle", ReferenceHandle, ffi::Object);
-    ReferenceHandle(std::vector<int> codes, std::string text)
-        : reference(
-              std::make_shared<const Reference>(Reference{std::move(text), std::move(codes)})) {}
+    ReferenceHandle(std::vector<int> codes, std::string text, int codebooks, int entries)
+        : reference(std::make_shared<const Reference>(
+              Reference{std::move(text), std::move(codes), codebooks, entries})) {}
 };
 struct Options : ffi::Object, GenerationOptions {
     // FFI scalar integers are signed. Keep the RNG seed's full bit pattern.
@@ -77,9 +77,11 @@ ffi::ObjectRef create(std::string path, int device, int batch, int context,
 ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string text, int rate,
                          int channels) {
     auto &engine = handle->get();
+    auto format = engine.audio_format();
     std::vector<float> mono;
     if (rate == 0) {
-        mono = read_audio(audio.data(), audio.size(), engine.max_reference_samples());
+        mono = read_audio(audio.data(), audio.size(), engine.max_reference_samples(),
+                          format.sample_rate);
     } else {
         if (channels < 1 || audio.size() % (sizeof(float) * size_t(channels)))
             throw std::invalid_argument("PCM must contain complete interleaved frames");
@@ -87,9 +89,10 @@ ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string tex
         std::vector<float> pcm(audio.size() / sizeof(float));
         std::memcpy(pcm.data(), audio.data(), audio.size());
         mono = resample_audio(pcm.data(), pcm.size() / channels, rate, channels,
-                              engine.max_reference_samples());
+                              engine.max_reference_samples(), format.sample_rate);
     }
-    return ffi::ObjectRef(ffi::make_object<ReferenceHandle>(engine.encode_audio(mono), text));
+    return ffi::ObjectRef(ffi::make_object<ReferenceHandle>(
+        engine.encode_audio(mono), text, format.codebooks, format.codebook_size));
 }
 
 Values generate(EngineHandle *handle, ffi::Array<Values> input, const Options *options,
@@ -157,6 +160,14 @@ ffi::ObjectRef default_options() {
 ffi::ObjectRef copy_options(const Options *options) {
     return ffi::ObjectRef(ffi::make_object<Options>(*options));
 }
+Values audio_format(const EngineHandle *handle) {
+    auto f = handle->get().audio_format();
+    return {{"sample_rate", f.sample_rate},
+            {"samples_per_frame", f.samples_per_frame},
+            {"codebooks", f.codebooks},
+            {"codebook_size", f.codebook_size}};
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(audio_format, audio_format);
 Values memory_stats(const EngineHandle *handle) {
     auto s = handle->get().memory_stats();
     return {{"used_bytes", s.used_bytes},
@@ -165,14 +176,16 @@ Values memory_stats(const EngineHandle *handle) {
             {"peak_reserved_bytes", s.peak_reserved_bytes}};
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare_reference, reference);
-ffi::ObjectRef reference_from_codes(std::vector<int> codes, std::string text) {
-    return ffi::ObjectRef(ffi::make_object<ReferenceHandle>(std::move(codes), std::move(text)));
+ffi::ObjectRef reference_from_codes(std::vector<int> codes, std::string text, int codebooks,
+                                    int entries) {
+    return ffi::ObjectRef(
+        ffi::make_object<ReferenceHandle>(std::move(codes), std::move(text), codebooks, entries));
 }
 std::vector<int> reference_codes(const ReferenceHandle *handle) {
     return handle->reference->codes;
 }
 size_t reference_frames(const ReferenceHandle *handle) {
-    return handle->reference->codes.size() / 16;
+    return handle->reference->frames();
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(close, close);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(version, version);

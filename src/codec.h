@@ -1,5 +1,6 @@
 #pragma once
 #include "transformer.h"
+#include "audio_config.h"
 
 namespace tts {
 // Every operation owns its streaming history. Weights remain immutable.
@@ -48,8 +49,9 @@ class Codec {
     Conv pre_conv_;
 
   public:
+    CodecConfig config;
     Transformer transformer;
-    Codec(Weights &, TransformerConfig);
+    Codec(Weights &, CodecConfig);
     TensorView forward(Backend &, CodecState &, const int *codes) const;
     friend struct CodecState;
 };

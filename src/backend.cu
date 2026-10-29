@@ -416,24 +416,26 @@ void Backend::gated(TensorView gu, TensorView y, int kind) {
 }
 template <class T>
 __global__ void embedding_kernel(const T *w, const int *ids, T *out, int rows, int cols,
-                                 float scale, const T *eoi) {
+                                 float scale, const T *replacement, int replacement_id) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < size_t(rows) * cols) {
         int id = ids[i / cols];
-        out[i] = (id == 256000 && eoi)
-                     ? eoi[i % cols]
+        out[i] = (id == replacement_id && replacement)
+                     ? replacement[i % cols]
                      : r<T>(f(w[size_t(id) * cols + i % cols]) * rounded<T>(scale));
     }
 }
 void Backend::embedding(TensorView table, const int *ids, TensorView out, float scale,
-                        TensorView eoi) {
+                        TensorView replacement, int replacement_id) {
     size_t n = size_t(out.rows) * out.cols;
     if (out.type == Type::BF16)
         embedding_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
-            table.ptr<bf16>(), ids, out.ptr<bf16>(), out.rows, out.cols, scale, eoi.ptr<bf16>());
+            table.ptr<bf16>(), ids, out.ptr<bf16>(), out.rows, out.cols, scale,
+            replacement.ptr<bf16>(), replacement_id);
     else
         embedding_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
-            table.ptr<float>(), ids, out.ptr<float>(), out.rows, out.cols, scale, eoi.ptr<float>());
+            table.ptr<float>(), ids, out.ptr<float>(), out.rows, out.cols, scale,
+            replacement.ptr<float>(), replacement_id);
 }
 template <class T>
 __global__ void rope_table_kernel(T *table, int rows, int dim, float theta, float factor,
@@ -648,7 +650,7 @@ __global__ void attention_kernel(const T *q, const T *k, const T *v, T *out, con
         out[(size_t(row) * nh + h) * dim + d] = r<T>(acc * denom);
     }
 }
-// Depth attention has at most 16 keys: normalize in registers after the
+// Short attention contexts fit in registers: normalize after the
 // cooperative QK reduction, avoiding shared-memory softmax reductions.
 static constexpr int short_attention_keys = 16;
 __global__ void depth_attention_kernel(const bf16 *q, const bf16 *k, const bf16 *v, bf16 *out,

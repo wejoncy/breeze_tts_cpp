@@ -25,6 +25,8 @@ int main(int argc, char **argv) {
                 if (options.dual_cfg) {
                     auto ref = std::make_shared<tts::Reference>();
                     ref->text = "Hello.";
+                    ref->codebooks = engine.audio_format().codebooks;
+                    ref->codebook_size = engine.audio_format().codebook_size;
                     ref->codes.assign(3 * 16, 1);
                     request.reference = ref;
                 }

@@ -31,8 +31,8 @@ typedef struct {
 int tts_configure_logging(const tts_log_config *, char *error, size_t error_capacity);
 typedef struct {
     uint32_t abi_version;
-    int32_t max_frames; /* 1..min(2000, context - prompt length) */
-    int32_t top_k;      /* 0 = full distribution, otherwise 1..2048 */
+    int32_t max_frames; /* bounded by model positions and context minus prompt */
+    int32_t top_k;      /* 0 = full distribution; otherwise bounded by model codebook size */
     float temperature;  /* 0 = greedy */
     float cfg_scale;    /* instruction guidance, > 0 */
     uint64_t seed;
@@ -64,6 +64,11 @@ tts_engine *tts_create_with_quantization(const char *model_dir, int32_t device, 
                                       int32_t context, const char *quantization, char *error,
                                       size_t error_capacity);
 void tts_destroy(tts_engine *);
+typedef struct {
+    int32_t sample_rate, samples_per_frame, codebooks, codebook_size;
+} tts_audio_format;
+int tts_get_audio_format(const tts_engine *, tts_audio_format *, char *error,
+                         size_t error_capacity);
 /* Engine-owned pool bytes. Driver/library-private allocations are not included.
    Synchronizes pending work; call between requests, never from an audio callback. */
 typedef struct {
@@ -112,8 +117,10 @@ tts_reference *tts_reference_from_audio(tts_engine *, const void *encoded, size_
 tts_reference *tts_reference_from_pcm(tts_engine *, const float *interleaved, size_t frames,
                                       int32_t sample_rate, int32_t channels, const char *transcript,
                                       char *error, size_t error_capacity);
-tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, const char *transcript,
-                                        char *error, size_t error_capacity);
+/* CPU-only import; dimensions come from tts_get_audio_format or persisted metadata. */
+tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, int32_t codebooks,
+                                        int32_t codebook_size, const char *transcript, char *error,
+                                        size_t error_capacity);
 size_t tts_reference_frames(const tts_reference *);
 /* Returns frame count; out capacity is in int32 code elements. */
 size_t tts_reference_codes(const tts_reference *, int32_t *out, size_t capacity);

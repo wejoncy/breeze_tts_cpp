@@ -24,10 +24,13 @@ void ModelRunner::depth_frame(GenerationState &s, int batch, int branches,
     {
         Range r("tts.lm_head");
         g.linear(h, model.lm_head, l);
-        tts::sample(g.stream, l, s.codes.ptr<int>(), s.rng.ptr<uint64_t>(), batch, branches, 0,
-                    options.cfg_scale, options.do_sample ? options.temperature : 0.f, options.top_k,
-                    s.done.ptr<int>(), options.top_p, options.cfg_scale_ref, options.cfg_scale_ins,
-                    options.repetition_penalty, s.seen.ptr<int>());
+        tts::sample(
+            g.stream, l,
+            {model.config.codebooks, model.config.codec.codebook_size, model.config.backbone_eos},
+            s.codes.ptr<int>(), s.rng.ptr<uint64_t>(), batch, branches, 0, options.cfg_scale,
+            options.do_sample ? options.temperature : 0.f, options.top_k, s.done.ptr<int>(),
+            options.top_p, options.cfg_scale_ref, options.cfg_scale_ins, options.repetition_penalty,
+            s.seen.ptr<int>());
     }
     if (debug)
         dump_tensor(g, l, ".backbone_logits.bf16");
@@ -38,23 +41,25 @@ void ModelRunner::depth_frame(GenerationState &s, int batch, int branches,
     auto dh = hidden.every_rows(1, 2, lanes);
     g.linear(h, model.depth_proj, first);
     tts::audio_embedding(g.stream, model.depth_embedding, s.codes.ptr<int>(), dh, batch, branches,
-                         0);
+                         model.config.codebooks, 0);
     model.depth.forward(g, s.ds, hidden, nullptr, lanes, 2, 0, 0);
     for (int cb = 1; cb < model.config.codebooks; cb++) {
         if (cb > 1) {
             hidden = s.depth_hidden.view(lanes, model.depth.config.hidden);
             dh = hidden;
             tts::audio_embedding(g.stream, model.depth_embedding, s.codes.ptr<int>(), hidden, batch,
-                                 branches, cb - 1);
+                                 branches, model.config.codebooks, cb - 1);
             model.depth.forward(g, s.ds, hidden, nullptr, lanes, 1, 0, cb);
         }
         g.linear(dh, model.depth_heads[cb - 1], dl);
         if (debug)
             dump_tensor(g, dl, ".depth_" + std::to_string(cb) + ".bf16");
-        tts::sample(g.stream, dl, s.codes.ptr<int>(), s.rng.ptr<uint64_t>(), batch, branches, cb,
-                    options.cfg_scale, options.depth_do_sample ? options.depth_temperature : 0.f,
-                    options.depth_top_k, s.done.ptr<int>(), options.depth_top_p,
-                    options.cfg_scale_ref, options.cfg_scale_ins);
+        tts::sample(
+            g.stream, dl,
+            {model.config.codebooks, model.config.codec.codebook_size, model.config.backbone_eos},
+            s.codes.ptr<int>(), s.rng.ptr<uint64_t>(), batch, branches, cb, options.cfg_scale,
+            options.depth_do_sample ? options.depth_temperature : 0.f, options.depth_top_k,
+            s.done.ptr<int>(), options.depth_top_p, options.cfg_scale_ref, options.cfg_scale_ins);
     }
 }
 void ModelRunner::next_frame(GenerationState &s, int batch, int branches,
@@ -64,7 +69,7 @@ void ModelRunner::next_frame(GenerationState &s, int batch, int branches,
         Range r("tts.backbone");
         auto input = s.last.view(lanes, model.backbone.config.hidden);
         tts::audio_embedding(gpu.stream, model.audio_embedding, s.codes.ptr<int>(), input, batch,
-                             branches);
+                             branches, model.config.codebooks);
         model.backbone.forward(gpu, s.bs, input, s.positions.ptr<int>(), lanes, 1);
         gpu.increment(s.positions.ptr<int>(), lanes);
     }
@@ -94,7 +99,12 @@ int ModelRunner::generate(const std::vector<Request> &requests, const Generation
     auto lease = resources.lease_workspace();
     GenerationState s(model, context, batch, branches, rows, &resources.workspace(),
                       resources.kv_view());
-    auto &graphs = resources.graphs_for(batch, branches, rows, opt, gpu.execution_revision());
+    // Only capture-time scalar arguments belong in the key; seeds and positions live in buffers.
+    auto &graphs =
+        resources.graphs_for({batch, branches, rows, opt.temperature, opt.cfg_scale, opt.top_k,
+                              opt.top_p, opt.repetition_penalty, opt.do_sample, opt.depth_top_k,
+                              opt.depth_temperature, opt.depth_top_p, opt.depth_do_sample,
+                              opt.cfg_scale_ref, opt.cfg_scale_ins, gpu.execution_revision()});
     gpu.zero(s.codes);
     gpu.zero(s.done);
     gpu.zero(s.seen);
@@ -185,31 +195,34 @@ std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
     CUDA(cudaSetDevice(gpu.device));
     if (mono.size() > size_t(model.config.max_reference_frames) * model.config.samples_per_frame)
         throw std::invalid_argument("reference audio exceeds context");
-    resources.prepare(AudioEncoder::workspace_bytes(mono.size()));
+    resources.prepare(model.encoder.workspace_bytes(mono.size()));
     auto lease = resources.lease_workspace();
     return model.encoder.encode(gpu, resources.workspace(), mono);
 }
 std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
     CUDA(cudaSetDevice(gpu.device));
-    if (codes.size() % 16 ||
-        codes.size() / 16 > size_t(std::min(2000, model.codec.transformer.config.max_positions)))
-        throw std::runtime_error("codes must contain <=2000 frames of 16 int32 IDs");
-    for (int c : codes)
-        if (c < 0 || c >= 2048)
+    const auto &c = model.config;
+    size_t frames = codes.size() / c.codebooks;
+    if (codes.empty() || codes.size() % c.codebooks ||
+        frames > size_t(c.codec.transformer.max_positions))
+        throw std::runtime_error("codes must contain complete frames within codec position limits");
+    for (int code : codes)
+        if (code < 0 || code >= c.codec.codebook_size)
             throw std::runtime_error("codec ID out of range");
     WorkspacePlan plan;
     CodecState planned(model.codec, 1, &plan);
-    plan.allocate(16 * 4);
+    size_t code_bytes = size_t(c.codebooks) * sizeof(int);
+    plan.allocate(code_bytes);
     resources.prepare(plan.size);
     auto lease = resources.lease_workspace();
     CodecState state(model.codec, 1, &resources.workspace());
     state.reset(gpu);
-    Buffer frame(16 * 4, &resources.workspace());
-    std::vector<float> pcm(codes.size() / 16 * 1920);
-    for (size_t t = 0; t < codes.size() / 16; t++) {
-        gpu.upload(frame.data(), codes.data() + t * 16, 64);
+    Buffer frame(code_bytes, &resources.workspace());
+    std::vector<float> pcm(frames * c.samples_per_frame);
+    for (size_t t = 0; t < frames; t++) {
+        gpu.upload(frame.data(), codes.data() + t * c.codebooks, code_bytes);
         TensorView out = model.codec.forward(gpu, state, frame.ptr<int>());
-        gpu.download(pcm.data() + t * 1920, out.data, 1920 * 4);
+        gpu.download(pcm.data() + t * c.samples_per_frame, out.data, out.size());
     }
     return pcm;
 }

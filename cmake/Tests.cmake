@@ -1,6 +1,10 @@
 add_executable(test_c_api EXCLUDE_FROM_ALL tests/c_api.cpp)
 tts_test_assertions(test_c_api)
 target_link_libraries(test_c_api PRIVATE tts)
+add_executable(test_audio_model EXCLUDE_FROM_ALL tests/audio_model.cpp)
+target_include_directories(test_audio_model PRIVATE src)
+tts_test_assertions(test_audio_model)
+target_link_libraries(test_audio_model PRIVATE tts CUDA::cublas CUDA::cudart)
 add_executable(test_logging EXCLUDE_FROM_ALL tests/logging.cpp src/log.cpp)
 target_include_directories(test_logging PRIVATE include src)
 tts_test_assertions(test_logging)
@@ -95,7 +99,7 @@ foreach(mode IN ITEMS fp8 int8)
 endforeach()
 add_test(NAME quant_gated_int8_ptx80 COMMAND test_quant_gated_ptx80 int8)
 set_tests_properties(quant_gated_int8_ptx80 PROPERTIES LABELS int8 RUN_SERIAL TRUE)
-add_custom_target(tts_tests DEPENDS test_tensor test_kernel_selection test_logging test_safetensors
+add_custom_target(tts_tests DEPENDS test_audio_model test_tensor test_kernel_selection test_logging test_safetensors
   test_model_config test_prepared_batch test_c_api test_sampling test_kv_cache
   test_execution_resources test_device_pool test_page_engine test_quantization test_quant_norm
   test_quant_gated test_quant_gated_ptx80)

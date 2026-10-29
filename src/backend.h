@@ -80,7 +80,7 @@ class Backend {
     void activation(TensorView x, TensorView y, int kind); // 0 SiLU, 1 tanh GELU, 2 erf GELU
     void gated(TensorView gu, TensorView y, int kind);
     void embedding(TensorView table, const int *ids, TensorView out, float scale = 1,
-                   TensorView eoi = {});
+                   TensorView replacement = {}, int replacement_id = -1);
     void make_rope(TensorView table, int dim, float theta, float factor, int rope_type,
                    float low_wave = 0, float high_wave = 0);
     void qkv(TensorView in, TensorView q, TensorView cache_k, TensorView cache_v,

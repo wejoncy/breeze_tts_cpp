@@ -19,6 +19,7 @@ struct GenerationState {
                        storage),
           codes(size_t(b) * m.config.codebooks * sizeof(int), storage),
           done(size_t(b) * 4, storage), positions(size_t(b * br) * 4, storage),
-          rng(size_t(b) * 8, storage), seen(size_t(b) * 2048 * 4, storage) {}
+          rng(size_t(b) * 8, storage),
+          seen(size_t(b) * m.config.codec.codebook_size * sizeof(int), storage) {}
 };
 } // namespace tts

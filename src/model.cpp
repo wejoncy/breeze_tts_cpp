@@ -25,13 +25,24 @@ Model::Model(Backend &gpu, const std::string &dir, ModelConfig cfg)
       tokenizer(dir + "/tokenizer.json"), text(weights, "text_encoder", config.text),
       backbone(weights, "backbone_model", config.backbone),
       depth(weights, "depth_decoder.model", config.depth), codec(weights, config.codec),
-      encoder(weights, config.encoder_positions) {
+      encoder(weights, config.encoder) {
     text_embedding = weights.get("text_encoder.embed_tokens.weight");
     eoi = weights.get("text_encoder.embed_tokens.eoi_embedding");
     text_proj = weights.get("text_encoder_proj.weight");
     audio_embedding = weights.get("depth_decoder.model.embed_tokens.weight");
     depth_proj = weights.get("depth_decoder.model.inputs_embeds_projector.weight");
     lm_head = weights.get("lm_head.weight");
+    auto shape = [](TensorView v, int rows, int cols) {
+        if (v.type != Type::BF16 || v.rows != rows || v.cols != cols)
+            throw std::invalid_argument("model projection/embedding weight/configuration mismatch");
+    };
+    shape(text_embedding, config.text_vocab, config.text.hidden);
+    shape(text_proj, config.backbone.hidden, config.text.hidden);
+    shape(audio_embedding, config.codebooks * config.audio_vocab, config.backbone.hidden);
+    shape(depth_proj, config.depth.hidden, config.backbone.hidden);
+    shape(lm_head, config.backbone_eos + 1, config.backbone.hidden);
+    if (eoi.type != Type::BF16 || eoi.numel() != size_t(config.text.hidden))
+        throw std::invalid_argument("text replacement embedding shape");
     // Frozen embedding -> projection is input-independent: evaluate once at load.
     depth_embedding_storage = Tensor({audio_embedding.rows, depth.config.hidden}, depth.config.type, &gpu.memory);
     depth_embedding = depth_embedding_storage.view();

@@ -11,6 +11,20 @@ int main(int argc, char **argv) {
     std::unique_ptr<tts_engine, decltype(&tts_destroy)> engine(
         tts_create(argv[1], 0, 1, 2048, error, sizeof(error)), tts_destroy);
     assert(engine);
+    tts_audio_format format{};
+    assert(tts_get_audio_format(engine.get(), &format, error, sizeof(error)) == 0);
+    assert(format.sample_rate > 0 && format.samples_per_frame > 0 && format.codebooks > 1);
+    std::vector<int32_t> codes(size_t(format.codebooks) * 2, 0), copied(codes.size());
+    std::unique_ptr<tts_reference, decltype(&tts_reference_destroy)> reference(
+        tts_reference_from_codes(codes.data(), 2, format.codebooks, format.codebook_size,
+                                 "Reference", error, sizeof(error)),
+        tts_reference_destroy);
+    assert(reference && tts_reference_frames(reference.get()) == 2);
+    assert(tts_reference_codes(reference.get(), copied.data(), copied.size()) == 2 &&
+           codes == copied);
+    codes[0] = format.codebook_size;
+    assert(!tts_reference_from_codes(codes.data(), 2, format.codebooks, format.codebook_size,
+                                     "Reference", error, sizeof(error)));
     auto receive = [](void *user, int32_t, const int16_t *pcm, size_t count) -> int {
         auto &out = *static_cast<std::vector<int16_t> *>(user);
         out.insert(out.end(), pcm, pcm + count);
