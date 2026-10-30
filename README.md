@@ -9,7 +9,7 @@ and streaming PCM. Python is optional; native inference needs no PyTorch or mode
 Requires CMake 3.28+, a C++17 compiler, CUDA 13+, Rust/Cargo, Git, libsndfile and
 libsoxr. Rust is a build dependency only. CUDA/cuBLAS and audio libraries are
 found locally; [FetchContent](cmake/Dependencies.cmake) fetches pinned JSON,
-spdlog, Corrosion, CUTLASS, FlashAttention and missing audio headers.
+spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention and missing audio headers.
 
 ```sh
 cmake -S . -B build -DTTS_BUILD_PYTHON=OFF
@@ -84,6 +84,7 @@ sys.path.insert(0, "python")
 from tts_cpp import Engine
 
 with Engine(model="models/Breeze-TTS-2", max_batch=8) as engine:
+    engine.run_async()
     with engine.prepare_reference("reference.wav", "参考音频的准确文字。") as ref:
         pcm, stats = engine.generate(
             [{"text": "你好。", "reference": ref}, {"text": "Welcome."}],
@@ -105,27 +106,36 @@ Speech requests accept JSON text/instruction/sampling fields; reference input is
 base64 `ref_audio` plus `ref_text`, or a multipart audio upload. Larger HTTP batches
 use bounded GPU microbatches. Disconnects cancel generation.
 
-## Validate and profile
-
-With the model and Python bridge available:
-
-```sh
-make test MODEL_DIR=models/Breeze-TTS-2
-make test-fp8 MODEL_DIR=models/Breeze-TTS-2
-make test-int8 MODEL_DIR=models/Breeze-TTS-2
-make build/kernels
-python bench/benchmark.py --model models/Breeze-TTS-2 --output artifacts/benchmark.json
-bash bench/profile.sh models/Breeze-TTS-2
-```
-
-`profile.sh` uses nsys for timelines and ncu for kernel compute/bandwidth metrics.
-Run GPU measurements sequentially, separating load/capture from warm execution.
-Keep debug dumps disabled when profiling. `tests/run_reference.py` and
-`tests/run_parity_oracles.py` provide numerical checks with the original Python
-model's separate development environment. For the Hoppou comparison, configure
-`checkpoint`, `reference_audio` and `reference_text` in `bench/hoppou_plan.json`
-with your local inputs. Generated audio and reports remain ignored.
+The C++ engine continuously batches active requests, admitting new work at audio-frame
+boundaries and reusing slots as individual requests finish. It shares model weights and GPU
+compute while each request retains its page table, codec history and sampling state at stable addresses.
+One engine-wide KV pool reserves generation capacity at admission, assigns pages as tokens arrive,
+and reuses them across requests. Initialization reserves fixed backing for KV and eager activations;
+`--memory-limit-mb 6144` / Python `memory_limit_mb=6144` caps engine GPU allocations, including
+weights, load/tuning scratch, persistent workspaces and runtime backing. CUDA context, library
+and graph overhead are additional; leave device headroom.
+`--runtime-memory-mb` / Python `runtime_memory_mb` sets the runtime backing size (0 derives it from context/batch,
+capped at 90% of then-available memory). Admission checks both free space and fragmentation.
+Eager activations borrow and return pool regions; serving does not grow physical backing or tune kernels.
+Graphs are captured from largest to smallest at initialization and retained. Nearby shapes may pad
+rows by at most 12.5%; inactive rows own no KV/history/RNG state. Other shapes execute eagerly.
+`--max-batch` bounds active requests; `--queue-limit` and `--stream-buffer-mb` configure native
+admission and output-buffer limits. Slow consumers are cancelled without blocking other requests.
+`Request` carries `request_id`, `inputs` and `options`. Native `Engine::add_request(request)`
+returns `void`; Python submits the same fields as a dictionary and returns `None`.
+Read with `engine.read_result(request_id)` (zero timeout polls), or discard/cancel with
+`engine.cancel_request(request_id)`, which posts a cancellation event and returns `None`
+(`void` in C++); unknown IDs are ignored. Results carry the same ID. Duplicate live IDs reject;
+reading terminal output/errors consumes the ID, after which it can be reused. Completed unread
+results count toward the admission limit. Construction loads resources only; call `run_async()`
+before execution or GPU control calls. C++ `shutdown()` and Python `close()` cancel outstanding requests and join
+both threads. Repeated starts while running and repeated shutdowns are harmless; restarting
+a closed engine is rejected. The owner stops API ingress before calling shutdown; lifecycle
+calls belong to that owner. The C API exposes `tts_run_async()` and `tts_shutdown()`.
+A C++ scheduling thread performs tokenization and batch formation, independently of the GPU
+execution thread. They communicate through queues and block when idle; offline `generate()`
+wraps the same scheduler.
 
 See [architecture and ownership](docs/DESIGN.md) and the
-[C interface](include/tts/tts.h). CPU inference, continuous batching, multi-GPU
-and arbitrary model architectures are not supported.
+[C interface](include/tts/tts.h). CPU inference, multi-GPU and arbitrary model architectures
+are not supported.

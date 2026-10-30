@@ -1,6 +1,6 @@
-#include "audio_io.h"
-#include "engine.h"
-#include "log.h"
+#include "io/audio_io.h"
+#include "tts/engine.h"
+#include "support/log.h"
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/extra/stl.h>
@@ -12,17 +12,26 @@ namespace tts::python {
 namespace ffi = tvm::ffi;
 using Values = ffi::Map<ffi::String, ffi::Any>;
 
+template <class F> decltype(auto) with_errors(F &&f) {
+    try {
+        return f();
+    } catch (const RequestOverloaded &error) {
+        TVM_FFI_THROW(TTSOverloaded) << error.what();
+    }
+}
+
 struct EngineHandle : ffi::Object {
-    std::unique_ptr<Engine> engine;
+    // The FFI argument retains immutable engine storage for the whole call.
+    const std::unique_ptr<Engine> engine;
     static constexpr bool _type_mutable = true;
     TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tts.EngineHandle", EngineHandle, ffi::Object);
-    EngineHandle(std::string path, int device, int batch, int context, std::string quantization)
-        : engine(std::make_unique<Engine>(path, device, batch, context, 128,
-                                          quantization_from_string(quantization))) {}
-    Engine &get() const {
-        if (!engine)
-            throw std::runtime_error("engine is closed");
-        return *engine;
+    EngineHandle(std::string path, int device, int batch, int context, std::string quantization,
+                 int64_t runtime_memory_bytes, int64_t memory_limit_bytes)
+        : engine(std::make_unique<Engine>(
+              path, device, batch, context, 128, quantization_from_string(quantization),
+              size_t(runtime_memory_bytes), size_t(memory_limit_bytes))) {}
+    Engine *get() const {
+        return engine.get();
     }
 };
 struct ReferenceHandle : ffi::Object {
@@ -38,7 +47,6 @@ struct Options : ffi::Object, GenerationOptions {
     static constexpr bool _type_mutable = true;
     TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tts.Options", Options, ffi::Object);
 };
-
 TVM_FFI_STATIC_INIT_BLOCK() {
     ffi::reflection::ObjectDef<EngineHandle>();
     ffi::reflection::ObjectDef<ReferenceHandle>();
@@ -64,10 +72,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 }
 
 ffi::ObjectRef create(std::string path, int device, int batch, int context,
-                      std::string quantization) {
+                      std::string quantization, int64_t runtime_memory_bytes,
+                      int64_t memory_limit_bytes) {
     try {
-        return ffi::ObjectRef(
-            ffi::make_object<EngineHandle>(path, device, batch, context, quantization));
+        if (runtime_memory_bytes < 0 || memory_limit_bytes < 0)
+            throw std::invalid_argument("memory budgets must be nonnegative");
+        return ffi::ObjectRef(ffi::make_object<EngineHandle>(
+            path, device, batch, context, quantization, runtime_memory_bytes, memory_limit_bytes));
     } catch (const std::exception &e) {
         TTS_LOG(TTS_LOG_ERROR, "api", "{}", e.what());
         throw;
@@ -76,11 +87,11 @@ ffi::ObjectRef create(std::string path, int device, int batch, int context,
 
 ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string text, int rate,
                          int channels) {
-    auto &engine = handle->get();
-    auto format = engine.audio_format();
+    auto engine = handle->get();
+    auto format = engine->audio_format();
     std::vector<float> mono;
     if (rate == 0) {
-        mono = read_audio(audio.data(), audio.size(), engine.max_reference_samples(),
+        mono = read_audio(audio.data(), audio.size(), engine->max_reference_samples(),
                           format.sample_rate);
     } else {
         if (channels < 1 || audio.size() % (sizeof(float) * size_t(channels)))
@@ -89,15 +100,15 @@ ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string tex
         std::vector<float> pcm(audio.size() / sizeof(float));
         std::memcpy(pcm.data(), audio.data(), audio.size());
         mono = resample_audio(pcm.data(), pcm.size() / channels, rate, channels,
-                              engine.max_reference_samples(), format.sample_rate);
+                              engine->max_reference_samples(), format.sample_rate);
     }
-    return ffi::ObjectRef(ffi::make_object<ReferenceHandle>(
-        engine.encode_audio(mono), text, format.codebooks, format.codebook_size));
+    return ffi::ObjectRef(
+        ffi::make_object<ReferenceHandle>(with_errors([&] { return engine->encode_audio(mono); }),
+                                          text, format.codebooks, format.codebook_size));
 }
 
-Values generate(EngineHandle *handle, ffi::Array<Values> input, const Options *options,
-                ffi::Function deliver) {
-    std::vector<Request> requests;
+std::vector<Input> requests_from(const ffi::Array<Values> &input) {
+    std::vector<Input> requests;
     requests.reserve(input.size());
     for (const auto &r : input) {
         auto ref = r.at("reference");
@@ -106,11 +117,20 @@ Values generate(EngineHandle *handle, ffi::Array<Values> input, const Options *o
              r.at("speaker").cast<std::string>(),
              ref == nullptr ? nullptr : ref.cast<const ReferenceHandle *>()->reference});
     }
+    return requests;
+}
+GenerationOptions snapshot_options(const Options *options) {
     // Snapshot options before releasing control to Python callbacks.
     GenerationOptions snapshot = *options;
     snapshot.seed = static_cast<uint64_t>(options->seed_bits);
+    return snapshot;
+}
+Values generate(EngineHandle *handle, ffi::Array<Values> input, const Options *options,
+                ffi::Function deliver) {
+    auto requests = requests_from(input);
+    auto snapshot = snapshot_options(options);
     Stats stats;
-    int status = handle->get().generate(
+    int status = handle->get()->generate(
         requests, snapshot,
         [&](int lane, const int16_t *pcm, size_t count) {
             return deliver(lane,
@@ -147,9 +167,53 @@ void configure_logging(std::string level, std::string file, bool json,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create, create);
+void add_request(EngineHandle *handle, std::string request_id, ffi::Array<Values> input,
+                 const Options *options) {
+    with_errors([&] {
+        handle->get()->add_request(
+            {std::move(request_id), requests_from(input), snapshot_options(options)});
+    });
+}
+Values read_result(EngineHandle *handle, std::string request_id, int timeout_ms) {
+    auto frame = with_errors([&] { return handle->get()->read_result(request_id, timeout_ms); });
+    ffi::Array<Values> chunks;
+    for (const auto &[lane, pcm] : frame.chunks)
+        chunks.push_back({{"index", lane},
+                          {"pcm", ffi::Bytes(reinterpret_cast<const char *>(pcm.data()),
+                                             pcm.size() * sizeof(int16_t))}});
+    const auto &s = frame.stats;
+    return {{"request_id", frame.request_id},
+            {"chunks", chunks},
+            {"ready", frame.ready},
+            {"batch_size", frame.batch_size},
+            {"done", frame.done},
+            {"cancelled", frame.cancelled},
+            {"prefill_ms", s.prefill_ms},
+            {"first_audio_ms", s.first_audio_ms},
+            {"total_ms", s.total_ms},
+            {"audio_seconds", s.audio_seconds},
+            {"frames", s.frames},
+            {"truncated", s.truncated}};
+}
+void cancel_request(EngineHandle *handle, std::string request_id) {
+    handle->get()->cancel_request(request_id);
+}
+void configure_serving(EngineHandle *handle, int request_limit, int output_buffer_bytes) {
+    if (request_limit < 1 || output_buffer_bytes < 1)
+        throw std::invalid_argument("serving limits must be positive");
+    handle->get()->configure_serving(request_limit, output_buffer_bytes);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure_serving, configure_serving);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_request, add_request);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(read_result, read_result);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cancel_request, cancel_request);
+void run_async(EngineHandle *handle) {
+    handle->get()->run_async();
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_async, run_async);
 void close(EngineHandle *handle) {
     log::check_not_callback();
-    handle->engine.reset();
+    handle->engine->shutdown();
 }
 std::string version() {
     return tts_version();
@@ -161,7 +225,7 @@ ffi::ObjectRef copy_options(const Options *options) {
     return ffi::ObjectRef(ffi::make_object<Options>(*options));
 }
 Values audio_format(const EngineHandle *handle) {
-    auto f = handle->get().audio_format();
+    auto f = handle->get()->audio_format();
     return {{"sample_rate", f.sample_rate},
             {"samples_per_frame", f.samples_per_frame},
             {"codebooks", f.codebooks},
@@ -169,7 +233,7 @@ Values audio_format(const EngineHandle *handle) {
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(audio_format, audio_format);
 Values memory_stats(const EngineHandle *handle) {
-    auto s = handle->get().memory_stats();
+    auto s = with_errors([&] { return handle->get()->memory_stats(); });
     return {{"used_bytes", s.used_bytes},
             {"reserved_bytes", s.reserved_bytes},
             {"peak_used_bytes", s.peak_used_bytes},

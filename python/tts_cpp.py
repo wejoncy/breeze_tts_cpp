@@ -1,9 +1,9 @@
 """TVM FFI bindings to the native C++/CUDA engine; no Python model execution."""
 
 from array import array
-from contextlib import ExitStack
 from pathlib import Path
 import threading
+import uuid
 
 import request_schema
 from model_source import resolve_model_dir
@@ -15,24 +15,22 @@ from tts_logging import check_not_in_callback, configure_logging  # noqa: F401 -
 class Reference:
     def __init__(self, module, handle):
         self._module, self._handle = module, handle
-        self._lock = threading.RLock()
+
+    def _native_handle(self):
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError("reference is closed")
+        return handle
 
     @property
     def frames(self):
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("reference is closed")
-            return self._module.reference_frames(self._handle)
+        return self._module.reference_frames(self._native_handle())
 
     def codes(self):
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("reference is closed")
-            return list(self._module.reference_codes(self._handle))
+        return list(self._module.reference_codes(self._native_handle()))
 
     def close(self):
-        with self._lock:
-            self._handle = None
+        self._handle = None
 
     def __enter__(self):
         return self
@@ -51,18 +49,29 @@ class Engine:
         context=2048,
         revision=None,
         quantization=None,
+        runtime_memory_mb=0,
+        memory_limit_mb=0,
     ):
         check_not_in_callback()
         if quantization not in (None, "fp8", "int8"):
             raise ValueError("quantization must be fp8 or int8")
+        if type(runtime_memory_mb) is not int or not 0 <= runtime_memory_mb < 2**43:
+            raise ValueError("runtime_memory_mb must be a nonnegative integer")
+        if type(memory_limit_mb) is not int or not 0 <= memory_limit_mb < 2**43:
+            raise ValueError("memory_limit_mb must be a nonnegative integer")
         self.quantization = quantization
         self._module = load_library(library)
         self.model = resolve_model_dir(model, revision)
-        self._lock = threading.RLock()
-        self._active = False
+        self._callbacks = threading.local()
         self.max_batch, self.context = max_batch, context
         self._handle = self._module.create(
-            str(self.model), device, max_batch, context, quantization or ""
+            str(self.model),
+            device,
+            max_batch,
+            context,
+            quantization or "",
+            runtime_memory_mb * 1024 * 1024,
+            memory_limit_mb * 1024 * 1024,
         )
         self._format = dict(self._module.audio_format(self._handle))
 
@@ -74,21 +83,27 @@ class Engine:
     def version(self):
         return self._module.version()
 
-    def _check(self):
+    def _native_handle(self):
         check_not_in_callback()
-        if self._handle is None:
+        handle = self._handle
+        if handle is None:
             raise RuntimeError("engine is closed")
-        if self._active:
+        if getattr(self._callbacks, "active", False):
             raise RuntimeError("cannot reenter engine from an audio callback")
+        return handle
+
+    def run_async(self):
+        """Start native scheduling and execution; construction only loads resources."""
+        self._module.run_async(self._native_handle())
 
     def close(self):
         check_not_in_callback()
-        with self._lock:
-            if self._active:
-                raise RuntimeError("cannot reenter engine from an audio callback")
-            if self._handle is not None:
-                self._module.close(self._handle)
-                self._handle = None
+        if getattr(self._callbacks, "active", False):
+            raise RuntimeError("cannot reenter engine from an audio callback")
+        handle = self._handle
+        if handle is not None:
+            self._module.close(handle)
+            self._handle = None
 
     def __enter__(self):
         return self
@@ -101,10 +116,7 @@ class Engine:
 
     def memory_stats(self):
         """Pool bytes between requests; excludes CUDA driver/library memory."""
-        check_not_in_callback()
-        with self._lock:
-            self._check()
-            return dict(self._module.memory_stats(self._handle))
+        return dict(self._module.memory_stats(self._native_handle()))
 
     def prepare_reference(self, audio, transcript, *, sample_rate=None, channels=1):
         """File/encoded bytes, or interleaved float PCM with sample_rate specified."""
@@ -128,12 +140,10 @@ class Engine:
             if not isinstance(channels, int) or channels < 1 or len(audio) % channels:
                 raise ValueError("PCM must contain complete interleaved frames")
             data = array("f", audio).tobytes()
-        with self._lock:
-            self._check()
-            handle = self._module.prepare_reference(
-                self._handle, data, transcript, sample_rate or 0, channels
-            )
-            return Reference(self._module, handle)
+        handle = self._module.prepare_reference(
+            self._native_handle(), data, transcript, sample_rate or 0, channels
+        )
+        return Reference(self._module, handle)
 
     def reference_from_codes(self, codes, transcript):
         if (
@@ -164,12 +174,7 @@ class Engine:
             ),
         )
 
-    def generate(self, requests, options=None, deliver=None):
-        """Return (PCM byte arrays, stats), or stream deliver(index, bytes) and return stats.
-
-        Returning False from deliver cancels. Up to 128 requests are split into
-        capacity-sized GPU batches, preserving order and per-lane RNG seeds.
-        """
+    def _snapshot_generation(self, requests, options):
         check_not_in_callback()
         if options is None or isinstance(options, dict):
             _, options = request_schema.validate(
@@ -181,73 +186,93 @@ class Engine:
             request_schema.validate({"requests": requests}, True, options)
         else:
             raise TypeError("options must be a dictionary or native Options")
+        native = []
+        for request in requests:
+            reference = request.get("reference")
+            if reference is not None and not isinstance(reference, Reference):
+                raise ValueError("reference must be a prepared Reference")
+            # Local ObjectRefs retain native storage across a concurrent close.
+            handle = reference._handle if reference is not None else None
+            if reference is not None and handle is None:
+                raise ValueError("reference is closed")
+            native.append(
+                dict(
+                    text=request["text"],
+                    instruction=request.get("instruction", ""),
+                    speaker=request.get("speaker", "S0") or "",
+                    reference=handle,
+                )
+            )
+        return native, options
+
+    def configure_serving(self, request_limit=32, output_buffer_bytes=1 << 20):
+        """Set native admission and output buffer limits for future requests."""
+        self._module.configure_serving(
+            self._native_handle(), request_limit, output_buffer_bytes
+        )
+
+    def add_request(self, request):
+        """Enqueue {request_id, inputs, options} without waiting for native scheduling."""
+        check_not_in_callback()
+        if not isinstance(request, dict):
+            raise TypeError("request must be a dictionary")
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) or not request_id or "\0" in request_id:
+            raise ValueError("request_id must be a nonempty string without NUL")
+        handle = self._native_handle()
+        native, options = self._snapshot_generation(
+            request.get("inputs"), request.get("options")
+        )
+        self._module.add_request(handle, request_id, native, options)
+
+    def read_result(self, request_id, timeout=None):
+        """Read by ID; terminal output/errors consume it. Duplicate errors preserve it."""
+        check_not_in_callback()
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative or None")
+        handle = self._native_handle()
+        frame = dict(
+            self._module.read_result(
+                handle, request_id, -1 if timeout is None else int(timeout * 1000)
+            )
+        )
+        frame["chunks"] = [(int(c["index"]), bytes(c["pcm"])) for c in frame["chunks"]]
+        return frame
+
+    def cancel_request(self, request_id):
+        """Post cancellation and return immediately; unknown IDs are ignored."""
+        return self._module.cancel_request(self._native_handle(), request_id)
+
+    def generate(self, requests, options=None, deliver=None):
+        """Collect PCM or deliver(index, bytes); returning False cancels this request."""
         buffers = [bytearray() for _ in requests]
         output = deliver or (lambda i, pcm: buffers[i].extend(pcm))
-        total = dict(
-            prefill_ms=0.0,
-            first_audio_ms=0.0,
-            total_ms=0.0,
-            audio_seconds=0.0,
-            frames=0,
-            truncated=0,
-            cancelled=False,
-        )
-        with self._lock, ExitStack() as stack:
-            self._check()
-            refs = {
-                id(r["reference"]): r["reference"]
-                for r in requests
-                if r.get("reference")
-            }
-            for ref in sorted(refs.values(), key=id):
-                if not isinstance(ref, Reference):
-                    raise ValueError("reference must be a prepared Reference")
-                stack.enter_context(ref._lock)
-                if ref._handle is None:
-                    raise ValueError("reference is closed")
-            # Retain all native handles before callbacks can close a Reference.
-            native = [
-                dict(
-                    text=r["text"],
-                    instruction=r.get("instruction", ""),
-                    speaker=r.get("speaker", "S0") or "",
-                    reference=r["reference"]._handle if r.get("reference") else None,
-                )
-                for r in requests
-            ]
-            self._active = True
-            try:
-                for start in range(0, len(native), self.max_batch):
-                    local = self._module.copy_options(options)
-                    local.seed = (options.seed + start * 0xD1342543DE82EF95) % 2**64
-                    failures = []
-
-                    def callback(index, pcm):
-                        try:
-                            return output(start + index, pcm) is not False
-                        except BaseException as exc:
-                            failures.append(exc)
-                            return False
-
-                    stats = self._module.generate(
-                        self._handle,
-                        native[start : start + self.max_batch],
-                        local,
-                        callback,
-                    )
-                    if failures:
-                        raise failures[0]
-                    for key in ("prefill_ms", "total_ms", "audio_seconds", "frames"):
-                        total[key] += stats[key]
-                    if start == 0:
-                        total["first_audio_ms"] = stats["first_audio_ms"]
-                    total["truncated"] |= stats["truncated"]
-                    if stats["cancelled"]:
-                        total["cancelled"] = True
-                        break
-            finally:
-                self._active = False
-        return total if deliver else ([bytes(b) for b in buffers], total)
+        request_id = uuid.uuid4().hex
+        self.add_request(dict(request_id=request_id, inputs=requests, options=options))
+        try:
+            while True:
+                frame = self.read_result(request_id)
+                stats = {
+                    k: v
+                    for k, v in frame.items()
+                    if k not in ("request_id", "chunks", "ready", "done", "batch_size")
+                }
+                for index, pcm in frame["chunks"]:
+                    self._callbacks.active = True
+                    try:
+                        keep = output(index, pcm) is not False
+                    finally:
+                        self._callbacks.active = False
+                    if not keep:
+                        stats["cancelled"] = True
+                        return (
+                            stats if deliver else ([bytes(b) for b in buffers], stats)
+                        )
+                if frame["done"]:
+                    break
+        finally:
+            self.cancel_request(request_id)
+        return stats if deliver else ([bytes(b) for b in buffers], stats)
 
     def warmup(self, batch=1, **options):
         return self.generate(

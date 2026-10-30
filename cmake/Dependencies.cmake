@@ -11,6 +11,11 @@ FetchContent_Declare(spdlog
   URL https://codeload.github.com/gabime/spdlog/tar.gz/refs/tags/v1.15.3
   URL_HASH SHA256=15a04e69c222eb6c01094b5c7ff8a249b36bb22788d72519646fb85feb267e67
   EXCLUDE_FROM_ALL)
+FetchContent_Declare(concurrentqueue
+  URL https://codeload.github.com/cameron314/concurrentqueue/tar.gz/refs/tags/v1.0.4
+  URL_HASH SHA256=87fbc9884d60d0d4bf3462c18f4c0ee0a9311d0519341cac7cbd361c885e5281
+  EXCLUDE_FROM_ALL
+  SOURCE_SUBDIR _tts_headers_only)
 FetchContent_Declare(corrosion
   URL https://codeload.github.com/corrosion-rs/corrosion/tar.gz/refs/tags/v0.5.2
   URL_HASH SHA256=6bc02411e29183a896aa60c58db6819ec6cf57c08997481d0b0da9029356b529
@@ -47,7 +52,10 @@ function(tts_fetch_dependencies)
   set(SPDLOG_INSTALL OFF)
   set(CORROSION_BUILD_TESTS OFF)
   set(CORROSION_DEV_MODE OFF)
-  FetchContent_MakeAvailable(json spdlog corrosion cutlass flash_attention)
+  FetchContent_MakeAvailable(json spdlog concurrentqueue corrosion cutlass flash_attention)
+
+  add_library(tts_concurrentqueue INTERFACE)
+  target_include_directories(tts_concurrentqueue SYSTEM INTERFACE "${concurrentqueue_SOURCE_DIR}")
 
   add_library(tts_cutlass INTERFACE)
   target_include_directories(tts_cutlass SYSTEM INTERFACE "${cutlass_SOURCE_DIR}/include")
@@ -59,6 +67,8 @@ function(tts_fetch_dependencies)
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/json")
   install(FILES "${cutlass_SOURCE_DIR}/LICENSE.txt"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/cutlass")
+  install(FILES "${concurrentqueue_SOURCE_DIR}/LICENSE.md"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/concurrentqueue")
   foreach(name IN ITEMS spdlog corrosion flash_attention)
     install(FILES "${${name}_SOURCE_DIR}/LICENSE"
       DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/${name}")
