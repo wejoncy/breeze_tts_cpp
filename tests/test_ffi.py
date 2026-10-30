@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -64,6 +65,14 @@ class FFIFieldsTests(unittest.TestCase):
         reference.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             reference.codes()
+
+    def test_second_library_rejected_before_native_type_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            other = Path(directory) / "different-runtime.so"
+            other.touch()
+            with self.assertRaisesRegex(RuntimeError, "already loaded"):
+                load_library(other)
+        self.assertIs(load_library(), self.module)
 
 
 if __name__ == "__main__":

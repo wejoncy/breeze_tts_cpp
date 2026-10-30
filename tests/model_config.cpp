@@ -1,5 +1,5 @@
-#include "model_config.h"
-#include "json.h"
+#include "models/breeze/model_config.h"
+#include "io/json.h"
 #include <cassert>
 #include <filesystem>
 #include <iostream>
@@ -10,9 +10,9 @@ int main(int argc, char **argv) {
     const std::string source = argc > 1 ? argv[1] : "..";
     auto c = read_json(source + "/config.json");
     auto a = read_json(source + "/audio_tokenizer/config.json");
-    auto directory = std::filesystem::temp_directory_path() /
-                     ("tts-配置-" +
-                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    auto directory =
+        std::filesystem::temp_directory_path() /
+        ("tts-配置-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(directory / "audio_tokenizer");
     struct Cleanup {
         std::filesystem::path path;
@@ -20,14 +20,29 @@ int main(int argc, char **argv) {
             std::filesystem::remove_all(path);
         }
     } cleanup{directory};
-    auto load = [&](const Json &model, const Json &audio) {
+    auto load = [&](const Json &model, const Json &audio, int batch = 4, int context = 256) {
         std::ofstream(directory / "config.json") << model;
         std::ofstream(directory / "audio_tokenizer/config.json") << audio;
-        return load_model_config(directory.u8string(), 4, 256);
+        return load_model_config(directory.u8string(), batch, context);
     };
     auto good = load(c, a);
     assert(good.backbone.max_positions == 256 && good.depth.max_positions == 16);
     assert(good.codec.transformer.window == a.at("decoder_config").at("sliding_window"));
+    assert(load(c, a, 33).backbone.max_positions == 256);
+    const int position_limit =
+        std::min(c.at("text_encoder_config").at("max_position_embeddings").get<int>(),
+                 c.at("backbone_config").at("max_position_embeddings").get<int>());
+    assert(load(c, a, 1, position_limit).backbone.max_positions == position_limit);
+    for (auto [batch, context] :
+         {std::pair{0, 256}, {4, 0}, {INT32_MAX, 256}, {1, position_limit + 1}}) {
+        bool rejected = false;
+        try {
+            load(c, a, batch, context);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
     for (const char *component :
          {"text_encoder_config", "backbone_config", "depth_decoder_config"}) {
         auto bad = c;

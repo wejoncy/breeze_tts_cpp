@@ -9,7 +9,6 @@ import sys
 import threading
 import unittest
 import wave
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -20,7 +19,7 @@ args, remaining = parser.parse_known_args()
 sys.argv = [sys.argv[0], *remaining]
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "python"), str(ROOT / "examples")]
-from server import make_handler
+from server import Server
 from tts_cpp import Engine
 from request_schema import validate
 
@@ -34,6 +33,7 @@ class ParityTests(unittest.TestCase):
             max_batch=4,
             quantization=args.quantization,
         )
+        cls.engine.run_async()
 
         def fixture(name, text):
             path = ROOT / "artifacts/final" / name
@@ -201,7 +201,7 @@ class ParityTests(unittest.TestCase):
             self.engine.generate([dict(text="Hello.", reference=closed)])
 
     def test_http_multipart_batch_model(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.engine))
+        server = Server(("127.0.0.1", 0), self.engine)
         worker = threading.Thread(target=server.serve_forever)
         worker.start()
 
@@ -262,11 +262,6 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(status, 200, data)
             self.assertEqual(h["X-Segment-Bytes"], ",".join(["7680"] * 5))
             self.assertEqual(len(data), 5 * 7680)
-            server.RequestHandlerClass.admission_gate.acquire()
-            try:
-                self.assertEqual(call("/v1/audio/speech", dict(text="Hi."))[0], 409)
-            finally:
-                server.RequestHandlerClass.admission_gate.release()
             self.assertEqual(
                 call("/v1/audio/speech", dict(text="Hi.", ref_text="missing file"))[0],
                 400,

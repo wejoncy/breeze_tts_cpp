@@ -1,4 +1,4 @@
-#include "engine.h"
+#include "tts/engine.h"
 #include <cassert>
 #include <iostream>
 
@@ -8,6 +8,7 @@ int main(int argc, char **argv) {
     std::vector<Audio> baseline;
     for (int page : {128, 64, 256}) {
         tts::Engine engine(model, 0, 3, 512, page);
+        engine.run_async();
         for (int scenario = 0; scenario < 3; ++scenario) {
             tts::GenerationOptions options;
             options.max_frames = 4;
@@ -16,9 +17,9 @@ int main(int argc, char **argv) {
             options.dual_cfg = scenario == 2;
             options.cfg_scale_ref = 2;
             options.cfg_scale_ins = 3;
-            std::vector<tts::Request> requests;
+            std::vector<tts::Input> requests;
             for (int i = 0; i < (scenario ? 3 : 1); ++i) {
-                tts::Request request;
+                tts::Input request;
                 for (int repeat = 0; repeat < 1 + i * 40; ++repeat)
                     request.text += "Welcome aboard. ";
                 request.instruction = "A calm voice.";

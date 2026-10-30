@@ -3,6 +3,10 @@
 import math
 
 
+class Overloaded(RuntimeError):
+    pass
+
+
 def validate(payload, batch, defaults):
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")

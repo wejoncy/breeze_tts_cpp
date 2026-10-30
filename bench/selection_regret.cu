@@ -1,8 +1,9 @@
-// Compare a reusable capacity-class choice to exhaustive timing at actual M.
-#include "backend.h"
-#include "quant_kernel_catalog.h"
-#include "quant_dispatch.h"
-#include "graph.h"
+// Compare the analytical production choice against native candidates at actual M.
+// The production choice may also use cuBLASLt; the reference here is native only.
+#include "backends/cuda/backend.h"
+#include "kernels/quant/quant_kernel_catalog.h"
+#include "kernels/quant/quant_dispatch.h"
+#include "runtime/graph.h"
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cstdlib>
@@ -11,15 +12,6 @@
 #include <vector>
 using namespace tts;
 using bf16 = __nv_bfloat16;
-void set_autotune(bool enabled) {
-#ifdef _WIN32
-    int result = _putenv_s("TTS_QUANT_AUTOTUNE", enabled ? "" : "0");
-#else
-    int result = enabled ? unsetenv("TTS_QUANT_AUTOTUNE") : setenv("TTS_QUANT_AUTOTUNE", "0", 1);
-#endif
-    if (result)
-        throw std::runtime_error("cannot configure benchmark autotuning");
-}
 __global__ void values(bf16 *x, size_t count) {
     size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
     if (i < count)
@@ -54,7 +46,6 @@ float time_path(Backend &g, const std::function<void(int)> &run, int banks) {
 }
 int main() {
     Backend g(0, Quantization::FP8);
-    QuantBackend baseline(g.memory);
     cudaDeviceProp property{};
     CUDA(cudaGetDeviceProperties(&property, 0));
     Buffer scratch(8 << 20, &g.memory);
@@ -73,12 +64,6 @@ int main() {
             q.quantize(x.view(m, k), a);
             q.quantize(w.view(n * banks, k),
                        {qw.view(n * banks, k, Type::FP8), sw.view(n * banks, 1, Type::F32)});
-            // Standalone benchmark process: disable selection only while preparing
-            // the independent library baseline, then prepare the production path.
-            set_autotune(false);
-            baseline.begin_admission();
-            baseline.prepare(m, n, k);
-            set_autotune(true);
             g.begin_admission();
             q.prepare(m, n, k);
             auto weight = [&](int bank) {
@@ -91,14 +76,13 @@ int main() {
             std::string best_name;
             for (auto config : quant_linear_candidates(
                      {m, n, k}, {true, size_t(property.sharedMemPerBlock), scratch.size()})) {
+                if (config.kind == LinearKind::Lt)
+                    continue;
                 auto run = [&](int bank) {
                     auto b = weight(bank);
-                    if (config.kind == LinearKind::Lt)
-                        baseline.linear(a, b, y.view(m, n));
-                    else
-                        launch_quant_linear(config, {m, n, k}, a.values.data, a.scales.ptr<float>(),
-                                          b.values.data, b.scales.ptr<float>(), y.data(),
-                                          scratch.data(), scratch.size(), g.stream);
+                    launch_quant_linear(config, {m, n, k}, a.values.data, a.scales.ptr<float>(),
+                                        b.values.data, b.scales.ptr<float>(), y.data(),
+                                        scratch.data(), scratch.size(), g.stream);
                 };
                 float us = time_path(g, run, banks);
                 if (us < best) {
@@ -107,8 +91,8 @@ int main() {
                 }
             }
             std::cout << "{\"m\":" << m << ",\"n\":" << n << ",\"k\":" << k
-                      << ",\"selected_us\":" << selected << ",\"best_actual_us\":" << best
-                      << ",\"ratio\":" << selected / best << ",\"best_actual\":\"" << best_name
+                      << ",\"selected_us\":" << selected << ",\"best_native_us\":" << best
+                      << ",\"ratio\":" << selected / best << ",\"best_native\":\"" << best_name
                       << "\"}\n"
                       << std::flush;
         }

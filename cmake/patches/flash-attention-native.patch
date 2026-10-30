@@ -9,7 +9,16 @@
  
  namespace FLASH_NAMESPACE {
  constexpr int TOTAL_DIM = 0;
-@@ -119,7 +119,7 @@
+@@ -103,6 +103,8 @@
+     int * __restrict__ block_table;
+     index_t block_table_batch_stride;
+     int page_block_size;
++    void *const *k_pages, *const *v_pages;
++    index_t page_layer_offset;
+ 
+     // The dropout probability (probability of keeping an activation).
+     float p_dropout;
+@@ -119,7 +121,7 @@
      float softcap;
  
      // Random state.
@@ -39,3 +48,99 @@
      FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                             bidb, bidh, tidx, params.h);
  
+@@ -587,22 +588,22 @@
+     const index_t row_offset_k = block_table == nullptr
+         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
+           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+-        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
++        : (params.k_pages ? 0 : block_table[block_table_idx] * params.k_batch_stride) + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+     const index_t row_offset_v = block_table == nullptr
+         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
+           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
+-        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
++        : (params.v_pages ? 0 : block_table[block_table_idx] * params.v_batch_stride) + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+ 
+     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+-    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
++    Tensor gK = make_tensor(make_gmem_ptr((params.k_pages ? reinterpret_cast<Element *>(params.k_pages[block_table[block_table_idx]]) + params.page_layer_offset : reinterpret_cast<Element *>(params.k_ptr)) + row_offset_k),
+                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                             make_stride(params.k_row_stride, _1{}));
+     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("k_ptr = %p, row_offset_k = %d, gK_ptr = %p\n", params.k_ptr, row_offset_k, gK.data()); }
+-    Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
++    Tensor gV = make_tensor(make_gmem_ptr((params.v_pages ? reinterpret_cast<Element *>(params.v_pages[block_table[block_table_idx]]) + params.page_layer_offset : reinterpret_cast<Element *>(params.v_ptr)) + row_offset_v),
+                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                             make_stride(params.v_row_stride, _1{}));
+ 
+@@ -622,6 +623,21 @@
+     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
+     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
++    // Rebase tiled loads directly onto engine-owned physical pages. Appending a
++    // pool chunk does not change any page address or require KV materialization.
++    const index_t k_thread_offset = tKgK.data().get() - gK.data().get();
++    const index_t v_thread_offset = tVgV.data().get() - gV.data().get();
++    auto page_k = [&](int idx, int offset) {
++        return make_gmem_ptr(reinterpret_cast<Element *>(params.k_pages[block_table[idx]])
++            + params.page_layer_offset + offset * params.k_row_stride
++            + (bidh / params.h_h_k_ratio) * params.k_head_stride + k_thread_offset);
++    };
++    auto page_v = [&](int idx, int offset) {
++        return make_gmem_ptr(reinterpret_cast<Element *>(params.v_pages[block_table[idx]])
++            + params.page_layer_offset + offset * params.v_row_stride
++            + (bidh / params.h_h_k_ratio) * params.v_head_stride + v_thread_offset);
++    };
++
+ 
+     typename Kernel_traits::TiledMma tiled_mma;
+     auto thr_mma = tiled_mma.get_thread_slice(tidx);
+@@ -771,8 +787,8 @@
+                     const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                     const int table_diff = block_table[block_table_idx_next] - block_table[block_table_idx_cur];
+                     const int offset_diff = block_table_offset_next - block_table_offset_cur;
+-                    tVgV.data() = tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
+-                    tKgK.data() = tKgK.data() + table_diff * params.k_batch_stride + offset_diff * params.k_row_stride;
++                    tVgV.data() = params.v_pages ? page_v(block_table_idx_next, block_table_offset_next) : tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
++                    tKgK.data() = params.k_pages ? page_k(block_table_idx_next, block_table_offset_next) : tKgK.data() + table_diff * params.k_batch_stride + offset_diff * params.k_row_stride;
+                 }
+             }
+         }
+@@ -865,7 +881,7 @@
+                 const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
+                 const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+                 const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+-                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
++                tVgV.data() = params.v_pages ? page_v(block_table_idx_next, block_table_offset_next) : tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+         } else {
+@@ -904,7 +920,7 @@
+                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                 const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
++                tKgK.data() = params.k_pages ? page_k(block_table_idx_next, block_table_offset_next) : tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+             // This cp_async_fence needs to be in the if block, otherwise the synchronization
+@@ -947,7 +963,7 @@
+             const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
+             const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+             const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+-            tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
++            tVgV.data() = params.v_pages ? page_v(block_table_idx_next, block_table_offset_next) : tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+         }
+         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+         cute::cp_async_fence();
+@@ -971,7 +987,7 @@
+                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                 const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                 const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
++                tKgK.data() = params.k_pages ? page_k(block_table_idx_next, block_table_offset_next) : tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+             // This cp_async_fence needs to be in the if block, otherwise the synchronization

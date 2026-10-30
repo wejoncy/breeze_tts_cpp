@@ -1,5 +1,5 @@
-#include "kv_cache.h"
-#include "backend.h"
+#include "runtime/kv_cache.h"
+#include "backends/cuda/backend.h"
 #include <cuda_bf16.h>
 #include <cassert>
 #include <cmath>
@@ -11,9 +11,11 @@ static void check_paged(Backend &g, int page_size) {
     const int blocks = cap / page_size, pages = batch * blocks;
     const int lengths[] = {129, 259};
     int rows = lengths[0] + lengths[1];
-    Buffer input(size_t(rows) * (nh + 2 * nk) * dim * 2, &g.memory), q(size_t(rows) * nh * dim * 2, &g.memory),
-        k(size_t(batch) * cap * nk * dim * 2, &g.memory), v(k.size(), &g.memory), pk(k.size(), &g.memory), pv(k.size(), &g.memory), a(q.size(), &g.memory),
-        b(q.size(), &g.memory), table(pages * sizeof(int), &g.memory), meta((2 * rows + 7) * 4, &g.memory), pos(8, &g.memory),
+    Buffer input(size_t(rows) * (nh + 2 * nk) * dim * 2, &g.memory),
+        q(size_t(rows) * nh * dim * 2, &g.memory), k(size_t(batch) * cap * nk * dim * 2, &g.memory),
+        v(k.size(), &g.memory), pk(k.size(), &g.memory), pv(k.size(), &g.memory),
+        a(q.size(), &g.memory), b(q.size(), &g.memory), table(pages * sizeof(int), &g.memory),
+        meta((2 * rows + 7) * 4, &g.memory), pos(8, &g.memory),
         rope(size_t(cap) * dim * 2, &g.memory);
     // Deliberately nonconsecutive, nonmonotone physical pages; lanes own disjoint pages.
     std::vector<int> mapping(pages);
@@ -48,6 +50,12 @@ static void check_paged(Backend &g, int page_size) {
               time, 0, cap, nh, nk, dim, {}, {}, 1e-6f, false, rope.view(cap, dim), 0, pack,
               layout);
     };
+    PagedKVCache pool(g.memory, 2, nk * dim, Type::BF16, batch, cap, page_size);
+    Buffer shared_table(batch * blocks * sizeof(int), &g.memory);
+    PagedKVCache::Lease first(pool, {lengths[0]}, {cap}, shared_table.ptr<int>());
+    PagedKVCache::Lease second(pool, {lengths[1]}, {cap}, shared_table.ptr<int>() + blocks);
+    auto shared = pool.view(shared_table.ptr<int>()).layout;
+    shared.layer = 1; // Check the page-local layer stride as well as page addressing.
     write(k, v, {}, rows, lengths[1], nullptr, &packed);
     write(pk, pv, paged, rows, lengths[1], nullptr, &packed);
     auto attend = [&](Buffer &key, Buffer &val, Buffer &out, CacheLayout layout, int n, int time,
@@ -65,6 +73,11 @@ static void check_paged(Backend &g, int page_size) {
     for (size_t i = 0; i < x.size(); ++i)
         error = std::max(error, std::abs(float(x[i]) - float(y[i])));
     assert(error <= .004f);
+    write(pk, pv, shared, rows, lengths[1], nullptr, &packed);
+    attend(pk, pv, b, shared, rows, lengths[1], nullptr, &packed);
+    g.download(y.data(), b.data(), y.size() * 2);
+    for (size_t i = 0; i < x.size(); ++i)
+        assert(std::abs(float(x[i]) - float(y[i])) <= .004f);
     // Short, non-packed prefill exercises the shared page-table fallback too.
     attend(k, v, a, {}, batch * 31, 31, nullptr, nullptr);
     attend(pk, pv, b, paged, batch * 31, 31, nullptr, nullptr);
@@ -74,9 +87,19 @@ static void check_paged(Backend &g, int page_size) {
         assert(x[i] == y[i]);
     // Appends straddle another page boundary, with independent absolute lane lengths.
     float decode_error = 0;
+    Buffer sequences(batch * sizeof(CacheSequence), &g.memory);
+    std::vector<CacheSequence> sequence_rows;
+    for (int lane = 0; lane < batch; ++lane)
+        sequence_rows.push_back(
+            {pk.data(), pv.data(), 0, table.ptr<int>() + lane * blocks, pos.ptr<int>() + lane});
+    g.upload(sequences.data(), sequence_rows.data(), sequences.size());
+    CacheLayout indirect = paged;
+    indirect.sequences = sequences.ptr<CacheSequence>();
     for (int step = 0; step < 132; ++step) {
         int positions[] = {lengths[0] + step, lengths[1] + step};
         g.upload(pos.data(), positions, sizeof(positions));
+        first.ensure({positions[0] + 1});
+        second.ensure({positions[1] + 1});
         write(k, v, {}, batch, 1, pos.ptr<int>(), nullptr);
         write(pk, pv, paged, batch, 1, pos.ptr<int>(), nullptr);
         attend(k, v, a, {}, batch, 1, pos.ptr<int>(), nullptr);
@@ -85,6 +108,16 @@ static void check_paged(Backend &g, int page_size) {
         g.download(y.data(), b.data(), batch * nh * dim * 2);
         for (int i = 0; i < batch * nh * dim; ++i)
             decode_error = std::max(decode_error, std::abs(float(x[i]) - float(y[i])));
+        write(pk, pv, shared, batch, 1, pos.ptr<int>(), nullptr);
+        attend(pk, pv, a, shared, batch, 1, pos.ptr<int>(), nullptr);
+        g.download(x.data(), a.data(), batch * nh * dim * 2);
+        for (int i = 0; i < batch * nh * dim; ++i)
+            assert(x[i] == y[i]);
+        write(pk, pv, indirect, batch, 1, nullptr, nullptr);
+        attend(pk, pv, a, indirect, batch, 1, nullptr, nullptr);
+        g.download(x.data(), a.data(), batch * nh * dim * 2);
+        for (int i = 0; i < batch * nh * dim; ++i)
+            assert(x[i] == y[i]);
     }
     // FA rounds softmax probabilities to BF16 for tensor-core PV; the dense
     // oracle accumulates FP32. Inputs/values have magnitude <= 0.5.
@@ -95,8 +128,10 @@ static void check_paged(Backend &g, int page_size) {
 static void check_ring(Backend &g) {
     constexpr int batch = 2, nh = 4, nk = 4, dim = 64, cap = 256, window = 72;
     Buffer input(batch * (nh + 2 * nk) * dim * 4, &g.memory), q(batch * nh * dim * 4, &g.memory),
-        k(batch * cap * nk * dim * 4, &g.memory), v(k.size(), &g.memory), rk(batch * window * nk * dim * 4, &g.memory),
-        rv(rk.size(), &g.memory), a(q.size(), &g.memory), b(q.size(), &g.memory), pos(batch * 4, &g.memory), rope(cap * dim * 4, &g.memory);
+        k(batch * cap * nk * dim * 4, &g.memory), v(k.size(), &g.memory),
+        rk(batch * window * nk * dim * 4, &g.memory), rv(rk.size(), &g.memory),
+        a(q.size(), &g.memory), b(q.size(), &g.memory), pos(batch * 4, &g.memory),
+        rope(cap * dim * 4, &g.memory);
     std::vector<float> data(input.size() / 4), x(a.size() / 4), y(x.size());
     g.make_rope(rope.view(cap, dim, Type::F32), dim, 10000, 1, 0);
     for (int step = 0; step < 151; ++step) {
@@ -130,8 +165,9 @@ static void check_ring(Backend &g) {
 }
 static void check_short_attention(Backend &g) {
     constexpr int batch = 2, nh = 8, nk = 2, dim = 128;
-    Buffer q(batch * 2 * nh * dim * 2, &g.memory), k(batch * 31 * nk * dim * 2, &g.memory), v(k.size(), &g.memory), a(q.size(), &g.memory),
-        b(q.size(), &g.memory), positions(batch * sizeof(int), &g.memory);
+    Buffer q(batch * 2 * nh * dim * 2, &g.memory), k(batch * 31 * nk * dim * 2, &g.memory),
+        v(k.size(), &g.memory), a(q.size(), &g.memory), b(q.size(), &g.memory),
+        positions(batch * sizeof(int), &g.memory);
     std::vector<__nv_bfloat16> data(k.size() / 2), x(q.size() / 2), y(x.size());
     for (size_t i = 0; i < data.size(); ++i)
         data[i] = __float2bfloat16(std::sin(i * .037) * .5);
@@ -159,44 +195,111 @@ static void check_short_attention(Backend &g) {
     std::cout << "short attention agrees across capacities 16/17/31 and key counts 15/16/17\n";
 }
 static void check_reuse(Backend &g) {
-    PagedKVCache pool(g.memory, 2, 128, Type::BF16, 6, 512);
-    pool.reserve(7);
-    assert(pool.capacity() == 7);
-    auto *address = pool.keys(0).data;
-    for (const auto &lengths :
-         std::vector<std::vector<int>>{{129, 259}, {1, 127, 128, 129}, {512}}) {
-        PagedKVCache::Lease lease(pool, g.stream, lengths);
-        assert(pool.keys(0).data == address);
+    {
+        PagedKVCache shared(g.memory, 2, 128, Type::BF16, 3, 512);
+        Buffer tables(3 * shared.block_stride() * sizeof(int), &g.memory);
+        {
+            PagedKVCache::Reservation request(shared, 6);
+            const auto capacity = shared.capacity();
+            {
+                PagedKVCache::Lease a(shared, {1}, {256}, tables.ptr<int>(), &request);
+                PagedKVCache::Lease b(shared, {129}, {512},
+                                      tables.ptr<int>() + shared.block_stride(), &request);
+                assert(shared.committed() == 6);
+                bool rejected = false;
+                try {
+                    PagedKVCache::Lease excess(shared, {1}, {128},
+                                               tables.ptr<int>() + 2 * shared.block_stride(),
+                                               &request);
+                } catch (const std::logic_error &) {
+                    rejected = true;
+                }
+                assert(rejected && shared.committed() == 6);
+                a.ensure({256});
+                b.ensure({512});
+                assert(shared.available() == 0 && shared.capacity() == capacity);
+            }
+            assert(shared.available() == 6 && shared.committed() == 6);
+            PagedKVCache::Lease next_wave(shared, {512}, {512}, tables.ptr<int>(), &request);
+            assert(shared.capacity() == capacity && shared.committed() == 6);
+        }
+        assert(shared.committed() == 0 && shared.available() == shared.capacity());
     }
+    PagedKVCache pool(g.memory, 2, 128, Type::BF16, 6, 512);
+    Buffer tables(6 * pool.block_stride() * sizeof(int), &g.memory);
+    auto first = std::make_unique<PagedKVCache::Lease>(pool, std::vector<int>{129},
+                                                       std::vector<int>{256}, tables.ptr<int>());
+    PagedKVCache::Lease second(pool, {259}, {512}, tables.ptr<int>() + pool.block_stride());
+    const auto kept = second.pages();
+    auto returned = first->pages();
+    auto view = pool.view();
+    auto *page_table = view.layout.key_pages;
+    std::vector<void *> addresses(pool.capacity());
+    g.download(addresses.data(), page_table, addresses.size() * sizeof(void *));
+    uint32_t marker = 0x12345678, observed = 0;
+    auto *address = addresses[kept[0]];
+    g.upload(address, &marker, sizeof(marker));
+    int before = pool.capacity();
+    int available = pool.available();
+    first.reset();
+    assert(pool.available() == available + int(returned.size()));
+    assert(pool.committed() == 4);
+    PagedKVCache::Lease third(pool, {129}, {256}, tables.ptr<int>() + 2 * pool.block_stride());
+    assert(pool.capacity() == before);
+    for (int page : third.pages())
+        assert(std::find(returned.begin(), returned.end(), page) != returned.end());
+    second.ensure({512}); // Assign already reserved pages while another request is active.
+    assert(pool.capacity() == before);
+    pool.reserve(16); // Appends storage without invalidating old addresses/page tables.
+    assert(pool.view().layout.key_pages == page_table);
+    g.download(&observed, address, sizeof(observed));
+    assert(observed == marker);
+    assert(std::equal(kept.begin(), kept.end(), second.pages().begin()));
     bool rejected = false;
     try {
-        PagedKVCache::Lease bad(pool, g.stream, {513});
+        third.ensure({513});
     } catch (const std::invalid_argument &) {
         rejected = true;
     }
     assert(rejected);
-    pool.reserve(16);
-    PagedKVCache::Lease lease(pool, g.stream, {512, 512, 512});
+    rejected = false;
+    try {
+        third.ensure({257}); // In context, but outside this request's admitted limit.
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected);
+    third.ensure({256});
     PagedKVCache unaligned(g.memory, 1, 1, Type::BF16, 1, 130, 64);
-    unaligned.reserve(3);
+    Buffer small_table(unaligned.block_stride() * sizeof(int), &g.memory);
     assert(unaligned.required_pages({130}) == 3);
     for (const auto &lengths : std::vector<std::vector<int>>{{131}, {0}, {-1}, {}, {1, 1}}) {
         rejected = false;
         try {
-            PagedKVCache::Lease bad(unaligned, g.stream, lengths);
+            PagedKVCache::Lease bad(unaligned, lengths, lengths, small_table.ptr<int>());
         } catch (const std::invalid_argument &) {
             rejected = true;
         }
         assert(rejected);
     }
-    PagedKVCache::Lease valid(unaligned, g.stream, {130});
-    // Pool geometry must not impose the engine's independent context admission limit.
+    PagedKVCache::Lease valid(unaligned, {130}, {130}, small_table.ptr<int>());
+    const auto committed = unaligned.committed();
+    rejected = false;
+    try {
+        PagedKVCache::Lease overcommitted(unaligned, {1}, {1}, small_table.ptr<int>());
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected && unaligned.committed() == committed);
+    valid.ensure({130});
     PagedKVCache larger(g.memory, 1, 1, Type::BF16, 1, 9001);
+    Buffer large_table(larger.block_stride() * sizeof(int), &g.memory);
     assert(larger.required_pages({9001}) == 71);
-    larger.reserve(71);
-    PagedKVCache::Lease big(larger, g.stream, {9001});
-    std::cout << "page leases, reuse, rejection recovery and idle growth passed\n";
+    PagedKVCache::Lease big(larger, {9001}, {9001}, large_table.ptr<int>());
+    std::cout << "global KV pool: simultaneous leases, cross-request page reuse, live growth and "
+                 "stable addresses passed\n";
 }
+
 int main() {
     Backend g;
     for (int page_size : {64, 128, 256})

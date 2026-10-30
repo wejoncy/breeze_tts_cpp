@@ -1,6 +1,6 @@
-#include "backend.h"
-#include "graph.h"
-#include "quant_norm_kernels.cuh"
+#include "backends/cuda/backend.h"
+#include "runtime/graph.h"
+#include "kernels/quant/quant_norm_kernels.cuh"
 #include <functional>
 #include <iostream>
 #include <iomanip>
@@ -50,7 +50,6 @@ int main(int argc, char **argv) {
     bool gemma = argc > 3 ? atoi(argv[3]) : false;
     std::string profile = argc > 4 ? argv[4] : "";
     Backend g(0, Quantization::FP8);
-    g.quantized().prepare_norm(rows, width, gemma);
     Buffer x(size_t(rows) * width * 2, &g.memory), u(x.size(), &g.memory), w(width * 2, &g.memory), y(x.size(), &g.memory),
         q(size_t(rows) * width, &g.memory), s(rows * 4, &g.memory);
     auto fill = [&](Buffer &v, float a, unsigned seed) {

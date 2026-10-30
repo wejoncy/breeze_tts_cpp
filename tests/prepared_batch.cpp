@@ -1,4 +1,4 @@
-#include "prepared_batch.h"
+#include "execution/prepared_batch.h"
 #include <cassert>
 #include <iostream>
 using namespace tts;
@@ -11,8 +11,8 @@ int main(int argc, char **argv) {
     ref->codebooks = config.codebooks;
     ref->codebook_size = config.codec.codebook_size;
     ref->codes.assign(2 * config.codebooks, 7);
-    std::vector<Request> requests{{"你好。", "A calm voice.", "S0", ref},
-                                  {"Welcome aboard.", "A clear voice.", "S1", {}}};
+    std::vector<Input> requests{{"你好。", "A calm voice.", "S0", ref},
+                                {"Welcome aboard.", "A clear voice.", "S1", {}}};
     GenerationOptions options;
     options.max_frames = 4;
     auto check = [&](const PreparedBatch &p) {
@@ -53,6 +53,20 @@ int main(int argc, char **argv) {
     assert(cfg.prompts[0].target == tokenizer.encode("[S0]你好。"));
     assert(cfg.prompts[2].target == cfg.prompts[0].target);
     assert(cfg.prompts[4].target == mixed.prompts[0].target);
+    auto packed = pack_prefill({&mixed, &cfg});
+    check(packed);
+    assert(packed.batch == 4 && packed.lanes == 8);
+    assert(packed.max_prompt == std::max(mixed.max_prompt, cfg.max_prompt));
+    assert(packed.text_rows == mixed.text_rows + cfg.text_rows);
+    assert(packed.prompt_rows == mixed.prompt_rows + cfg.prompt_rows);
+    assert(
+        std::equal(cfg.tokens.begin(), cfg.tokens.end(), packed.tokens.begin() + mixed.text_rows));
+    for (size_t i = 0; i < cfg.segments.size(); ++i) {
+        const auto actual = packed.segments[mixed.segments.size() + i];
+        assert(actual.start == cfg.segments[i].start + mixed.text_rows);
+        assert(actual.destination == cfg.segments[i].destination + mixed.prompt_rows);
+        assert(actual.size == cfg.segments[i].size);
+    }
     requests[0].reference.reset();
     bool rejected = false;
     try {

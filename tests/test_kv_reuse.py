@@ -17,10 +17,17 @@ from tts_cpp import Engine
 
 
 class CacheReuseTests(unittest.TestCase):
-    def test_capacity_is_a_limit_not_a_reservation(self):
-        # The old worst-case reservation exceeds the entire H100 NVL at these
-        # legal limits, even when the actual request contains a single short lane.
-        with Engine(library=args.library, model=args.model, max_batch=32, context=8192) as engine:
+    def test_limits_are_independent_of_physical_backing(self):
+        # Legal context/concurrency limits may exceed the fixed physical backing.
+        # Actual KV credits and transient workspace decide each admission.
+        with Engine(
+            library=args.library,
+            model=args.model,
+            max_batch=32,
+            context=8192,
+            runtime_memory_mb=1024,
+        ) as engine:
+            engine.run_async()
             short = [dict(text="你好。")]
             options = dict(max_frames=4, temperature=0)
             original, _ = engine.generate(short, options)

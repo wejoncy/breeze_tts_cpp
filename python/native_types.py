@@ -1,6 +1,7 @@
 """Opaque RAII handles and generation fields reflected by the C++ adapter."""
 
 import tvm_ffi
+from request_schema import Overloaded
 
 
 class Options(tvm_ffi.Object):
@@ -16,6 +17,7 @@ class ReferenceHandle(tvm_ffi.Object):
 
 
 def register_types():
+    tvm_ffi.register_error("TTSOverloaded", Overloaded)
     for cls in (Options, EngineHandle, ReferenceHandle):
         tvm_ffi.register_object("tts." + cls.__name__)(cls)
     # FFI scalar integers use int64 on the wire; native RNG seeds use uint64.

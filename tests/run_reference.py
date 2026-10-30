@@ -33,7 +33,8 @@ for name, text, batch in [
     folder.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(
-        TTS_DUMP_PREFIX=str(folder / "native"), TTS_TOKENS_OUT=str(folder / "codes.i32")
+        TTS_DUMP_PREFIX=str(folder / "native-{request}"),
+        TTS_TOKENS_OUT=str(folder / "codes-{request}.i32"),
     )
     inputs = ["--text", text]
     if batch > 1:
@@ -64,7 +65,17 @@ for name, text, batch in [
             stderr=log,
             check=True,
         )
-    codes = (folder / "codes.i32").read_bytes()
+    for component in folder.glob("native-1.*"):
+        (folder / component.name.replace("native-1.", "native.", 1)).write_bytes(
+            component.read_bytes()
+        )
+    streams = [(folder / f"codes-{lane + 1}.i32").read_bytes() for lane in range(batch)]
+    codes = b"".join(
+        stream[offset : offset + 64]
+        for offset in range(0, len(streams[0]), 64)
+        for stream in streams
+    )
+    (folder / "codes.i32").write_bytes(codes)
     if batch == 2:
         codes *= 12  # 96 codec frames; only the first frame is used for depth oracle.
         (folder / "codes.i32").write_bytes(codes)

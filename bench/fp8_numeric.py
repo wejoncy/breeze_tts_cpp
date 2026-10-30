@@ -67,6 +67,7 @@ def run(args):
                 quantization=None if precision == "bf16" else precision,
                 max_batch=1,
             ) as engine:
+                engine.run_async()
                 for case in cases:
                     name = case["case"]
                     if precision == "bf16":

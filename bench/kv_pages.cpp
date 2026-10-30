@@ -1,6 +1,6 @@
-#include "backend.h"
-#include "graph.h"
-#include "kv_cache.h"
+#include "backends/cuda/backend.h"
+#include "runtime/graph.h"
+#include "runtime/kv_cache.h"
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -25,20 +25,27 @@ int main(int argc, char **argv) {
             lengths[i] = std::max(1, context - i * 7);
             positions[i] = lengths[i] - 1;
         }
-        pool.reserve(pool.required_pages(lengths));
-        tts::PagedKVCache::Lease lease(pool, g.stream, lengths);
-        auto view = pool.view();
-        CUDA(cudaMemsetAsync(view.keys.data, 0, view.keys.size(), g.stream));
-        CUDA(cudaMemsetAsync(view.values.data, 0, view.values.size(), g.stream));
+        tts::Buffer table(size_t(batch) * pool.block_stride() * sizeof(int), &g.memory);
+        tts::PagedKVCache::Lease lease(pool, lengths, lengths, table.ptr<int>());
+        auto view = lease.view();
+        std::vector<void *> addresses(pool.capacity());
+        for (auto pages : {view.layout.key_pages, view.layout.value_pages}) {
+            g.download(addresses.data(), pages, addresses.size() * sizeof(void *));
+            for (auto address : addresses)
+                CUDA(cudaMemsetAsync(address, 0, view.layout.page_layer_bytes * layers, g.stream));
+        }
         tts::Buffer q(size_t(batch) * heads * dim * 2, &g.memory), out(q.size(), &g.memory), pos(batch * sizeof(int), &g.memory);
         g.zero(q);
         g.upload(pos.data(), positions.data(), pos.size());
         tts::Graph graph;
         graph.capture(g.stream, [&] {
-            for (int layer = 0; layer < layers; ++layer)
-                g.attention(q.view(batch, heads * dim), pool.keys(layer), pool.values(layer),
+            for (int layer = 0; layer < layers; ++layer) {
+                auto layout = view.layout;
+                layout.layer = layer;
+                g.attention(q.view(batch, heads * dim), view.keys, view.values,
                             out.view(batch, heads * dim), pos.ptr<int>(), batch, 1, 0, context,
-                            heads, kvheads, dim, true, 0, -1, nullptr, pool.layout());
+                            heads, kvheads, dim, true, 0, -1, nullptr, layout);
+            }
         });
         for (int i = 0; i < 5; ++i)
             graph.run(g.stream);

@@ -1,4 +1,4 @@
-#include "quant_gemm.h"
+#include "kernels/quant/quant_gemm.h"
 #include <cuda_bf16.h>
 #include <stdexcept>
 #include <cutlass/cutlass.h>

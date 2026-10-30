@@ -1,8 +1,8 @@
 // Benchmark adapter only: links the unmodified HoppouAI core and the native engine.
 // argv: ENGINE(native|hoppou) MODEL PLAN.json RESULTS.json
-#include "engine.h"
-#include "tokenizer.h"
-#include "backend.h"
+#include "tts/engine.h"
+#include "io/tokenizer.h"
+#include "backends/cuda/backend.h"
 #include "breeze/audio.h"
 #include "breeze/generation.h"
 #include <chrono>

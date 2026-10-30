@@ -1,15 +1,52 @@
-#include "backend.h"
+#include "backends/cuda/backend.h"
 #include "quant_reference.h"
-#include "quant_kernel_catalog.h"
-#include "quant_dispatch.h"
-#include "graph.h"
+#include "kernels/quant/quant_kernel_catalog.h"
+#include "kernels/quant/quant_dispatch.h"
+#include "kernels/quant/quant_format.cuh"
+#include "runtime/graph.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 using namespace tts;
 using bf16 = __nv_bfloat16;
+__global__ void encode_int8_pairs(const float2 *x, unsigned short *q, int pairs) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < pairs)
+        q[i] = quant_device::Format<Type::I8>::pair(x[i]);
+}
+void int8_pairs_test(Backend &g) {
+    if (g.quantized().type() != Type::I8)
+        return;
+    std::vector<float> input(65536 + 3 * 512);
+    for (unsigned i = 0; i < 65536; ++i) {
+        uint32_t bits = i << 16;
+        std::memcpy(&input[i], &bits, sizeof(bits));
+    }
+    for (int i = 0; i < 3 * 512; ++i) {
+        float tie = i / 3 - 256.f + .5f;
+        input[65536 + i] =
+            i % 3 == 0 ? tie : std::nextafter(tie, i % 3 == 1 ? -INFINITY : INFINITY);
+    }
+    Buffer x(input.size() * sizeof(float), &g.memory), q(input.size(), &g.memory);
+    g.upload(x.data(), input.data(), x.size());
+    int pairs = int(input.size() / 2);
+    encode_int8_pairs<<<(pairs + 255) / 256, 256, 0, g.stream>>>(x.ptr<float2>(),
+                                                                 q.ptr<unsigned short>(), pairs);
+    std::vector<unsigned char> actual(q.size());
+    g.download(actual.data(), q.data(), q.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        // CUDA fmaxf suppresses both quiet and signaling NaNs. Host fmaxf may
+        // propagate signaling NaNs, so define the expected clipping explicitly.
+        float bounded = std::isnan(input[i]) ? -127.f : std::clamp(input[i], -127.f, 127.f);
+        auto expected = static_cast<unsigned char>(int(std::nearbyint(bounded)));
+        assert(actual[i] == expected);
+    }
+    std::cout << "INT8 packed conversion: all BF16 patterns and float tie neighbors match "
+                 "nearest-even symmetric clipping\n";
+}
 void linear_test(Backend &g, int rows, int n, int k, bool exact = false, bool projection = false) {
     g.begin_admission();
     Buffer x(size_t(rows) * k * 2, &g.memory), w(size_t(n) * k * 2, &g.memory), qx(size_t(rows) * k, &g.memory), qw(size_t(n) * k, &g.memory),
@@ -160,7 +197,6 @@ void producer_test(Backend &g, int width, bool gemma) {
                   << relative << '\n';
     };
     if (width <= 2048) {
-        g.quantized().prepare_norm(rows, width, gemma);
         g.residual_norm(x.view(rows, width), u.view(rows, width), w.view(1, width),
                         reference.view(rows, width), 1e-6f, {}, gemma);
         g.download(actual.data(), reference.data(), reference.size());
@@ -174,7 +210,6 @@ void producer_test(Backend &g, int width, bool gemma) {
     g.upload(gu.data(), gated.data(), gu.size());
     g.gated(gu.view(rows, width * 2), reference.view(rows, width), gemma ? 1 : 0);
     g.download(actual.data(), reference.data(), reference.size());
-    g.quantized().prepare_gated(rows, width, gemma ? 1 : 0);
     g.quantized().gated(gu.view(rows, width * 2), output, gemma ? 1 : 0);
     verify("fused gated activation");
 }
@@ -197,19 +232,21 @@ void graph_after_plan_eviction(Backend &g) {
     graph.capture(g.stream, [&] { q.linear(a, b, y.view(m, n)); });
     graph.run(g.stream);
     g.sync();
-    auto revision = g.execution_revision();
     for (int rows = 64; rows < 144; ++rows) {
         g.begin_admission();
         q.prepare(rows, n, k);
     }
     assert(q.cache_stats().prepared_plans <= 65);
-    assert(g.execution_revision() > revision);
+    auto searches = q.cache_stats().selection.searches;
+    g.begin_admission();
+    q.prepare(m, n, k);
+    assert(q.cache_stats().selection.searches == searches);
     graph.run(g.stream);
     std::vector<bf16> result(m * n);
     g.download(result.data(), y.data(), y.size());
     for (auto v : result)
         assert(float(v) == 256.f);
-    std::cout << "captured quantized graph survives exact-plan eviction; revision advances\n";
+    std::cout << "captured quantized graph and algorithm choice survive exact-plan eviction\n";
 }
 void int8_paths_test(Backend &g) {
     if (g.quantized().type() != Type::I8)
@@ -326,5 +363,6 @@ int main(int argc, char **argv) {
     graph_after_plan_eviction(g);
     int8_paths_test(g);
     int8_rounding_test(g);
+    int8_pairs_test(g);
     CUDA(cudaGetLastError());
 }

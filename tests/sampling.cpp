@@ -1,15 +1,84 @@
-#include "sampling.h"
-#include "audio_kernels.h"
-#include "backend.h"
+#include "kernels/sampling/sampling.h"
+#include "kernels/audio/audio_kernels.h"
+#include "backends/cuda/backend.h"
 #include <cassert>
 #include <cuda_bf16.h>
 #include <iostream>
+static void mapped_sampling(tts::Backend &g) {
+    constexpr int count = 3, books = 3, entries = 37, vocab = 41, lanes = 6;
+    std::vector<float> logits(lanes * vocab);
+    for (size_t i = 0; i < logits.size(); ++i)
+        logits[i] = float(int((i * 17) % 29) - 14) * .17f;
+    tts::Buffer input(logits.size() * sizeof(float), &g.memory),
+        output(count * books * sizeof(int), &g.memory), done(count * sizeof(int), &g.memory),
+        history(count * entries * sizeof(int), &g.memory), rng(count * sizeof(uint64_t), &g.memory),
+        metadata((count + 1) * sizeof(tts::SamplingRow), &g.memory);
+    std::vector<uint64_t> seeds{11, 23, 37};
+    g.upload(input.data(), logits.data(), input.size());
+    auto reset = [&] {
+        g.zero(output);
+        g.zero(done);
+        g.zero(history);
+        g.upload(rng.data(), seeds.data(), rng.size());
+    };
+    reset();
+    std::vector<tts::SamplingRow> rows(count + 1); // Last row is inactive padding.
+    for (int request = 0, offset = 0; request < count; ++request) {
+        auto &row = rows[count - 1 - request]; // Dense scheduling order differs from state order.
+        row.codes = output.ptr<int>() + request * books;
+        row.done = done.ptr<int>() + request;
+        row.seen = history.ptr<int>() + request * entries;
+        row.rng = rng.ptr<uint64_t>() + request;
+        row.branches = request + 1;
+        row.cfg = 2;
+        row.cfg_ref = .7f;
+        row.cfg_ins = 1.3f;
+        row.penalty = 1.1f;
+        row.backbone = {request == 0 ? 0.f : .8f, .9f, 9};
+        row.depth = {.6f, .85f, 7};
+        for (int branch = 0; branch < row.branches; ++branch)
+            row.logits[branch] = offset + branch;
+        for (int cb = 0; cb < books; ++cb) {
+            auto params = cb ? row.depth : row.backbone;
+            tts::sample(g.stream,
+                        input.view(lanes, vocab, tts::Type::F32).slice(offset, row.branches),
+                        {books, entries, 40}, row.codes, row.rng, 1, row.branches, cb, row.cfg,
+                        params.temperature, params.top_k, row.done, params.top_p, row.cfg_ref,
+                        row.cfg_ins, row.penalty, cb ? nullptr : row.seen);
+        }
+        offset += row.branches;
+    }
+    std::vector<int> expected(count * books), actual(expected.size());
+    std::vector<uint64_t> expected_rng(count), actual_rng(count);
+    g.download(expected.data(), output.data(), output.size());
+    g.download(expected_rng.data(), rng.data(), rng.size());
+    reset();
+    g.upload(metadata.data(), rows.data(), metadata.size());
+    tts::Buffer dense_done((count + 1) * sizeof(int), &g.memory);
+    std::vector<int> flags(count + 1, -1), state_flags(count);
+    g.upload(dense_done.data(), flags.data(), dense_done.size());
+    for (int cb = 0; cb < books; ++cb)
+        tts::sample(g.stream, input.view(lanes, vocab, tts::Type::F32), {books, entries, 40},
+                    nullptr, nullptr, count + 1, 1, cb, 1, 0, 0, dense_done.ptr<int>(), 1, 1, 1, 1,
+                    nullptr, metadata.ptr<tts::SamplingRow>());
+    g.download(actual.data(), output.data(), output.size());
+    g.download(actual_rng.data(), rng.data(), rng.size());
+    assert(actual == expected && actual_rng == expected_rng);
+    g.download(flags.data(), dense_done.data(), dense_done.size());
+    g.download(state_flags.data(), done.data(), done.size());
+    assert(flags[count] == 1);
+    for (int row = 0; row < count; ++row)
+        assert(flags[row] == state_flags[count - 1 - row]);
+}
+
 // Synthetic distributions isolate CFG/penalty/filtering from model numerics.
 int main() {
     tts::Backend g;
+    mapped_sampling(g);
     int batch = 2, branches = 3, vocab = 2052;
-    tts::Buffer logits(size_t(batch) * branches * vocab * 4, &g.memory), codes(batch * 16 * 4, &g.memory),
-        done(batch * 4, &g.memory), rng(batch * 8, &g.memory), seen(batch * 2048 * 4, &g.memory);
+    tts::Buffer logits(size_t(batch) * branches * vocab * 4, &g.memory),
+        codes(batch * 16 * 4, &g.memory), done(batch * 4, &g.memory), rng(batch * 8, &g.memory),
+        seen(batch * 2048 * 4, &g.memory);
     std::vector<float> l(size_t(batch) * branches * vocab, -100);
     for (int b = 0; b < batch; b++) {
         l[b * vocab + 2] = 4;

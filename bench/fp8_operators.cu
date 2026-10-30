@@ -1,6 +1,6 @@
 // Paired measurements of actual engine operators. CUDA graphs exclude host launch overhead.
-#include "backend.h"
-#include "graph.h"
+#include "backends/cuda/backend.h"
+#include "runtime/graph.h"
 #include <cuda_bf16.h>
 #include <functional>
 #include <iostream>
@@ -69,22 +69,27 @@ void linear(Backend &g, const char *model, const char *op, int m, int n, int k) 
     size_t matrix = size_t(n) * k;
     int banks = std::min<size_t>(
         128, std::max<size_t>(4, (2 * property.l2CacheSize + matrix - 1) / matrix));
-    Buffer x(size_t(m) * k * 2, &g.memory), w(matrix * banks * 2, &g.memory), qx(size_t(m) * k, &g.memory), qw(matrix * banks, &g.memory),
-        sx(m * 4, &g.memory), sw(size_t(banks) * n * 4, &g.memory), y(size_t(m) * n * 2, &g.memory);
+    Buffer x(size_t(m) * k * 2, &g.memory), w(matrix * banks * 2, &g.memory),
+        qx(size_t(m) * k, &g.memory), qw(matrix * banks, &g.memory), sx(m * 4, &g.memory),
+        sw(size_t(banks) * n * 4, &g.memory), y(size_t(m) * n * 2, &g.memory);
     fill(g, x, 7);
     fill(g, w, 13, .1f);
+    auto bf = [&](int bank) {
+        g.linear(x.view(m, k), w.view(n, k, Type::BF16, matrix * bank * 2), y.view(m, n));
+    };
+    if (std::string(op) == "out") {
+        // The engine keeps attention output projections in BF16 in every mode.
+        float b = timing(g, bf, banks);
+        output(model, "out_bf16", m, n, k, b, b);
+        return;
+    }
     auto &quant = g.quantized();
     RowScaledView a{qx.view(m, k, g.quantized().type()), sx.view(m, 1, Type::F32)};
     quant.quantize(x.view(m, k), a);
     quant.quantize(w.view(n * banks, k),
                    {qw.view(n * banks, k, g.quantized().type()), sw.view(n * banks, 1, Type::F32)});
     quant.prepare(m, n, k);
-    if (std::string(op) == "out")
-        quant.prepare_projection(m, n, k);
     g.sync();
-    auto bf = [&](int bank) {
-        g.linear(x.view(m, k), w.view(n, k, Type::BF16, matrix * bank * 2), y.view(m, n));
-    };
     auto fp = [&](int bank) {
         quant.linear(a,
                      {qw.view(n, k, g.quantized().type(), matrix * bank),
@@ -96,27 +101,15 @@ void linear(Backend &g, const char *model, const char *op, int m, int n, int k) 
     g.sync();
     float b = timing(g, bf, banks), q = timing(g, fp, banks);
     output(model, op, m, n, k, b, q, matrix);
-    if (std::string(op) == "out") {
-        auto complete = [&](int bank) {
-            quant.quantize(x.view(m, k), a);
-            fp(bank);
-        };
-        output(model, "out_with_quant", m, n, k, b, timing(g, complete, banks), matrix);
-        auto selected = [&](int bank) {
-            quant.project(x.view(m, k),
-                          {qw.view(n, k, g.quantized().type(), matrix * bank),
-                           sw.view(n, 1, Type::F32, size_t(bank) * n * 4)},
-                          a, y.view(m, n));
-        };
-        output(model, "out_complete", m, n, k, b, timing(g, selected, banks), matrix);
-    }
 }
 void producers(Backend &g, const char *model, int rows, int hidden, int intermediate, bool gemma) {
     constexpr int copies = 64, banks = 4;
     auto &quant = g.quantized();
-    Buffer x(size_t(banks) * rows * hidden * 2, &g.memory), u(x.size(), &g.memory), w(hidden * 2, &g.memory),
-        y(size_t(rows) * hidden * 2, &g.memory), q(size_t(rows) * intermediate, &g.memory), s(rows * 4, &g.memory),
-        gu(size_t(banks) * rows * intermediate * 4, &g.memory), gy(size_t(rows) * intermediate * 2, &g.memory);
+    Buffer x(size_t(banks) * rows * hidden * 2, &g.memory), u(x.size(), &g.memory),
+        w(hidden * 2, &g.memory), y(size_t(rows) * hidden * 2, &g.memory),
+        q(size_t(rows) * intermediate, &g.memory), s(rows * 4, &g.memory),
+        gu(size_t(banks) * rows * intermediate * 4, &g.memory),
+        gy(size_t(rows) * intermediate * 2, &g.memory);
     fill(g, x, 17);
     fill(g, u, 21, .1);
     fill(g, w, 8, .5);
@@ -133,7 +126,6 @@ void producers(Backend &g, const char *model, int rows, int hidden, int intermed
         return gu.view(rows, intermediate * 2, Type::BF16,
                        size_t(i % banks) * rows * intermediate * 4);
     };
-    quant.prepare_norm(rows, hidden, gemma);
     auto normbf = [&](int i) {
         g.norm(xv(i), w.view(1, hidden), y.view(rows, hidden), 1e-6f, gemma);
     };
@@ -149,7 +141,6 @@ void producers(Backend &g, const char *model, int rows, int hidden, int intermed
     fill(g, x, 17);
     f = timing(g, resfp, copies);
     output(model, "residual_rms", rows, hidden, 0, b, f);
-    quant.prepare_gated(rows, intermediate, gemma ? 1 : 0);
     auto gatebf = [&](int i) { g.gated(gv(i), gy.view(rows, intermediate), gemma ? 1 : 0); };
     auto gatefp = [&](int i) { quant.gated(gv(i), z, gemma ? 1 : 0); };
     b = timing(g, gatebf, copies);

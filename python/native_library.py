@@ -40,9 +40,16 @@ def load_library(library=None):
     path = library_path(library)
     with _lock:
         if path not in _loaded:
+            if _loaded:
+                previous = next(iter(_loaded))
+                if path.samefile(previous):
+                    return _loaded[previous][0]
+                raise RuntimeError(
+                    "A different native library is already loaded; use the same library "
+                    "for logging and engines (or set TTS_LIBRARY before importing)."
+                )
             module, directories = _load(path)
-            if not _loaded:
-                register_types()
+            register_types()
             _loaded[path] = (module, directories)
         return _loaded[path][0]
 

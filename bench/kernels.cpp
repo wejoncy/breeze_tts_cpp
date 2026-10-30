@@ -1,4 +1,7 @@
-#include "backend.h"
+#include "backends/cuda/backend.h"
+#include "kernels/attention/flash_attention.h"
+#include <cmath>
+#include <cuda_bf16.h>
 #include <iostream>
 #include <chrono>
 #include <cstdlib>
@@ -13,20 +16,39 @@ static int primitive(int argc, char **argv) {
         throw std::invalid_argument("invalid benchmark size");
     tts::Backend g;
     tts::Buffer x(size_t(rows) * 2048 * 2, &g.memory), u(x.size(), &g.memory), y(x.size(), &g.memory), w(2048 * 2, &g.memory);
-    tts::Buffer keys(size_t(rows) * 512 * 8 * 128 * 2, &g.memory), values(keys.size(), &g.memory);
+    tts::Buffer keys(size_t(rows) * 17 * 2 * 128 * 2, &g.memory), values(keys.size(), &g.memory);
+    tts::Buffer lse(size_t(rows) * 8 * sizeof(float), &g.memory);
     for (auto *b : {&x, &u, &y, &w, &keys, &values})
         g.zero(*b);
+    if (kind == "--depth-attention" || kind == "--flash-depth-attention") {
+        std::vector<__nv_bfloat16> data(keys.size() / 2);
+        int seed = 0;
+        for (auto *b : {&x, &keys, &values}) {
+            ++seed;
+            for (size_t i = 0; i < b->size() / 2; ++i)
+                data[i] = __nv_bfloat16(std::sin(i * .037f + seed));
+            g.upload(b->data(), data.data(), b->size());
+            g.sync();
+        }
+    }
     auto launch = [&] {
         if (kind == "--rms") {
             if (width != 1024 && width != 1152 && width != 2048)
                 throw std::invalid_argument("RMS width");
             g.residual_norm(x.view(rows, width), u.view(rows, width), w.view(1, width),
                             y.view(rows, width), 1e-6f);
-        } else if (kind == "--depth-attention") {
+        } else if (kind == "--depth-attention" || kind == "--flash-depth-attention") {
             if (width < 1 || width > 16)
                 throw std::invalid_argument("depth key count");
-            g.attention(x.view(rows, 1024), keys.view(rows * 17, 256), values.view(rows * 17, 256),
-                        y.view(rows, 1024), nullptr, rows, 1, 0, 17, 8, 2, 128, true, 0, width - 1);
+            if (kind == "--flash-depth-attention")
+                tts::flash_prefill(g.stream, x.view(rows, 1024), keys.view(rows * 17, 256),
+                                    values.view(rows * 17, 256), y.view(rows, 1024),
+                                    lse.ptr<float>(), rows, 1, 0, 17, 8, 2, 128, true, 0,
+                                    nullptr, {}, width);
+            else
+                g.attention(x.view(rows, 1024), keys.view(rows * 17, 256),
+                            values.view(rows * 17, 256), y.view(rows, 1024), nullptr, rows, 1, 0,
+                            17, 8, 2, 128, true, 0, width - 1);
         } else
             throw std::invalid_argument("unknown primitive");
     };

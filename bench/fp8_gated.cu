@@ -1,8 +1,8 @@
-#include "backend.h"
-#include "graph.h"
-#include "quant_gated_dispatch.cuh"
+#include "backends/cuda/backend.h"
+#include "runtime/graph.h"
+#include "support/quant_gated_dispatch.cuh"
 #include "gated_legacy.cuh"
-#include "kernel_timing.h"
+#include "support/kernel_timing.h"
 #include <functional>
 #include <iostream>
 #include <iomanip>
@@ -13,7 +13,6 @@ int main(int argc, char **argv) {
         kind = argc > 3 ? atoi(argv[3]) : 0;
     std::string profile = argc > 4 ? argv[4] : "";
     Backend g(0, Quantization::FP8);
-    g.quantized().prepare_gated(rows, width, kind);
     Buffer x(size_t(rows) * width * 4, &g.memory), y(size_t(rows) * width * 2, &g.memory), q(size_t(rows) * width, &g.memory),
         s(rows * 4, &g.memory);
     Buffer table(65536 * 2, &g.memory);

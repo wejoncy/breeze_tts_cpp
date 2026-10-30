@@ -29,7 +29,15 @@ class Capture(logging.Handler):
         self.records.append(record)
         calls = [lambda: configure_logging("off")]
         if self.engine is not None:
-            calls.extend([self.engine.memory_stats, self.engine.close])
+            calls.extend([
+                self.engine.memory_stats,
+                self.engine.run_async,
+                self.engine.close,
+                self.engine.configure_serving,
+                lambda: self.engine.add_request({}),
+                lambda: self.engine.read_result("callback", 0),
+                lambda: self.engine.cancel_request("callback"),
+            ])
         for call in calls:
             try:
                 call()
@@ -53,7 +61,15 @@ class LoggingTests(unittest.TestCase):
         with Engine(
             model=args.model, max_batch=1, quantization="int8"
         ) as engine:
+            engine.run_async()
             capture.engine = engine
+            # The caller waits for the worker while holding the Python engine lock.
+            # Log reentry must reject before trying that lock on the worker thread.
+            with engine.prepare_reference(
+                [0.0] * (engine.audio_format["samples_per_frame"] * 2),
+                "Hello.", sample_rate=engine.audio_format["sample_rate"],
+            ):
+                pass
             a, _ = engine.generate(
                 [dict(text="你好。")], dict(max_frames=2, temperature=0)
             )

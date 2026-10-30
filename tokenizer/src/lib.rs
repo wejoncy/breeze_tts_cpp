@@ -17,7 +17,10 @@ pub unsafe extern "C" fn hf_tokenizer_new(
 ) -> *mut c_void {
     let result = catch_unwind(|| {
         let path = CStr::from_ptr(path).to_str().map_err(|e| e.to_string())?;
-        Tokenizer::from_file(path).map_err(|e| e.to_string())
+        let tokenizer = Tokenizer::from_file(path).map_err(|e| e.to_string())?;
+        // Materialize lazy regex/BPE resources while loading, before accepting requests.
+        tokenizer.encode("Warmup.", true).map_err(|e| e.to_string())?;
+        Ok::<_, String>(tokenizer)
     });
     match result {
         Ok(Ok(t)) => Box::into_raw(Box::new(t)).cast(),

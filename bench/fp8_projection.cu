@@ -1,6 +1,6 @@
 // Experimental only: compare complete BF16-input projection paths before dispatch decisions.
-#include "backend.h"
-#include "graph.h"
+#include "backends/cuda/backend.h"
+#include "runtime/graph.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cublasLt.h>

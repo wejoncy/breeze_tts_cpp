@@ -1,6 +1,6 @@
-#include "backend.h"
+#include "backends/cuda/backend.h"
 #include "quant_reference.h"
-#include "quant_gated_dispatch.cuh"
+#include "support/quant_gated_dispatch.cuh"
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -97,7 +97,6 @@ int main(int argc, char **argv) {
         table_test(g, kind, table);
         for (int width : {31, 128, 6144, 6912, 8192}) {
             g.begin_admission();
-            g.quantized().prepare_gated(3, width, kind);
             for (int pattern = 0; pattern < 4; ++pattern)
                 check(g, width, kind, pattern, table);
             std::cout << "gated width=" << width << " kind=" << kind

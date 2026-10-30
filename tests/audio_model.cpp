@@ -1,6 +1,6 @@
-#include "audio_encoder.h"
-#include "codec.h"
-#include "model_config.h"
+#include "models/breeze/audio_encoder.h"
+#include "models/breeze/codec.h"
+#include "models/breeze/model_config.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

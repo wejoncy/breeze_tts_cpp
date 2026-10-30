@@ -13,6 +13,8 @@ import io
 import json
 import logging
 import threading
+import select
+import socket
 import wave
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from tts_cpp import Engine, configure_logging
 from model_source import model_info
 from request_schema import validate
+from serving import Responses, Overloaded
 
 
 def wav(pcm, sample_rate):
@@ -41,36 +44,42 @@ def wav(pcm, sample_rate):
     return buf.getvalue()
 
 
-def make_handler(engine):
+def make_handler(engine, responses):
     sample_rate = engine.audio_format["sample_rate"]
+    samples_per_frame = engine.audio_format["samples_per_frame"]
     references = OrderedDict()
     metadata = None
+    metadata_lock = threading.Lock()
+    reference_lock = threading.Lock()
 
     def prepare(payload, requests, uploaded):
-        for request in requests:
-            transcript = request.get("ref_text", payload.get("ref_text", ""))
-            audio = request.get("ref_audio", payload.get("ref_audio"))
-            data = uploaded
-            if audio:
-                if not isinstance(audio, str):
-                    raise ValueError("JSON ref_audio must be base64 encoded audio")
-                data = base64.b64decode(audio, validate=True)
-            if bool(data) != bool(transcript):
-                raise ValueError("ref_audio and ref_text must be provided together")
-            if data:
-                key = hashlib.sha256(
-                    len(data).to_bytes(8, "little") + data + transcript.encode()
-                ).digest()
-                if key not in references:
-                    try:
-                        references[key] = engine.prepare_reference(data, transcript)
-                    except RuntimeError as exc:
-                        raise ValueError(str(exc)) from exc
-                references.move_to_end(key)
-                request["reference"] = references[key]
-                # Drop cache ownership only; requests retain their references.
-                while len(references) > 16:
-                    references.popitem(last=False)
+        with reference_lock:
+            for request in requests:
+                transcript = request.get("ref_text", payload.get("ref_text", ""))
+                audio = request.get("ref_audio", payload.get("ref_audio"))
+                data = uploaded
+                if audio:
+                    if not isinstance(audio, str):
+                        raise ValueError("JSON ref_audio must be base64 encoded audio")
+                    data = base64.b64decode(audio, validate=True)
+                if bool(data) != bool(transcript):
+                    raise ValueError("ref_audio and ref_text must be provided together")
+                if data:
+                    key = hashlib.sha256(
+                        len(data).to_bytes(8, "little") + data + transcript.encode()
+                    ).digest()
+                    if key not in references:
+                        try:
+                            references[key] = engine.prepare_reference(data, transcript)
+                        except Overloaded:
+                            raise
+                        except RuntimeError as exc:
+                            raise ValueError(str(exc)) from exc
+                    references.move_to_end(key)
+                    request["reference"] = references[key]
+                    # Drop cache ownership only; requests retain their references.
+                    while len(references) > 16:
+                        references.popitem(last=False)
 
     def parse_body(body, content_type):
         uploaded = None
@@ -146,7 +155,6 @@ def make_handler(engine):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        admission_gate = threading.BoundedSemaphore(1)
 
         def log_message(self, format, *args):
             logging.getLogger("tts.http").info(format, *args)
@@ -182,11 +190,12 @@ def make_handler(engine):
                     },
                 )
             elif self.path == "/v1/model":
-                if metadata is None:
-                    metadata = model_info(engine.model)
-                    metadata["max_new_tokens"] = min(
-                        metadata["max_new_tokens"], engine.context - 1
-                    )
+                with metadata_lock:
+                    if metadata is None:
+                        metadata = model_info(engine.model)
+                        metadata["max_new_tokens"] = min(
+                            metadata["max_new_tokens"], engine.context - 1
+                        )
                 self.reply(200, metadata)
             else:
                 self.reply(404, {"error": "not found"})
@@ -242,7 +251,7 @@ def make_handler(engine):
                         raise ValueError("max_new_tokens must be integer")
                     payload.pop("max_new_tokens", None)
                     payload["max_frames"] = frames
-                # Native preparation happens only after acquiring admission.
+                # Schema checks precede reference preparation and native submission.
                 if uploaded:
                     for r in payload.get("requests", [payload]):
                         r["ref_audio"] = True
@@ -251,18 +260,18 @@ def make_handler(engine):
                 self.close_connection = True
                 self.reply(400, {"error": str(exc)})
                 return
-            if not self.admission_gate.acquire(blocking=False):
-                self.reply(
-                    409 if form or compatible_batch else 503,
-                    {"error": "engine busy; submit a batch or retry"},
-                )
-                return
             started = False
+            job = None
             try:
                 if uploaded:
                     for r in requests:
                         r.pop("ref_audio", None)
-                prepare(payload, requests, uploaded)
+                job = responses.submit(
+                    requests,
+                    opts,
+                    lambda admitted: prepare(payload, admitted, uploaded),
+                    request_id=payload.get("request_id"),
+                )
                 streaming = not batch and payload.get("stream", True)
                 buffers = [bytearray() for _ in requests]
 
@@ -279,6 +288,9 @@ def make_handler(engine):
                             self.send_header("Cache-Control", "no-store")
                             self.send_header("X-Sample-Rate", str(sample_rate))
                             self.send_header("X-Sample-Format", "s16le")
+                            self.send_header(
+                                "X-Samples-Per-Frame", str(samples_per_frame)
+                            )
                             self.end_headers()
                             started = True
                         self.wfile.write(f"{len(pcm):x}\r\n".encode() + pcm + b"\r\n")
@@ -286,7 +298,19 @@ def make_handler(engine):
                     else:
                         buffers[index].extend(pcm)
 
-                stats = engine.generate(requests, opts, deliver)
+                while True:
+                    try:
+                        index, pcm = job.take()
+                    except TimeoutError:
+                        # Detect disconnects while waiting for admission or the next GPU frame.
+                        readable, _, _ = select.select([self.connection], [], [], 0)
+                        if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                            raise ConnectionResetError("client disconnected")
+                        continue
+                    except StopIteration:
+                        break
+                    deliver(index, pcm)
+                stats = job.stats
                 if streaming:
                     if not started:
                         self.reply(
@@ -296,6 +320,7 @@ def make_handler(engine):
                             {
                                 "X-Sample-Rate": str(sample_rate),
                                 "X-Sample-Format": "s16le",
+                                "X-Samples-Per-Frame": str(samples_per_frame),
                             },
                         )
                     else:
@@ -321,6 +346,8 @@ def make_handler(engine):
                     self.reply(200, result.getvalue(), "application/zip")
                 else:
                     self.reply(200, wav(buffers[0], sample_rate), "audio/wav")
+            except Overloaded as exc:
+                self.reply(503, {"error": str(exc)})
             except (TimeoutError, BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
             except (ValueError, TypeError) as exc:
@@ -333,9 +360,24 @@ def make_handler(engine):
                     self.reply(422, {"error": str(exc)})
                 self.close_connection = True
             finally:
-                self.admission_gate.release()
+                if job is not None:
+                    job.cancel()
 
     return Handler
+
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, address, engine, **limits):
+        self.responses = Responses(engine, **limits)
+        try:
+            super().__init__(address, make_handler(engine, self.responses))
+        except BaseException:
+            self.responses.close()
+            raise
+
+    def server_close(self):
+        self.responses.close()
+        super().server_close()
 
 
 def main():
@@ -353,6 +395,20 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument("--context", type=int, default=2048)
+    parser.add_argument(
+        "--memory-limit-mb",
+        type=int,
+        default=0,
+        help="Engine GPU allocation budget in MiB, including weights; 0 uses available memory",
+    )
+    parser.add_argument(
+        "--runtime-memory-mb",
+        type=int,
+        default=0,
+        help="Fixed eager/KV backing in MiB; 0 sizes from context and batch",
+    )
+    parser.add_argument("--queue-limit", type=int, default=32)
+    parser.add_argument("--stream-buffer-mb", type=int, default=1)
     parser.add_argument("--quantization", choices=("fp8", "int8"))
     parser.add_argument(
         "--log-level",
@@ -387,10 +443,18 @@ def main():
         args.context,
         args.revision,
         quantization=args.quantization,
+        runtime_memory_mb=args.runtime_memory_mb,
+        memory_limit_mb=args.memory_limit_mb,
     )
+    engine.run_async()
     if args.warmup:
         engine.warmup()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(engine))
+    server = Server(
+        (args.host, args.port),
+        engine,
+        queue_limit=args.queue_limit,
+        buffer_bytes=args.stream_buffer_mb * 1024 * 1024,
+    )
     server.daemon_threads = False
     logging.getLogger("tts.http").info("ready on http://%s:%s", args.host, args.port)
     try:

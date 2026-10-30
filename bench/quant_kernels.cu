@@ -1,6 +1,6 @@
-#include "backend.h"
-#include "quant_gemm.h"
-#include "quant_projection.cuh"
+#include "backends/cuda/backend.h"
+#include "kernels/quant/quant_gemm.h"
+#include "kernels/quant/quant_dispatch.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <iostream>
@@ -36,18 +36,8 @@ int main(int argc, char **argv) {
         quant.prepare(rows, n, k);
     auto run = [&] {
         if (projection) {
-            if (k == 1024)
-                fp8_projection_token_tile<1024, 4>
-                    <<<dim3((n + 7) / 8, (rows + 3) / 4), 256, 0, gpu.stream>>>(
-                        x.ptr<bf16>(), qw.ptr<unsigned char>(), sw.ptr<float>(), y.ptr<bf16>(),
-                        rows, n);
-            else if (k == 2048)
-                fp8_projection_token_tile<2048, 4>
-                    <<<dim3((n + 7) / 8, (rows + 3) / 4), 256, 0, gpu.stream>>>(
-                        x.ptr<bf16>(), qw.ptr<unsigned char>(), sw.ptr<float>(), y.ptr<bf16>(),
-                        rows, n);
-            else
-                throw std::invalid_argument("projection profile width");
+            launch_quant_projection(4, {rows, n, k}, x.data(), qw.data(), sw.ptr<float>(),
+                                     y.data(), gpu.stream);
         } else if (native)
             fp8_hopper_gemm(qx.data(), sx.ptr<float>(), qw.data(), sw.ptr<float>(), y.data(), rows,
                             n, k, scratch.data(), scratch.size(), gpu.stream, tile_channels,

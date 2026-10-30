@@ -1,8 +1,7 @@
-#include "backend.h"
+#include "backends/cuda/backend.h"
 #include "quant_reference.h"
-#include "graph.h"
-#include "quant_norm_config.h"
-#include "quant_norm_kernels.cuh"
+#include "runtime/graph.h"
+#include "kernels/quant/quant_norm_kernels.cuh"
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -144,7 +143,6 @@ int main(int argc, char **argv) {
     for (int width : {31, 128, 1024, 1152, 2048})
         for (bool gemma : {false, true}) {
             g.begin_admission();
-            g.quantized().prepare_norm(7, width, gemma);
             for (int mode = 0; mode < 3; ++mode)
                 for (int pattern = 0; pattern < 7; ++pattern)
                     for (bool unaligned : {false, true})

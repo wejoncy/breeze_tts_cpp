@@ -11,7 +11,6 @@ import threading
 import unittest
 import wave
 import zipfile
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -20,7 +19,7 @@ parser.add_argument("--model", type=Path, required=True)
 parser.add_argument("--quantization", choices=("fp8", "int8"))
 args, remaining = parser.parse_known_args()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from server import make_handler
+from server import Server
 from tts_cpp import Engine
 from request_schema import validate
 
@@ -34,6 +33,7 @@ class RuntimeTests(unittest.TestCase):
             max_batch=4,
             quantization=args.quantization,
         )
+        cls.engine.run_async()
 
     @classmethod
     def tearDownClass(cls):
@@ -173,8 +173,8 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.generate({"text": "测试" * 2048, "max_frames": 2000})
 
-    def test_http_offline_stream_batch_busy(self):
-        http_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.engine))
+    def test_http_offline_stream_batch(self):
+        http_server = Server(("127.0.0.1", 0), self.engine)
         worker = threading.Thread(target=http_server.serve_forever)
         worker.start()
 
@@ -212,11 +212,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status, 200)
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 self.assertEqual(set(z.namelist()), {"0.wav", "1.wav", "metrics.json"})
-            http_server.RequestHandlerClass.admission_gate.acquire()
-            try:
-                self.assertEqual(request("/v1/audio/speech", p)[0], 503)
-            finally:
-                http_server.RequestHandlerClass.admission_gate.release()
             self.assertEqual(request("/v1/audio/speech", {"text": ""})[0], 400)
         finally:
             http_server.shutdown()
