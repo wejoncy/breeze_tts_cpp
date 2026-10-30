@@ -15,8 +15,8 @@ namespace tts {
 // Choices live for the selector lifetime. Row classes grow logarithmically;
 // Choices remain available to every prepared plan in the class.
 // GPU plans/descriptors have their own bounded cache and do not own these choices.
-template <class Choice, class Operation> class KernelSelector {
-    using Key = std::tuple<Operation, int, int, int>;
+template <class Choice> class KernelSelector {
+    using Key = std::tuple<int, int, int>;
     std::map<Key, Choice> entries_;
     unsigned bins_per_octave_;
     SelectionStats stats_;
@@ -33,9 +33,9 @@ template <class Choice, class Operation> class KernelSelector {
         return p;
     }
     template <class Search>
-    Choice select(Operation operation, KernelProblem actual, Search &&search) {
+    Choice select(KernelProblem actual, Search &&search) {
         auto p = representative(actual, bins_per_octave_);
-        Key key{operation, p.rows, p.channels, p.reduction};
+        Key key{p.rows, p.channels, p.reduction};
         auto it = entries_.find(key);
         if (it != entries_.end()) {
             ++stats_.hits;

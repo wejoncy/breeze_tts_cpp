@@ -1,6 +1,5 @@
 #include "kernels/quant/quant_backend.h"
 #include "backends/cuda/blas_check.h"
-#include "kernels/quant/quant_kernel_catalog.h"
 #include "kernels/quant/quant_format.cuh"
 #include "runtime/prepared_cache.h"
 #include "kernels/quant/kernel_selection.h"
@@ -8,17 +7,11 @@
 #include "kernels/quant/kernel_cost.h"
 #include "kernels/quant/quant_norm.h"
 #include "kernels/quant/quant_gated.h"
-#include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <vector>
-#include <functional>
+#include <cstdint>
 #include "support/log.h"
 #include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <cublasLt.h>
-#include <cfloat>
-#include <map>
 #include <tuple>
 
 namespace tts {
@@ -61,8 +54,6 @@ void quantize_rows(Type format, const bf16 *x, unsigned char *q, float *scales, 
 struct Plan {
     LinearPath path;
     bool lt_compatible = true;
-    bool projection_prepared = false;
-    int projection_tokens = 0;
     int rows = 0, n = 0, k = 0;
     cublasLtMatmulDesc_t operation = nullptr;
     cublasLtMatrixLayout_t weight = nullptr, input = nullptr, output = nullptr;
@@ -92,7 +83,7 @@ struct QuantBackend::Impl {
     DeviceArena arena;
     Buffer workspace;
     cublasLtHandle_t handle = nullptr;
-    KernelSelector<KernelChoice, KernelOperation> selector;
+    KernelSelector<LinearPath> selector;
     PreparedCache<std::tuple<int, int, int>, Plan> plans;
     Impl(DeviceContext &m, Type f)
         : memory(m), stream(m.stream), device_id(m.device), format(f), norm(m, f), gated(m, f),
@@ -113,7 +104,13 @@ struct QuantBackend::Impl {
         chip.warp_tensor_ops_per_us =
             double(property.major >= 9 ? 4096 : tensor_ops) * sm_clock / 1000;
         chip.warp_instructions_per_us = 4. * sm_clock / 1000;
-        chip.scalar_ops_per_us = (f == Type::I8 ? 512. : scalar_lanes * 2. / 3) * sm_clock / 1000;
+        // Native packed INT8 / FP32 arithmetic rates. The kernel cost policy
+        // accounts for FP8 decoding and weight reuse within a token tile.
+        chip.scalar_ops_per_us = (f == Type::I8 ? 512. : scalar_lanes * 2.) * sm_clock / 1000;
+        chip.cache_bytes = property.l2CacheSize;
+        // Approximate aggregate cache-fabric rate, normalized per SM. This is
+        // a chip estimate checked with profiler traffic, not a shape lookup.
+        chip.cache_bytes_per_us = 64. * chip.sms * sm_clock / 1000;
         shared_bytes = property.sharedMemPerBlock;
         hopper = property.major == 9 && property.minor == 0;
         if (format != Type::FP8 && format != Type::I8)
@@ -152,11 +149,6 @@ struct QuantBackend::Impl {
         BLAS(cublasLtMatmul(handle, p.operation, &alpha, w, p.weight, x, p.input, &beta, y,
                             p.output, y, p.output, &p.algorithm.algo, workspace.data(),
                             workspace.size(), stream));
-    }
-    void run_projection(Plan &p, const bf16 *x, const unsigned char *w, const float *sw, bf16 *y,
-                        int actual_rows = 0) {
-        launch_quant_projection(p.projection_tokens, {actual_rows ? actual_rows : p.rows, p.n, p.k},
-                                x, w, sw, y, stream, format);
     }
     std::unique_ptr<Plan> make_plan(int rows, int n, int k) {
         if (rows < 1 || n < 1 || k < 1 || k % 16 || n % 16)
@@ -236,13 +228,33 @@ struct QuantBackend::Impl {
         throw std::runtime_error("FP8 execution requires CUDA 13");
 #endif
     }
+    void initialize_library() {
+        if (format != Type::FP8)
+            return;
+        // Load the library's FP8 kernels before serving. One WGMMA-sized
+        // GEMM primes the shared module; no model shapes or timing search.
+        constexpr int extent = 128;
+        constexpr size_t elements = size_t(extent) * extent;
+        Buffer scratch(4 * elements + 2 * extent * sizeof(float), &memory);
+        auto x = scratch.view(extent, extent, format);
+        auto w = scratch.view(extent, extent, format, elements);
+        auto y = scratch.view(extent, extent, Type::BF16, 2 * elements);
+        auto sx = scratch.view(extent, 1, Type::F32, 4 * elements);
+        auto sw = scratch.view(extent, 1, Type::F32, 4 * elements + extent * sizeof(float));
+        auto p = make_plan(extent, extent, extent);
+        CUDA(cudaMemsetAsync(scratch.data(), 0, scratch.size(), stream));
+        run(*p, x.data, sx.ptr<float>(), w.data, sw.ptr<float>(), y.data);
+        CUDA(cudaStreamSynchronize(stream));
+    }
     ~Impl() {
         if (handle)
             cublasLtDestroy(handle);
     }
 };
 QuantBackend::QuantBackend(DeviceContext &memory, Type format)
-    : impl(std::make_unique<Impl>(memory, format)) {}
+    : impl(std::make_unique<Impl>(memory, format)) {
+    impl->initialize_library();
+}
 QuantBackend::~QuantBackend() = default;
 Type QuantBackend::type() const {
     return impl->format;
@@ -260,56 +272,16 @@ void QuantBackend::prepare(int rows, int n, int k) {
     rows = row_capacity(rows);
     impl->plans.prepare(std::make_tuple(rows, n, k), [&] {
         auto p = impl->make_plan(rows, n, k);
-        p->path =
-            impl->selector
-                .select(KernelOperation::ScaledLinear, {rows, n, k},
-                        [&](KernelProblem problem) {
-                            auto path = select_linear(
-                                problem, {impl->hopper, impl->shared_bytes, impl->workspace.size()},
-                                impl->format, impl->chip, p->lt_compatible);
-                            TTS_LOG(
-                                TTS_LOG_DEBUG, "quant.gemm", "{} planned m={} n={} k={} path={}",
-                                quantized_name(impl->format), problem.rows, n, k, path_name(path));
-                            return KernelChoice{path, 0};
-                        })
-                .linear;
+        p->path = impl->selector.select({rows, n, k}, [&](KernelProblem problem) {
+            auto path = select_linear(
+                problem, {impl->hopper, impl->shared_bytes, impl->workspace.size()}, impl->format,
+                impl->chip, p->lt_compatible, p->algorithm.wavesCount);
+            TTS_LOG(TTS_LOG_DEBUG, "quant.gemm", "{} planned m={} n={} k={} path={}",
+                    quantized_name(impl->format), problem.rows, n, k, path_name(path));
+            return path;
+        });
         return p;
     });
-}
-void QuantBackend::prepare_projection(int rows, int n, int k) {
-    rows = row_capacity(rows);
-    prepare(rows, n, k);
-    auto &p = *impl->plans.find(std::make_tuple(rows, n, k));
-    if (p.projection_prepared)
-        return;
-    p.projection_tokens =
-        impl->selector
-            .select(KernelOperation::Bf16InputProjection, {rows, n, k},
-                    [&](KernelProblem problem) {
-                        return KernelChoice{p.path, select_projection(problem, p.path, impl->chip)};
-                    })
-            .projection_tokens;
-    p.projection_prepared = true;
-}
-void QuantBackend::project(TensorView x, RowScaledView w, RowScaledView scratch, TensorView y) {
-    w.validate();
-    scratch.validate();
-    if (w.values.type != impl->format || scratch.values.type != impl->format ||
-        x.type != Type::BF16 || !x.dense() || x.cols != w.values.cols || x.rows != y.rows ||
-        y.type != Type::BF16 || !y.dense() || y.cols != w.values.rows ||
-        scratch.values.rows != x.rows || scratch.values.cols != x.cols)
-        throw std::invalid_argument("quantized projection shape/type mismatch");
-    auto *plan = impl->plans.find(std::make_tuple(row_capacity(y.rows), y.cols, x.cols));
-    if (!plan || !plan->projection_prepared)
-        throw std::logic_error("quantized projection was not prepared before execution");
-    auto &p = *plan;
-    if (p.projection_tokens)
-        impl->run_projection(p, x.ptr<bf16>(), w.values.ptr<unsigned char>(), w.scales.ptr<float>(),
-                             y.ptr<bf16>(), y.rows);
-    else {
-        quantize(x, scratch);
-        linear(scratch, w, y);
-    }
 }
 void QuantBackend::quantize(TensorView source, RowScaledView destination) {
     destination.validate();

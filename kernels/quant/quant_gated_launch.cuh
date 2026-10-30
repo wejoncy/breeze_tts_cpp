@@ -6,25 +6,17 @@
 namespace tts::gated_kernels {
 using bf16 = __nv_bfloat16;
 template <int Kind> __device__ __forceinline__ float activate(float x) {
-    return Kind == 0 ? x / (1.f + expf(-x))
-                     : .5f * x * (1.f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
-}
-// BF16 has 65536 possible bit patterns. Materialize the exact rounded unary
-// activation once, using the same functions and operation order as the baseline.
-// This table is independent of model, shape and token values.
-template <int Kind> __global__ void initialize_activation_table(bf16 *table) {
-    unsigned bits = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bits >= 65536)
-        return;
-    float x = float(__ushort_as_bfloat16(static_cast<unsigned short>(bits)));
-    table[bits] = bf16(activate<Kind>(x));
+    if constexpr (Kind == 0) {
+        // Equal scaling keeps BF16 subnormals representable in FP32 and bounds
+        // finite denominators within __fdividef's nonzero range (up to 2^126).
+        return __fdividef(x * 0x1p-16f, (1.f + __expf(-x)) * 0x1p-16f);
+    }
+    return .5f * x * (1.f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
 }
 // Preserve the two BF16 rounding points; retain BF16 pairs across token amax.
-// Full expf/tanhf semantics match the existing producer. No fast-math substitute.
-template <int Kind, int Threads, int Vec, bool Table = false, int Parts = 1,
-          Type Storage = Type::FP8>
+template <int Kind, int Threads, int Vec, int Parts = 1, Type Storage = Type::FP8>
 __global__ void vector_gated_quantize(const bf16 *input, unsigned char *out, float *scales,
-                                      int cols, const bf16 *table = nullptr) {
+                                      int cols) {
     constexpr int Items = (8192 + Threads * Vec * Parts - 1) / (Threads * Vec * Parts);
     using Pack = quant_device::Bf16Pack<Vec>;
     int row = blockIdx.x / Parts;
@@ -42,14 +34,7 @@ __global__ void vector_gated_quantize(const bf16 *input, unsigned char *out, flo
 #pragma unroll
             for (int p = 0; p < Vec / 2; ++p) {
                 float2 f = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(g.v + p * 2));
-                __nv_bfloat162 activated;
-                if constexpr (Table) {
-                    unsigned short ga = __bfloat16_as_ushort(g.v[p * 2]),
-                                   gb = __bfloat16_as_ushort(g.v[p * 2 + 1]);
-                    activated = __halves2bfloat162(table[ga], table[gb]);
-                } else {
-                    activated = __floats2bfloat162_rn(activate<Kind>(f.x), activate<Kind>(f.y));
-                }
+                auto activated = __floats2bfloat162_rn(activate<Kind>(f.x), activate<Kind>(f.y));
                 auto v = __hmul2(activated, *reinterpret_cast<__nv_bfloat162 *>(u.v + p * 2));
                 *reinterpret_cast<__nv_bfloat162 *>(value.v + p * 2) = v;
                 f = __bfloat1622float2(v);
@@ -109,16 +94,15 @@ inline bool supports_clusters(int device) {
         return false;
     cudaFuncAttributes compiled{};
     CUDA(cudaFuncGetAttributes(
-        &compiled, gated_kernels::vector_gated_quantize<0, 256, 4, false, 2, Type::I8>));
+        &compiled, gated_kernels::vector_gated_quantize<0, 256, 4, 2, Type::I8>));
     // PTX compiled below SM90 omits the cross-CTA reduction, even when JITed on Hopper.
     return compiled.ptxVersion >= 90;
 }
-template <int Kind, int T, int V, int Parts, bool Table, Type Storage>
-void run(const bf16 *x, unsigned char *q, float *s, int rows, int width, const bf16 *table,
-         cudaStream_t stream) {
+template <int Kind, int T, int V, int Parts, Type Storage>
+void run(const bf16 *x, unsigned char *q, float *s, int rows, int width, cudaStream_t stream) {
     if constexpr (Parts == 1)
-        gated_kernels::vector_gated_quantize<Kind, T, V, Table, 1, Storage>
-            <<<rows, T, 0, stream>>>(x, q, s, width, table);
+        gated_kernels::vector_gated_quantize<Kind, T, V, 1, Storage>
+            <<<rows, T, 0, stream>>>(x, q, s, width);
     else {
         cudaLaunchConfig_t cfg{};
         cfg.gridDim = dim3(rows * Parts);
@@ -130,8 +114,7 @@ void run(const bf16 *x, unsigned char *q, float *s, int rows, int width, const b
         cfg.attrs = &attr;
         cfg.numAttrs = 1;
         CUDA(cudaLaunchKernelEx(
-            &cfg, gated_kernels::vector_gated_quantize<Kind, T, V, Table, Parts, Storage>, x, q, s,
-            width, table));
+            &cfg, gated_kernels::vector_gated_quantize<Kind, T, V, Parts, Storage>, x, q, s, width));
     }
 }
 } // namespace

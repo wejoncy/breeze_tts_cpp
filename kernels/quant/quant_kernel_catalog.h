@@ -31,8 +31,15 @@ inline std::vector<LinearPath> quant_linear_candidates(KernelProblem p, KernelLi
         for (int tokens : {16, 32, 64, 128}) {
             if (tokens > 16 && p.rows <= tokens / 2)
                 continue;
-            for (int channels : {64, 128})
+            for (int channels : {64, 128}) {
+                // FP8 keeps WGMMA partials and promoted FP32 accumulators.
+                // Their lower bound alone must fit the SM90 limit of 255
+                // registers per thread in a 128-thread consumer warp-group.
+                int copies = format == Type::FP8 ? 2 : 1;
+                if (kind == LinearKind::Hopper && channels * tokens * copies > 255 * 128)
+                    continue;
                 paths.push_back({kind, tokens, channels, 1});
+            }
             for (int channels : {64, 128}) {
                 if (kind == LinearKind::Hopper && channels != 64)
                     continue;
@@ -44,10 +51,5 @@ inline std::vector<LinearPath> quant_linear_candidates(KernelProblem p, KernelLi
         }
     }
     return paths;
-}
-inline std::vector<int> quant_projection_candidates(KernelProblem p) {
-    if (p.rows <= 32 && (p.reduction == 1024 || p.reduction == 2048))
-        return {0, 1, 2, 4, 8};
-    return {0};
 }
 } // namespace tts

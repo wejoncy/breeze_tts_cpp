@@ -2,6 +2,9 @@
 #include "kernels/quant/quant_gemm.h"
 #include <cuda_bf16.h>
 #include "kernels/quant/quant_format.cuh"
+#include <stdexcept>
+namespace tts {
+namespace {
 // Small-M FP8 GEMV with CTA-local split K and no intermediate layout conversion.
 template <int Tokens, int Splits = 1, tts::Type Storage = tts::Type::FP8>
 __global__ void quant_gemv(const unsigned char *x, const float *sx, const unsigned char *w,
@@ -50,81 +53,6 @@ __global__ void quant_gemv(const unsigned char *x, const float *sx, const unsign
         }
     }
 }
-#include <cuda_bf16.h>
-#include "kernels/quant/quant_format.cuh"
-#include <cfloat>
-namespace tts {
-// BF16-input projection. The CTA computes true per-token amax and keeps the
-// quantized input in shared memory. Output tiles deliberately repeat this work;
-// the cost model compares it to quantize + the prepared GEMM.
-using bf16 = __nv_bfloat16;
-template <int K, int Tokens, Type Storage = Type::FP8>
-__global__ void quant_projection_token_tile(const bf16 *x, const unsigned char *w, const float *sw,
-                                            bf16 *y, int rows, int n) {
-    using F = quant_device::Format<Storage>;
-    typename F::Acc sums[Tokens] = {};
-    __shared__ unsigned int aq[Tokens * K / 4];
-    __shared__ float partial[Tokens * 8], scales[Tokens], inverse[Tokens];
-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32, row = blockIdx.y * Tokens,
-        col = blockIdx.x * 8 + warp;
-    {
-        float values[Tokens][K / 256];
-#pragma unroll
-        for (int r = 0; r < Tokens; ++r) {
-            float amax = 0;
-#pragma unroll
-            for (int j = 0; j < K / 256; ++j) {
-                int c = threadIdx.x + j * 256;
-                float value = row + r < rows ? float(x[size_t(row + r) * K + c]) : 0;
-                values[r][j] = value;
-                amax = fmaxf(amax, fabsf(value));
-            }
-            for (int d = 16; d; d /= 2)
-                amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, d));
-            if (!lane)
-                partial[r * 8 + warp] = amax;
-        }
-        __syncthreads();
-        if (threadIdx.x < Tokens) {
-            float amax = 0;
-#pragma unroll
-            for (int w = 0; w < 8; ++w)
-                amax = fmaxf(amax, partial[threadIdx.x * 8 + w]);
-            scales[threadIdx.x] = quant_device::scale<Storage>(amax);
-            inverse[threadIdx.x] = 1.f / scales[threadIdx.x];
-        }
-        __syncthreads();
-#pragma unroll
-        for (int r = 0; r < Tokens; ++r) {
-#pragma unroll
-            for (int j = 0; j < K / 256; ++j)
-                reinterpret_cast<unsigned char *>(aq)[r * K + threadIdx.x + j * 256] =
-                    F::encode(values[r][j] * inverse[r]);
-        }
-        __syncthreads();
-    }
-    if (col < n) {
-#pragma unroll 4
-        for (int c = lane * 4; c < K; c += 128) {
-            unsigned int b = *reinterpret_cast<const unsigned int *>(w + size_t(col) * K + c);
-#pragma unroll
-            for (int r = 0; r < Tokens; ++r)
-                sums[r] = F::dot(aq[(r * K + c) / 4], b, sums[r]);
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < Tokens; ++r) {
-        for (int d = 16; d; d /= 2)
-            sums[r] += __shfl_down_sync(0xffffffff, sums[r], d);
-        if (!lane && col < n && row + r < rows) {
-            float scale = scales[r];
-            y[size_t(row + r) * n + col] = bf16(sums[r] * sw[col] * scale);
-        }
-    }
-}
-} // namespace tts
-#include <stdexcept>
-namespace tts {
 using bf16 = __nv_bfloat16;
 template <Type Storage>
 void linear_format(LinearPath config, KernelProblem shape, const void *input, const float *xs,
@@ -167,43 +95,7 @@ void linear_format(LinearPath config, KernelProblem shape, const void *input, co
 #undef GEMV
     throw std::invalid_argument("library GEMM must use its prepared descriptor");
 }
-template <Type Storage>
-void projection_format(int token_tile, KernelProblem shape, const void *input, const void *weights,
-                       const float *sw, void *output, cudaStream_t stream) {
-    int rows = shape.rows, n = shape.channels, k = shape.reduction;
-    if (k != 1024 && k != 2048)
-        throw std::invalid_argument("unsupported fused projection width");
-    const auto *x = static_cast<const bf16 *>(input);
-    const auto *w = static_cast<const unsigned char *>(weights);
-    auto *y = static_cast<bf16 *>(output);
-#define PROJECT(K, T)                                                                              \
-    quant_projection_token_tile<K, T, Storage>                                                     \
-        <<<dim3((n + 7) / 8, (rows + T - 1) / T), 256, 0, stream>>>(x, w, sw, y, rows, n)
-#define PROJECT_WIDTH(T)                                                                           \
-    if (k == 1024) {                                                                               \
-        PROJECT(1024, T);                                                                          \
-    } else {                                                                                       \
-        PROJECT(2048, T);                                                                          \
-    }
-    switch (token_tile) {
-    case 1:
-        PROJECT_WIDTH(1);
-        break;
-    case 2:
-        PROJECT_WIDTH(2);
-        break;
-    case 4:
-        PROJECT_WIDTH(4);
-        break;
-    case 8:
-        PROJECT_WIDTH(8);
-        break;
-    default:
-        throw std::logic_error("invalid prepared projection tile");
-    }
-#undef PROJECT_WIDTH
-#undef PROJECT
-}
+} // namespace
 void launch_quant_linear(LinearPath config, KernelProblem shape, const void *input, const float *xs,
                          const void *weights, const float *ws, void *y, void *workspace,
                          size_t bytes, cudaStream_t stream, Type format) {
@@ -212,12 +104,5 @@ void launch_quant_linear(LinearPath config, KernelProblem shape, const void *inp
     else
         linear_format<Type::FP8>(config, shape, input, xs, weights, ws, y, workspace, bytes,
                                  stream);
-}
-void launch_quant_projection(int tile, KernelProblem shape, const void *x, const void *w,
-                             const float *sw, void *y, cudaStream_t stream, Type format) {
-    if (format == Type::I8)
-        projection_format<Type::I8>(tile, shape, x, w, sw, y, stream);
-    else
-        projection_format<Type::FP8>(tile, shape, x, w, sw, y, stream);
 }
 } // namespace tts

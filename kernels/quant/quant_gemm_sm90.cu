@@ -154,7 +154,10 @@ void hopper_gemm(void *x, const float *sx, void *w, const float *sw, void *y, in
         } else if (tile_channels == 64 && tile_tokens == 128) {
             RUN_DIRECT(64, 128);
         } else if (tile_channels == 128 && tile_tokens == 128) {
-            RUN_DIRECT(128, 128);
+            if constexpr (std::is_same_v<E, int8_t>)
+                RUN_DIRECT(128, 128);
+            else
+                throw std::invalid_argument("FP8 tile exceeds consumer register capacity");
         } else
             throw std::invalid_argument("invalid quantized tile");
     } else {
