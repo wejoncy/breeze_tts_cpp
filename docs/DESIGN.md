@@ -97,8 +97,3 @@ The C API catches exceptions at its boundary. C callbacks borrow PCM until retur
 and return nonzero to cancel. Python callbacks receive PCM bytes and return
 `False` to cancel. Do not reenter or destroy an engine from its callbacks.
 Keep the engine resident to reuse weights, pages and captured graphs.
-
-`tests/test_architecture.py` guards module dependencies and the pool allocation
-boundary. Native tests cover tensor/configuration contracts, KV reuse, quantized
-operators and resources; Python tests cover FFI, reference/batch parity and HTTP.
-Profiling and numerical validation commands are in the [README](../README.md).

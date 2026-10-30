@@ -136,39 +136,6 @@ A C++ scheduling thread performs tokenization and batch formation, independently
 execution thread. They communicate through queues and block when idle; offline `generate()`
 wraps the same scheduler.
 
-Run independent streaming clients against a running server (standard library only):
-
-```sh
-python3 bench/client_benchmark.py --concurrency 1,4,8 --requests 32 --frames 64
-```
-
-`--input requests.jsonl` cycles speech JSON payloads for mixed lengths/options/reference audio.
-`--output results.json` optionally retains per-request frame timestamps, without audio.
-TTFT measures the first complete PCM frame; TPOT measures the mean interval between subsequent
-audio frames. Both include server queueing and transport. Warmup requests are excluded;
-failed streams are counted separately and excluded from latency/goodput summaries.
-
-## Validate and profile
-
-With the model and Python bridge available:
-
-```sh
-make test MODEL_DIR=models/Breeze-TTS-2
-make test-fp8 MODEL_DIR=models/Breeze-TTS-2
-make test-int8 MODEL_DIR=models/Breeze-TTS-2
-make build/kernels
-python bench/benchmark.py --model models/Breeze-TTS-2 --output artifacts/benchmark.json
-bash bench/profile.sh models/Breeze-TTS-2
-```
-
-`profile.sh` uses nsys for timelines and ncu for kernel compute/bandwidth metrics.
-Run GPU measurements sequentially, separating load/capture from warm execution.
-Keep debug dumps disabled when profiling. `tests/run_reference.py` and
-`tests/run_parity_oracles.py` provide numerical checks with the original Python
-model's separate development environment. For the Hoppou comparison, configure
-`checkpoint`, `reference_audio` and `reference_text` in `bench/hoppou_plan.json`
-with your local inputs. Generated audio and reports remain ignored.
-
 See [architecture and ownership](docs/DESIGN.md) and the
 [C interface](include/tts/tts.h). CPU inference, multi-GPU and arbitrary model architectures
 are not supported.
