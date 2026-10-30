@@ -22,10 +22,8 @@ class QuantBackend {
     void seal();
     QuantCacheStats cache_stats() const;
     void prepare(int rows, int output_channels, int input_channels);
-    void prepare_projection(int rows, int output_channels, int input_channels);
     void quantize(TensorView source, RowScaledView destination);
     void linear(RowScaledView input, RowScaledView weight, TensorView output);
-    void project(TensorView input, RowScaledView weight, RowScaledView scratch, TensorView output);
     void norm(TensorView residual, TensorView update, TensorView weight, RowScaledView output,
               float eps, bool gemma, TensorView update_scale = {});
     void gated(TensorView gate_up, RowScaledView output, int kind);

@@ -8,9 +8,9 @@ template <Type Storage, int Kind>
 void launch(TensorView input, RowScaledView out, int parts, cudaStream_t stream) {
 #define RUN(P)                                                                                     \
     case P:                                                                                        \
-        gated_dispatch::run<Kind, 256, P == 1 ? 8 : 4, P, false, Storage>(                          \
+        gated_dispatch::run<Kind, 256, P == 1 ? 8 : 4, P, Storage>(                                 \
             input.ptr<bf16>(), out.values.ptr<unsigned char>(), out.scales.ptr<float>(),           \
-            input.rows, out.values.cols, nullptr, stream);                                         \
+            input.rows, out.values.cols, stream);                                                  \
         break
     switch (parts) {
         RUN(1);
