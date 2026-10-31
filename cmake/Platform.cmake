@@ -1,9 +1,31 @@
 # Host compiler policy belongs here; CUDA architecture selection stays on targets.
 if(MSVC)
+  if(CMAKE_GENERATOR MATCHES "^Ninja")
+    # Ninja compares /showIncludes prefixes as bytes. CMake's locale decoding
+    # can corrupt a UTF-8 prefix on a Chinese Windows installation.
+    set(msvc_probe_dir "${CMAKE_BINARY_DIR}/CMakeFiles/tts-msvc-deps")
+    file(MAKE_DIRECTORY "${msvc_probe_dir}")
+    file(WRITE "${msvc_probe_dir}/prefix.h" "// Dependency prefix probe.\n")
+    file(WRITE "${msvc_probe_dir}/prefix.cpp" "#include \"prefix.h\"\n")
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /nologo /utf-8 /showIncludes /EP
+      "${msvc_probe_dir}/prefix.cpp"
+      OUTPUT_VARIABLE msvc_probe ERROR_VARIABLE msvc_probe
+      ENCODING NONE COMMAND_ERROR_IS_FATAL ANY)
+    string(REPLACE "\\" "/" msvc_probe "${msvc_probe}")
+    string(REGEX MATCH "[^\r\n]*prefix\\.h" msvc_include_line "${msvc_probe}")
+    string(TOLOWER "${msvc_include_line}" msvc_include_lower)
+    string(TOLOWER "${msvc_probe_dir}/prefix.h" msvc_probe_path)
+    string(FIND "${msvc_include_lower}" "${msvc_probe_path}" msvc_path_start)
+    if(msvc_path_start LESS 1)
+      message(FATAL_ERROR "Cannot detect MSVC /showIncludes prefix")
+    endif()
+    string(SUBSTRING "${msvc_include_line}" 0 ${msvc_path_start} CMAKE_CL_SHOWINCLUDES_PREFIX)
+  endif()
   add_compile_definitions(_USE_MATH_DEFINES)
+  # CUDA 13/CCCL requires the conforming MSVC preprocessor.
   add_compile_options(
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/Zc:__cplusplus;/bigobj>"
-    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus,/bigobj>")
+    "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/Zc:__cplusplus;/Zc:preprocessor;/bigobj>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus,/Zc:preprocessor,/bigobj>")
 endif()
 set(TTS_RUNTIME_DIRECTORIES "" CACHE STRING "Additional dependency DLL directories")
 if(WIN32)

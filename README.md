@@ -13,11 +13,13 @@ spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention and missing audio he
 
 ```sh
 cmake -S . -B build -DTTS_BUILD_PYTHON=OFF
-cmake --build build --config Release --parallel 4
+cmake --build build --config Release --parallel
 ```
 
-Select GPU targets with `-DCMAKE_CUDA_ARCHITECTURES=86` for an RTX 3060 or `90`
-for an H100. BF16 is the default. `--quantization int8` supports SM80+;
+GPU targets default to CMake's `native` detection. For cross-compilation or a
+machine without a visible GPU, select the deployment architectures explicitly
+with `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS`. BF16 is the default.
+`--quantization int8` supports SM80+;
 `--quantization fp8` supports SM90+. Both use per-channel weights and dynamic
 per-token activations; FlashAttention and its Q/K/V/KV storage remain BF16.
 Quantization speed and accuracy depend on the workload; FP8 is not always faster.
@@ -26,8 +28,54 @@ On Windows, use an x64 MSVC developer shell, CUDA and the MSVC Rust toolchain.
 Set `-DCMAKE_PREFIX_PATH=...` to the x64 audio library installation prefixes and
 `-DTTS_RUNTIME_DIRECTORIES=...` for extra DLL search directories. Multi-configuration
 builds produce `build/Release/tts.exe`; required DLLs are deployed beside the binaries.
-Windows cross-compilation has been checked, but a full native NVCC/MSVC build and
-Windows GPU execution remain unverified.
+Native NVCC/MSVC builds and INT8 GPU inference have been verified with CUDA 13.3,
+Visual Studio 2026 and an RTX 3060 Laptop GPU (6 GiB).
+CUTLASS SM90a kernel parameters currently trigger MSVC alignment errors. For
+affected toolchains, set `TTS_BUILD_HOPPER_KERNELS=OFF` in the local configuration;
+the SM80+ INT8 path remains available. The option defaults to `ON`, including on
+Linux/Hopper. The Hopper object retains the SM90a ISA required by its instructions.
+
+Keep Python packages in a uv virtual environment; native audio development
+files and Rust can be installed in a separate project-local directory. Supply
+their locations through `PATH`, `CMAKE_PREFIX_PATH`, `CARGO_HOME` and
+`RUSTUP_HOME`. No system installation or permanent environment change is needed.
+The Windows entry point uses an active MSVC developer environment, `TTS_VCVARS`,
+or `vswhere` on `PATH`. It changes only its own process environment.
+
+In a prepared developer shell, CMake can also be used directly:
+
+```sh
+cmake --preset my-release
+cmake --build --preset my-release
+```
+
+```powershell
+# Configure when setting up the toolchain or changing preset cache variables.
+cmd.exe /d /c "scripts\build-windows.cmd --preset my-release --configure-only"
+
+# Daily incremental build; CMake regenerates when build scripts change.
+cmd.exe /d /c "scripts\build-windows.cmd --preset my-release"
+
+# One complete rebuild after repairing an old dependency database.
+cmd.exe /d /c "scripts\build-windows.cmd --preset my-release --rebuild"
+```
+
+Define `my-release` (or any name) in the ignored `CMakeUserPresets.json`, inheriting
+the hidden `release` preset, and add a build preset with the same name. Set its
+generator, `binaryDir`, dependency prefixes and optional offline source overrides
+there. The public preset contains only reusable release settings. The script
+requires `--preset` or `TTS_PRESET`; it assumes no preset name or build directory.
+Tools come from `PATH`, with `TTS_CMAKE_EXE`, `TTS_NVCC_EXE` and `TTS_VSWHERE_EXE`
+available as overrides. Ninja chooses parallelism automatically;
+`CMAKE_BUILD_PARALLEL_LEVEL` can limit it when needed. No CPU/job count is fixed.
+CMake prints its actual version during configuration. Dependency/model downloads
+are separate from daily compilation.
+
+MSVC dependency detection probes `/showIncludes` with `/utf-8` and preserves
+the output bytes so localized diagnostics match Ninja's prefix. The pinned fmt
+compatibility patch is applied to a build-local CUDA header overlay; upstream
+sources and C++ logging interfaces are preserved. Reconfiguration uses
+`configure_file(COPYONLY)` to keep unchanged patched headers from recompiling CUDA.
 
 For offline builds, populate dependencies first, then use
 `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`. Fresh offline builds need local source
@@ -71,7 +119,7 @@ Install dependencies into your Python environment and enable the bridge:
 ```sh
 python -m pip install -r python/requirements.txt
 cmake -S . -B build -DTTS_BUILD_PYTHON=ON
-cmake --build build --config Release --parallel 4
+cmake --build build --config Release --parallel
 python examples/server.py --model models/Breeze-TTS-2 --host 127.0.0.1 --port 8000 --max-batch 8
 ```
 

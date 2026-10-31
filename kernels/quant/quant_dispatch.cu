@@ -87,10 +87,14 @@ void linear_format(LinearPath config, KernelProblem shape, const void *input, co
         }
     }
     if (config.kind == LinearKind::Hopper) {
+#if TTS_HAVE_HOPPER_KERNELS
         auto gemm = Storage == Type::I8 ? int8_hopper_gemm : fp8_hopper_gemm;
         gemm(x, xs, w, ws, y, m, n, k, workspace, workspace_bytes, stream, config.channels,
              config.tokens, config.splits);
         return;
+#else
+        throw std::runtime_error("native Hopper kernels are disabled in this build");
+#endif
     }
 #undef GEMV
     throw std::invalid_argument("library GEMM must use its prepared descriptor");

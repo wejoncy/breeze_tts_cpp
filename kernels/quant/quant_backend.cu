@@ -112,7 +112,9 @@ struct QuantBackend::Impl {
         // a chip estimate checked with profiler traffic, not a shape lookup.
         chip.cache_bytes_per_us = 64. * chip.sms * sm_clock / 1000;
         shared_bytes = property.sharedMemPerBlock;
+#if TTS_HAVE_HOPPER_KERNELS
         hopper = property.major == 9 && property.minor == 0;
+#endif
         if (format != Type::FP8 && format != Type::I8)
             throw std::invalid_argument("unsupported quantized storage type");
         if (format == Type::I8) {
