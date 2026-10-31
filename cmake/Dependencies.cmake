@@ -54,6 +54,10 @@ function(tts_fetch_dependencies)
   set(CORROSION_DEV_MODE OFF)
   FetchContent_MakeAvailable(json spdlog concurrentqueue corrosion cutlass flash_attention)
 
+  if(MSVC)
+    include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Spdlog.cmake")
+  endif()
+
   add_library(tts_concurrentqueue INTERFACE)
   target_include_directories(tts_concurrentqueue SYSTEM INTERFACE "${concurrentqueue_SOURCE_DIR}")
 

@@ -1,5 +1,8 @@
 # Executed after linking or during installation; no application code is loaded.
 include("${TTS_RUNTIME_INFO}")
+if(POLICY CMP0207)
+  cmake_policy(SET CMP0207 NEW)
+endif()
 cmake_path(GET runtime_binary PARENT_PATH binary_dir)
 cmake_path(GET runtime_binary FILENAME binary_name)
 list(FILTER runtime_directories EXCLUDE REGEX "^$")
@@ -11,13 +14,37 @@ file(REMOVE_RECURSE "${stage}")
 file(MAKE_DIRECTORY "${stage}")
 file(COPY "${runtime_binary}" ${runtime_libraries} DESTINATION "${stage}")
 list(REMOVE_ITEM runtime_directories "${binary_dir}")
+# Exclude the actual Windows installation before scanning optional forwarders.
+# Escape its path and match letters without relying on directory-name casing.
+file(TO_CMAKE_PATH "$ENV{SystemRoot}" system_root)
+set(system_exclude_patterns)
+if(system_root)
+  set(system_pattern "^")
+  string(LENGTH "${system_root}" system_length)
+  math(EXPR system_last "${system_length} - 1")
+  foreach(index RANGE 0 ${system_last})
+    string(SUBSTRING "${system_root}" ${index} 1 character)
+    if(character MATCHES "^[A-Za-z]$")
+      string(TOLOWER "${character}" lower)
+      string(TOUPPER "${character}" upper)
+      string(APPEND system_pattern "[${lower}${upper}]")
+    else()
+      string(FIND ".^$*+?()[]{}|\\" "${character}" special)
+      if(special GREATER_EQUAL 0)
+        string(APPEND system_pattern "\\")
+      endif()
+      string(APPEND system_pattern "${character}")
+    endif()
+  endforeach()
+  list(APPEND system_exclude_patterns "${system_pattern}(/|$)")
+endif()
 file(GET_RUNTIME_DEPENDENCIES
   LIBRARIES "${stage}/${binary_name}"
   DIRECTORIES ${runtime_directories}
   PRE_EXCLUDE_REGEXES "^api-ms-" "^ext-ms-"
+  POST_EXCLUDE_REGEXES ${system_exclude_patterns}
   RESOLVED_DEPENDENCIES_VAR dependencies)
 file(MAKE_DIRECTORY "${TTS_RUNTIME_DESTINATION}")
-file(TO_CMAKE_PATH "$ENV{SystemRoot}" system_root)
 string(TOLOWER "${system_root}" system_root)
 foreach(dependency IN LISTS dependencies)
   string(TOLOWER "${dependency}" normalized)

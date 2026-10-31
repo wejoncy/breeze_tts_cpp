@@ -1,0 +1,36 @@
+--- a/bundled/base.h
++++ b/bundled/base.h
+@@ -453,7 +453,13 @@
+                           const typename T::value_type*> {};
+ 
+ // Check if the literal encoding is UTF-8.
++#if defined(__CUDACC__) && defined(_MSC_VER)
++// NVCC's literal probe does not reflect the MSVC host's /utf-8 option.
++// Platform.cmake supplies /utf-8 to the host compiler.
++enum { is_utf8_enabled = 1 };
++#else
+ enum { is_utf8_enabled = "\u00A7"[1] == '\xA7' };
++#endif
+ enum { use_utf8 = !FMT_WIN32 || is_utf8_enabled };
+ 
+ #ifndef FMT_UNICODE
+--- a/bundled/format.h
++++ b/bundled/format.h
+@@ -2986,8 +2986,17 @@
+   // It is equal to ceil(2^31 + 2^32/10^(k + 1)).
+   // These are stored in a string literal because we cannot have static arrays
+   // in constexpr functions and non-static ones are poorly optimized.
++#if defined(__CUDACC__) && defined(_MSC_VER)
++  // NVCC/MSVC rejects UTF-32 character escapes above 0x7fffffff.
++  // Preserve the exact unsigned rounding thresholds with integer literals.
++  constexpr uint32_t thresholds[] = {
++      0x9999999au, 0x828f5c29u, 0x80418938u, 0x80068db9u,
++      0x8000a7c6u, 0x800010c7u, 0x800001aeu, 0x8000002bu};
++  return thresholds[index];
++#else
+   return U"\x9999999a\x828f5c29\x80418938\x80068db9\x8000a7c6\x800010c7"
+          U"\x800001ae\x8000002b"[index];
++#endif
+ }
+ 
+ template <typename Float>

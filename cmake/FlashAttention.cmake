@@ -11,8 +11,11 @@ foreach(header IN LISTS flash_headers)
   cmake_path(GET header FILENAME name)
   configure_file("${header}" "${flash_stage}/${name}" COPYONLY)
 endforeach()
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply --unsafe-paths
-  "--directory=${flash_stage}" "${flash_patch}" COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+  --unset=GIT_DIR --unset=GIT_WORK_TREE --unset=GIT_INDEX_FILE --unset=GIT_COMMON_DIR
+  "GIT_CEILING_DIRECTORIES=${flash_stage}"
+  "${GIT_EXECUTABLE}" apply --unsafe-paths "${flash_patch}"
+  WORKING_DIRECTORY "${flash_stage}" COMMAND_ERROR_IS_FATAL ANY)
 foreach(header IN LISTS flash_headers)
   cmake_path(GET header FILENAME name)
   configure_file("${flash_stage}/${name}" "${flash_native}/${name}" COPYONLY)
