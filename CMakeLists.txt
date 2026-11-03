@@ -15,26 +15,79 @@ include(cmake/Dependencies.cmake)
 corrosion_import_crate(MANIFEST_PATH tokenizer/Cargo.toml LOCKED)
 add_library(tts SHARED
   bindings/c_api.cpp
-  kernels/backend.cu
+  src/ops/kernels/backend.cu
+  src/ops/cuda/lt_linear.cpp
+  src/ops/cuda/grouped_linear.cpp
+  src/ops/cuda/relative_attention.cpp
+  src/ops/cuda/execution_context.cpp
+  src/ops/linear.cpp
+  src/ops/convolution.cpp
+  src/ops/kernels/sequence/sequence_pointwise.cu
+  src/ops/kernels/sequence/sequence_norm.cu
+  src/ops/kernels/sequence/sequence_conditioning.cu
+  src/layers/convolution.cpp
+  src/layers/transformer.cpp
+  src/layers/bert.cpp
+  src/layers/spectrogram.cpp
+  src/models/model_registry.cpp
+  src/models/gpt_sovits/model.cpp
+  src/models/gpt_sovits/frontend.cpp
+  src/models/gpt_sovits/language_router.cpp
+  src/models/gpt_sovits/pronunciation.cpp
+  src/models/gpt_sovits/model_runner.cpp
+  src/models/gpt_sovits/model_runner_init.cpp
+  src/models/gpt_sovits/request_planner.cpp
+  src/models/gpt_sovits/vocoder.cpp
+  src/models/gpt_sovits/dit.cpp
+  src/models/gpt_sovits/speech_encoder.cpp
+  src/models/gpt_sovits/semantic.cpp
+  src/models/gpt_sovits/relative_encoder.cpp
+  src/models/gpt_sovits/style_encoder.cpp
+  src/models/gpt_sovits/wavenet.cpp
+  src/models/gpt_sovits/acoustic.cpp
+  src/models/gpt_sovits/reference_encoder.cpp
   src/engine/engine.cpp
   src/engine/request_executor.cpp
   src/engine/request_scheduler.cpp
-  src/execution/model_runner.cpp
-  src/execution/prefill.cpp
-  src/execution/prepared_batch.cpp
-  src/execution/request_planner.cpp
+  src/models/breeze/model_runner.cpp
+  src/models/breeze/prefill.cpp
+  src/models/breeze/prepared_batch.cpp
+  src/models/breeze/request_planner.cpp
   src/io/audio_io.cpp
   src/io/mapped_file.cpp
+  src/io/model_loader.cpp
   src/io/safetensors.cpp
-  kernels/attention/flash_attention.cu
-  kernels/audio/audio_kernels.cu
-  kernels/audio/encoder_kernels.cu
-  kernels/quant/quant_backend.cu
-  kernels/quant/quant_dispatch.cu
-  kernels/quant/quant_gated.cu
-  kernels/quant/quant_gemm_sm80.cu
-  kernels/quant/quant_norm.cu
-  kernels/sampling/sampling.cu
+  src/text/g2pw.cpp
+  src/text/english.cpp
+  src/text/cantonese.cpp
+  src/text/morphology.cpp
+  src/text/korean.cpp
+  src/text/japanese.cpp
+  src/text/japanese_grammar.cpp
+  src/text/japanese_document.cpp
+  src/text/language_detector.cpp
+  src/text/budoux.cpp
+  src/text/segmentation.cpp
+  src/text/weighted_segmenter.cpp
+  src/text/pinyin.cpp
+  src/text/tone_sandhi.cpp
+  src/text/normalization.cpp
+  src/text/phonemizer.cpp
+  src/text/regex.cpp
+  src/ops/kernels/attention/flash_attention.cu
+  src/ops/kernels/attention/flash_decoding.cu
+  src/ops/kernels/attention/relative_attention.cu
+  src/ops/kernels/audio/audio_kernels.cu
+  src/ops/kernels/audio/encoder_kernels.cu
+  src/ops/kernels/audio/spectral_kernels.cu
+  src/ops/kernels/quant/quant_backend.cu
+  src/ops/kernels/quant/quant_dispatch.cu
+  src/ops/kernels/quant/quant_gated.cu
+  src/ops/kernels/quant/quant_gemm_sm80.cu
+  src/ops/kernels/quant/quant_norm.cu
+  src/ops/kernels/quant/vector_quantize.cu
+  src/ops/kernels/sampling/sampling.cu
+  src/ops/kernels/text/pronunciation.cu
   src/models/breeze/audio_encoder.cpp
   src/models/breeze/codec.cpp
   src/models/breeze/model.cpp
@@ -44,7 +97,7 @@ add_library(tts SHARED
 option(TTS_BUILD_HOPPER_KERNELS "Build native SM90a quantized GEMM kernels" ON)
 target_compile_definitions(tts PRIVATE TTS_HAVE_HOPPER_KERNELS=$<BOOL:${TTS_BUILD_HOPPER_KERNELS}>)
 if(TTS_BUILD_HOPPER_KERNELS)
-  add_library(tts_quant_hopper OBJECT kernels/quant/quant_gemm_sm90.cu)
+  add_library(tts_quant_hopper OBJECT src/ops/kernels/quant/quant_gemm_sm90.cu)
   set_target_properties(tts_quant_hopper PROPERTIES CUDA_ARCHITECTURES 90a POSITION_INDEPENDENT_CODE ON)
   target_include_directories(tts_quant_hopper PRIVATE include src "${PROJECT_SOURCE_DIR}")
   target_link_libraries(tts_quant_hopper PRIVATE tts_cutlass)
@@ -52,21 +105,24 @@ if(TTS_BUILD_HOPPER_KERNELS)
   target_sources(tts PRIVATE $<TARGET_OBJECTS:tts_quant_hopper>)
 endif()
 target_include_directories(tts PUBLIC include PRIVATE src "${PROJECT_SOURCE_DIR}")
-target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
-  kernels/backend.cu
-  kernels/quant/quant_backend.cu
-  kernels/quant/quant_norm.cu
-  kernels/quant/quant_gated.cu
-  kernels/quant/quant_dispatch.cu
-  kernels/audio/encoder_kernels.cu
-  kernels/audio/audio_kernels.cu
-  kernels/sampling/sampling.cu
+  src/ops/kernels/backend.cu
+  src/ops/kernels/quant/quant_backend.cu
+  src/ops/kernels/quant/quant_norm.cu
+  src/ops/kernels/quant/quant_gated.cu
+  src/ops/kernels/quant/quant_dispatch.cu
+  src/ops/kernels/audio/encoder_kernels.cu
+  src/ops/kernels/audio/audio_kernels.cu
+  src/ops/kernels/audio/spectral_kernels.cu
+  src/ops/kernels/sampling/sampling.cu
+  src/ops/kernels/quant/vector_quantize.cu
   PROPERTIES COMPILE_OPTIONS "--fmad=false")
 set_source_files_properties(
-  kernels/attention/flash_attention.cu
-  kernels/quant/quant_gemm_sm80.cu
+  src/ops/kernels/attention/flash_attention.cu
+  src/ops/kernels/attention/relative_attention.cu
+  src/ops/kernels/quant/quant_gemm_sm80.cu
   PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr")
 set_target_properties(tts PROPERTIES POSITION_INDEPENDENT_CODE ON WINDOWS_EXPORT_ALL_SYMBOLS ON)
 tts_deploy_runtime(tts)

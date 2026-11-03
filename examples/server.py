@@ -56,6 +56,9 @@ def make_handler(engine, responses):
         with reference_lock:
             for request in requests:
                 transcript = request.get("ref_text", payload.get("ref_text", ""))
+                language = request.get("prompt_language", payload.get("prompt_language", ""))
+                if not isinstance(language, str) or "\0" in language or len(language) > 32:
+                    raise ValueError("invalid prompt_language")
                 audio = request.get("ref_audio", payload.get("ref_audio"))
                 data = uploaded
                 if audio:
@@ -66,11 +69,11 @@ def make_handler(engine, responses):
                     raise ValueError("ref_audio and ref_text must be provided together")
                 if data:
                     key = hashlib.sha256(
-                        len(data).to_bytes(8, "little") + data + transcript.encode()
+                        len(data).to_bytes(8, "little") + data + transcript.encode() + b"\0" + language.encode()
                     ).digest()
                     if key not in references:
                         try:
-                            references[key] = engine.prepare_reference(data, transcript)
+                            references[key] = engine.prepare_reference(data, transcript, language=language)
                         except Overloaded:
                             raise
                         except RuntimeError as exc:
@@ -120,6 +123,7 @@ def make_handler(engine, responses):
             "max_new_tokens",
             "seed",
             "top_k",
+            "sample_steps",
             "depth_top_k",
             "depth_decoder_top_k",
         ):
@@ -127,6 +131,14 @@ def make_handler(engine, responses):
                 payload[name] = int(payload[name])
         for name in (
             "temperature",
+            "speed_factor",
+            "streaming_chunk_seconds",
+            "streaming_lookahead_seconds",
+            "streaming_overlap_seconds",
+            "semantic_lookahead_seconds",
+            "gpt_streaming_lookahead_seconds",
+            "fragment_interval",
+            "cfg_rate",
             "top_p",
             "cfg_scale",
             "cfg_scale_ref",
@@ -192,10 +204,7 @@ def make_handler(engine, responses):
             elif self.path == "/v1/model":
                 with metadata_lock:
                     if metadata is None:
-                        metadata = model_info(engine.model)
-                        metadata["max_new_tokens"] = min(
-                            metadata["max_new_tokens"], engine.context - 1
-                        )
+                        metadata = model_info(engine.model, engine.model_info)
                 self.reply(200, metadata)
             else:
                 self.reply(404, {"error": "not found"})
@@ -368,6 +377,9 @@ def make_handler(engine, responses):
 
 class Server(ThreadingHTTPServer):
     def __init__(self, address, engine, **limits):
+        # Match the listen backlog to native admission capacity. The standard
+        # library's small default can defer burst connections until TCP retries.
+        self.request_queue_size = limits.get("queue_limit", 32)
         self.responses = Responses(engine, **limits)
         try:
             super().__init__(address, make_handler(engine, self.responses))

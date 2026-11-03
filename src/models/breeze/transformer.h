@@ -1,10 +1,11 @@
 #pragma once
 #include <algorithm>
-#include "models/breeze/weights.h"
+#include "layers/weights.h"
 #include "models/breeze/transformer_config.h"
 #include "core/row_capacity.h"
+#include "core/forward_batch.h"
 
-namespace tts {
+namespace tts::breeze {
 struct LayerRange {
     int begin = 0, end = -1;
 };
@@ -52,6 +53,15 @@ class Transformer {
     Transformer(Weights &weights, const std::string &prefix, TransformerConfig cfg) : config(cfg) {
         for (int i = 0; i < cfg.layers; i++) {
             std::string p = prefix + ".layers." + std::to_string(i);
+            weights.validate(p + ".self_attn.q_proj.weight", {cfg.heads * cfg.dim, cfg.hidden},
+                             cfg.type);
+            weights.validate(p + ".self_attn.k_proj.weight", {cfg.kvheads * cfg.dim, cfg.hidden},
+                             cfg.type);
+            weights.validate(p + ".self_attn.v_proj.weight", {cfg.kvheads * cfg.dim, cfg.hidden},
+                             cfg.type);
+            weights.validate(p + ".mlp.gate_proj.weight", {cfg.intermediate, cfg.hidden}, cfg.type);
+            weights.validate(p + ".mlp.up_proj.weight", {cfg.intermediate, cfg.hidden}, cfg.type);
+            weights.validate(p + ".mlp.down_proj.weight", {cfg.hidden, cfg.intermediate}, cfg.type);
             TransformerLayer l;
             l.pre = weights.get(
                 p + (cfg.gemma ? ".pre_self_attn_layernorm.weight" : ".input_layernorm.weight"));
@@ -81,8 +91,10 @@ class Transformer {
                 l.qn = weights.get(p + ".self_attn.q_norm.weight");
                 l.kn = weights.get(p + ".self_attn.k_norm.weight");
             }
-            l.attn_scale = weights.optional(p + ".self_attn_layer_scale.scale");
-            l.mlp_scale = weights.optional(p + ".mlp_layer_scale.scale");
+            if (cfg.layer_scale) {
+                l.attn_scale = weights.get(p + ".self_attn_layer_scale.scale");
+                l.mlp_scale = weights.get(p + ".mlp_layer_scale.scale");
+            }
             auto vector = [&](TensorView v, int width) {
                 if (v.type != cfg.type || v.numel() != size_t(width))
                     throw std::invalid_argument(
@@ -132,16 +144,17 @@ class Transformer {
                                         cfg.rope_low_wave, cfg.rope_high_wave);
         }
     }
-    void prepare_range(Backend &gpu, int max_rows) const {
+    void prepare_range(int max_rows) const {
         if (config.quantization == Quantization::None)
             return;
         for (int rows = 1; rows <= max_rows;) {
             int capacity = row_capacity(rows);
-            prepare(gpu, capacity);
+            prepare(capacity);
             rows = capacity + 1;
         }
     }
-    void prepare(Backend &gpu, int rows) const {
+    void prepare(int rows) const {
+        auto &gpu = backend_for(layers.front().pre);
         if (config.quantization == Quantization::None)
             return;
         const auto &c = config;
@@ -150,15 +163,20 @@ class Transformer {
               std::pair{2 * c.intermediate, c.hidden}, std::pair{c.hidden, c.intermediate}})
             gpu.quantized().prepare(rows, shape.first, shape.second);
     }
-    void forward(Backend &gpu, TransformerState &s, TensorView x, const int *positions, int batch,
-                 int time, int slot = 0, int fixed_position = -1, TensorView final_last = {},
-                 const PackedBatch *packed = nullptr, const CacheSequence *sequences = nullptr,
+    void forward(TransformerState &s, TensorView x, const ForwardBatch &input,
                  LayerRange range = {}) const {
+        auto &gpu = backend_for(x);
         const auto &c = config;
+        int batch = input.batch(), time = input.time(), slot = input.slot;
+        int fixed_position = input.fixed_position;
+        const auto *positions = input.positions;
+        const auto *packed = input.sequence.addressing();
+        const auto *sequences = input.cache.layout.sequences;
+        auto final_last = input.output;
         int end = range.end < 0 ? c.layers : range.end;
         if (range.begin < 0 || range.begin >= end || end > c.layers)
             throw std::invalid_argument("invalid transformer layer range");
-        int n = packed ? packed->rows : batch * time;
+        int n = input.rows();
         if (batch < 1 || time < 1 || slot < 0 || n > s.max_rows || x.cols != c.hidden ||
             x.rows != n || slot + batch > s.batch ||
             (s.ring && (!c.causal || c.window <= 0 || s.capacity < c.window || time != 1)) ||
@@ -192,7 +210,7 @@ class Transformer {
                 gpu.quantized().linear(quant_view(c.hidden), l.qkv_quant, proj);
             else
                 gpu.linear(norm, l.qkv, proj);
-            const auto &external = s.external_kv;
+            const auto &external = input.cache;
             auto k = sequences && !external.layout.key_pages ? TensorView{}
                      : external.layout.key_pages             ? external.keys
                      : external.layout.block_table
@@ -208,7 +226,6 @@ class Transformer {
                                     i * cache_stride);
             CacheLayout cache = external.layout;
             cache.ring = s.ring;
-            cache.sequences = sequences ? sequences : cache.sequences;
             cache.layer = i;
             bool full = c.gemma && c.full_attention[i];
             gpu.qkv(proj, q, k, v, positions, batch, time, slot, s.capacity, c.heads, c.kvheads,
@@ -234,7 +251,7 @@ class Transformer {
             if (c.gemma)
                 gpu.norm(u, l.ffn_norm, u, c.eps, true);
             if (i + 1 == c.layers && final_last.data && packed)
-                gpu.residual_norm_last(x, u, final_norm, final_last, packed->offsets + 1, c.eps);
+                gpu.residual_norm_last(x, u, final_norm, final_last, packed->cu_seqlens + 1, c.eps);
             else if (i + 1 == c.layers && final_last.data)
                 gpu.residual_norm(x.slice(n - 1), u.slice(n - 1), final_norm, final_last, c.eps,
                                   l.mlp_scale, c.gemma);
@@ -247,4 +264,4 @@ class Transformer {
         }
     }
 };
-} // namespace tts
+} // namespace tts::breeze

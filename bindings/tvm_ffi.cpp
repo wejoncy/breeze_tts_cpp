@@ -37,6 +37,8 @@ struct EngineHandle : ffi::Object {
 struct ReferenceHandle : ffi::Object {
     std::shared_ptr<const Reference> reference;
     TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tts.ReferenceHandle", ReferenceHandle, ffi::Object);
+    explicit ReferenceHandle(std::shared_ptr<const Reference> value)
+        : reference(std::move(value)) {}
     ReferenceHandle(std::vector<int> codes, std::string text, int codebooks, int entries)
         : reference(std::make_shared<const Reference>(
               Reference{std::move(text), std::move(codes), codebooks, entries})) {}
@@ -44,6 +46,10 @@ struct ReferenceHandle : ffi::Object {
 struct Options : ffi::Object, GenerationOptions {
     // FFI scalar integers are signed. Keep the RNG seed's full bit pattern.
     int64_t seed_bits = static_cast<int64_t>(GenerationOptions::seed);
+    std::string synthesis_mode_name = tts::synthesis_mode_name(GenerationOptions::synthesis_mode);
+    Options() = default;
+    explicit Options(GenerationOptions options) : GenerationOptions(std::move(options)),
+        synthesis_mode_name(tts::synthesis_mode_name(GenerationOptions::synthesis_mode)) {}
     static constexpr bool _type_mutable = true;
     TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tts.Options", Options, ffi::Object);
 };
@@ -68,6 +74,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
     FIELD(dual_cfg);
     FIELD(cfg_scale_ref);
     FIELD(cfg_scale_ins);
+    FIELD(speed_factor);
+    FIELD(sample_steps);
+    FIELD(cfg_rate);
+    fields.def_rw("synthesis_mode", &Options::synthesis_mode_name);
+    FIELD(streaming_chunk_seconds);
+    FIELD(streaming_lookahead_seconds);
+    FIELD(streaming_overlap_seconds);
+    FIELD(semantic_lookahead_seconds);
 #undef FIELD
 }
 
@@ -86,7 +100,7 @@ ffi::ObjectRef create(std::string path, int device, int batch, int context,
 }
 
 ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string text, int rate,
-                         int channels) {
+                         int channels, std::string language) {
     auto engine = handle->get();
     auto format = engine->audio_format();
     std::vector<float> mono;
@@ -103,8 +117,9 @@ ffi::ObjectRef reference(EngineHandle *handle, ffi::Bytes audio, std::string tex
                               engine->max_reference_samples(), format.sample_rate);
     }
     return ffi::ObjectRef(
-        ffi::make_object<ReferenceHandle>(with_errors([&] { return engine->encode_audio(mono); }),
-                                          text, format.codebooks, format.codebook_size));
+        ffi::make_object<ReferenceHandle>(with_errors([&] {
+            return engine->prepare_reference(mono, std::move(text), language);
+        })));
 }
 
 std::vector<Input> requests_from(const ffi::Array<Values> &input) {
@@ -115,13 +130,17 @@ std::vector<Input> requests_from(const ffi::Array<Values> &input) {
         requests.push_back(
             {r.at("text").cast<std::string>(), r.at("instruction").cast<std::string>(),
              r.at("speaker").cast<std::string>(),
-             ref == nullptr ? nullptr : ref.cast<const ReferenceHandle *>()->reference});
+             ref == nullptr ? nullptr : ref.cast<const ReferenceHandle *>()->reference,
+             r.at("language").cast<std::string>(),
+             r.at("text_split_method").cast<std::string>(),
+             r.at("fragment_interval").cast<double>()});
     }
     return requests;
 }
 GenerationOptions snapshot_options(const Options *options) {
     // Snapshot options before releasing control to Python callbacks.
     GenerationOptions snapshot = *options;
+    snapshot.synthesis_mode = parse_synthesis_mode(options->synthesis_mode_name);
     snapshot.seed = static_cast<uint64_t>(options->seed_bits);
     return snapshot;
 }
@@ -218,8 +237,8 @@ void close(EngineHandle *handle) {
 std::string version() {
     return tts_version();
 }
-ffi::ObjectRef default_options() {
-    return ffi::ObjectRef(ffi::make_object<Options>());
+ffi::ObjectRef default_options(const EngineHandle *handle) {
+    return ffi::ObjectRef(ffi::make_object<Options>(handle->get()->default_options()));
 }
 ffi::ObjectRef copy_options(const Options *options) {
     return ffi::ObjectRef(ffi::make_object<Options>(*options));
@@ -240,6 +259,17 @@ Values memory_stats(const EngineHandle *handle) {
             {"peak_reserved_bytes", s.peak_reserved_bytes}};
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare_reference, reference);
+ffi::Map<ffi::String, ffi::Any> model_info(EngineHandle *handle) {
+    const auto &info = handle->get()->model_info();
+    ffi::Array<ffi::String> files;
+    for (const auto &name : info.checkpoint_files)
+        files.push_back(name);
+    return {{"model_type", info.model_type},
+            {"frame_rate", double(info.audio.sample_rate) / info.audio.samples_per_frame},
+            {"max_new_tokens", info.max_output_frames},
+            {"checkpoint_files", files}};
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(model_info, model_info);
 ffi::ObjectRef reference_from_codes(std::vector<int> codes, std::string text, int codebooks,
                                     int entries) {
     return ffi::ObjectRef(

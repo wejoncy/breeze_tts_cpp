@@ -1,22 +1,25 @@
 #include "models/breeze/audio_encoder.h"
 #include <filesystem>
-#include "kernels/audio/encoder_kernels.h"
+#include "ops/audio_encoder.h"
+#include "ops/vector_quantization.h"
 #include <cmath>
 #include <algorithm>
 #include <fstream>
-namespace tts {
+namespace tts::breeze {
 EncoderConv::EncoderConv(Weights &w, const std::string &p, int s, bool rep, int d)
-    : stride(s), dilation(d), replicate(rep) {
+    : EncoderConv(w, p, w.get(p + ".conv.bias"), s, rep, d) {}
+EncoderConv::EncoderConv(Weights &w, const std::string &p, TensorView b, int s, bool rep, int d)
+    : bias(b), stride(s), dilation(d), replicate(rep) {
     const auto &e = w.entry(p + ".conv.weight");
     if (stride < 1 || dilation < 1 || (stride > 1 && dilation > 1) || e.type != Type::F32 ||
-        e.shape.size() != 3 || e.shape[2] % stride)
+        e.shape.size() != 3 || e.shape[0] < 1 || e.shape[1] < 1 || e.shape[2] < 1 ||
+        e.shape[2] % stride)
         throw std::runtime_error("unsupported encoder convolution");
     out = e.shape[0];
     in = e.shape[1];
     kernel = e.shape[2];
     if (kernel > INT32_MAX / out || int64_t(kernel - 1) * dilation >= INT32_MAX)
         throw std::invalid_argument("encoder convolution indexing overflow");
-    bias = w.optional(p + ".conv.bias");
     if (bias.data && (bias.type != Type::F32 || bias.numel() != size_t(out)))
         throw std::invalid_argument("encoder convolution bias shape: " + p);
     std::vector<float> packed(e.size / 4);
@@ -30,17 +33,26 @@ EncoderConv::EncoderConv(Weights &w, const std::string &p, int s, bool rep, int 
                         src[(size_t(o) * in + c) * kernel + tap * stride + phase];
     weight = w.custom(p + ".phase_major", packed.data(), kernel * out, in, Type::F32);
 }
-void EncoderConv::run(Backend &g, TensorView x, TensorView scratch, TensorView y, bool elu,
+void EncoderConv::project(TensorView x, TensorView p, int max_input_rows) const {
+    auto &g = backend_for(x);
+    const int input_rows = max_input_rows ? max_input_rows : x.rows, taps = kernel / stride;
+    for (int phase = 0; phase < stride && phase < input_rows; ++phase) {
+        int count = (input_rows - 1 - phase) / stride + 1;
+        auto input = x.every_rows(phase, stride, max_input_rows ? 1 : count);
+        auto output = p.columns(phase * taps * out, taps * out).slice(0, input.rows);
+        auto weights = weight.slice(phase * taps * out, taps * out);
+        if (max_input_rows) g.prepare_linear(input, weights, output, true, 0, 1, 1, count);
+        else g.linear(input, weights, output, true);
+    }
+}
+void EncoderConv::run(TensorView x, TensorView scratch, TensorView y, bool elu,
                       TensorView residual) const {
-    int n = rows(x.rows), taps = kernel / stride;
+    auto &g = backend_for(x);
+    const int n = rows(x.rows);
     if (x.cols != in || y.rows != n || y.cols != out)
         throw std::runtime_error("encoder convolution shape");
     auto p = scratch.reshape({int(scratch.numel() / (kernel * out)), kernel * out}).slice(0, n);
-    for (int phase = 0; phase < stride && phase < x.rows; phase++) {
-        int count = (x.rows - 1 - phase) / stride + 1;
-        g.linear(x.every_rows(phase, stride, count), weight.slice(phase * taps * out, taps * out),
-                 p.columns(phase * taps * out, taps * out).slice(0, count), true);
-    }
+    project(x, p);
     encoder_conv_finish(g.stream, x, p, weight, bias, y, kernel, stride, replicate, elu, residual,
                         dilation);
 }
@@ -90,21 +102,17 @@ AudioEncoder::AudioEncoder(Weights &w, EncoderConfig config)
         throw std::invalid_argument("encoder last convolution channel mismatch");
     if (config_.downsample_stride != 1) {
         downsample_ = std::make_unique<EncoderConv>(w, "codec.encoder.downsample",
-                                                    config_.downsample_stride, true);
+                                                    TensorView{}, config_.downsample_stride, true);
         if (downsample_->in != c.hidden || downsample_->out != c.hidden ||
             downsample_->kernel != 2 * config_.downsample_stride)
             throw std::invalid_argument("encoder resampling weight/configuration mismatch");
     }
     auto matrix = [&](const std::string &name, int rows, int cols, bool upload = true) {
-        const auto &e = w.entry(name);
-        if (e.type != Type::F32 || e.shape != std::vector<int>{rows, cols})
-            throw std::invalid_argument("encoder matrix shape: " + name);
+        w.validate(name, {rows, cols}, Type::F32);
         return upload ? w.get(name) : TensorView{};
     };
     auto vector = [&](const std::string &name) {
-        const auto &e = w.entry(name);
-        if (e.type != Type::F32 || e.shape != std::vector<int>{c.hidden})
-            throw std::invalid_argument("encoder vector shape: " + name);
+        w.validate(name, {c.hidden}, Type::F32);
         return w.get(name);
     };
     for (int i = 0; i < c.layers; i++) {
@@ -211,8 +219,55 @@ size_t AudioEncoder::workspace_bytes(int samples) const {
     Storage storage(*this, samples, &plan);
     return plan.size;
 }
-std::vector<int> AudioEncoder::encode(Backend &g, BufferAllocator &arena,
+std::unique_ptr<DeviceArena> AudioEncoder::prepare(Backend &g, int max_samples) const {
+    if (max_samples < 1) throw std::invalid_argument("invalid encoder planning capacity");
+    size_t input_elements = 0, output_elements = 0;
+    auto visit = [&](auto conv, auto matrix) {
+        int rows = max_samples;
+        for (const auto &stage : stages_) {
+            for (const auto &block : stage.blocks) {
+                conv(block.first, rows); conv(block.second, rows);
+            }
+            conv(stage.down, rows); rows = stage.down.rows(rows);
+        }
+        conv(last_, rows);
+        for (const auto &layer : layers_)
+            for (auto weight : {layer.qkv, layer.out, layer.fc1, layer.fc2}) matrix(weight, rows);
+        if (downsample_) { conv(*downsample_, rows); rows = downsample_->rows(rows); }
+        matrix(semantic_proj_, rows); matrix(acoustic_proj_, rows);
+        for (auto table : tables_) matrix(table, rows);
+    };
+    visit([&](const EncoderConv &conv, int) {
+        input_elements = std::max(input_elements, size_t(conv.stride) * conv.in);
+        output_elements = std::max(output_elements, size_t(conv.kernel) * conv.out);
+    }, [&](TensorView weight, int) {
+        input_elements = std::max(input_elements, size_t(weight.cols));
+        output_elements = std::max(output_elements, size_t(weight.rows));
+    });
+    const int samples = std::min(max_samples, config_.stride);
+    WorkspacePlan plan;
+    plan.allocate(input_elements * sizeof(float)); plan.allocate(output_elements * sizeof(float));
+    plan.allocate(workspace_bytes(samples));
+    auto arena = std::make_unique<DeviceArena>(g.memory, plan.size);
+    Buffer input(input_elements * sizeof(float), arena.get()), output(output_elements * sizeof(float), arena.get());
+    visit([&](const EncoderConv &conv, int rows) {
+        conv.project(input.view(conv.stride, conv.in, Type::F32),
+                        output.view(1, conv.kernel * conv.out, Type::F32), rows);
+    }, [&](TensorView weight, int rows) {
+        g.prepare_linear(input.view(1, weight.cols, Type::F32), weight,
+                           output.view(1, weight.rows, Type::F32), true, 0, 1, 1, rows);
+    });
+    // A minimal legal path materializes reference-only kernel functions. All
+    // large-M library plans were declared above; no full reference activation
+    // buffers or real audio are needed during resource initialization.
+    encode(*arena, std::vector<float>(samples, 0));
+    // Returning the backing keeps every planning/priming pointer alive until
+    // the caller has uploaded and destroyed the temporary initialization graph.
+    return arena;
+}
+std::vector<int> AudioEncoder::encode(BufferAllocator &arena,
                                       const std::vector<float> &mono) const {
+    auto &g = backend_for(arena.device_ordinal());
     Range range("tts.reference_encoder");
     if (mono.size() > INT32_MAX)
         throw std::invalid_argument("reference audio sample count exceeds tensor indexing");
@@ -233,22 +288,22 @@ std::vector<int> AudioEncoder::encode(Backend &g, BufferAllocator &arena,
         for (size_t i = 0; i < stage.blocks.size(); ++i) {
             const auto &block = stage.blocks[i];
             auto mid = c.view(x.rows, block.first.out, Type::F32);
-            block.first.run(g, activated, workspace(block.first, x.rows), mid, true);
+            block.first.run(activated, workspace(block.first, x.rows), mid, true);
             // Keep the residual unactivated until all residual blocks have consumed it.
             bool last = i + 1 == stage.blocks.size();
-            block.second.run(g, mid, workspace(block.second, mid.rows), last ? activated : x, last,
+            block.second.run(mid, workspace(block.second, mid.rows), last ? activated : x, last,
                              x);
             if (!last)
                 g.activation(x, activated, 3);
         }
         auto next = a.view(stage.down.rows(x.rows), stage.down.out, Type::F32);
-        stage.down.run(g, activated, workspace(stage.down, x.rows), next);
+        stage.down.run(activated, workspace(stage.down, x.rows), next);
         x = next;
     }
     auto act = b.view(x.rows, x.cols, Type::F32);
     g.activation(x, act, 3);
     x = a.view(act.rows, last_.out, Type::F32);
-    last_.run(g, act, workspace(last_, act.rows), x);
+    last_.run(act, workspace(last_, act.rows), x);
     auto dump = [&](TensorView value, const char *suffix) {
         if (const char *prefix = std::getenv("TTS_ENCODER_DUMP")) {
             std::vector<float> h(value.numel());
@@ -288,7 +343,7 @@ std::vector<int> AudioEncoder::encode(Backend &g, BufferAllocator &arena,
     auto down = x;
     if (downsample_) {
         down = b.view(downsample_->rows(x.rows), downsample_->out, Type::F32);
-        downsample_->run(g, x, workspace(*downsample_, x.rows), down);
+        downsample_->run(x, workspace(*downsample_, x.rows), down);
     }
     dump(down, ".latent.f32");
     auto r = residual.view(down.rows, config_.codebook_dim, Type::F32),
@@ -297,11 +352,11 @@ std::vector<int> AudioEncoder::encode(Backend &g, BufferAllocator &arena,
         if (cb == 0 || cb == config_.semantic_codebooks)
             g.linear(down, cb ? acoustic_proj_ : semantic_proj_, r, true);
         g.linear(r, tables_[cb], sc, true);
-        encoder_quantize(g.stream, r, sc, tables_[cb], norms_[cb], codes.ptr<int>(), cb,
+        vector_quantize(g.stream, r, sc, tables_[cb], norms_[cb], codes.ptr<int>(), cb,
                          config_.codebooks);
     }
     std::vector<int> result(size_t(down.rows) * config_.codebooks);
     g.download(result.data(), codes.data(), codes.size());
     return result;
 }
-} // namespace tts
+} // namespace tts::breeze

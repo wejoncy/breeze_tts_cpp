@@ -4,11 +4,16 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 extern "C" {
+struct HFToken {
+    uint32_t id;
+    size_t start, end;
+};
 void *hf_tokenizer_new(const char *, char *, size_t);
 void hf_tokenizer_free(void *);
-int hf_tokenizer_encode(void *, const char *, bool, uint32_t **, size_t *, char *, size_t);
-void hf_tokens_free(uint32_t *, size_t);
+int hf_tokenizer_encode(void *, const char *, bool, HFToken **, size_t *, char *, size_t);
+void hf_tokens_free(HFToken *, size_t);
 }
 namespace tts {
 class Tokenizer {
@@ -26,14 +31,21 @@ class Tokenizer {
     }
     Tokenizer(const Tokenizer &) = delete;
     Tokenizer &operator=(const Tokenizer &) = delete;
-    std::vector<int> encode(const std::string &text, bool bos = true) const {
-        uint32_t *ids = nullptr;
+    std::vector<HFToken> tokenize(const std::string &text, bool bos = true) const {
+        HFToken *tokens = nullptr;
         size_t n = 0;
         char err[1024]{};
-        if (hf_tokenizer_encode(impl_, text.c_str(), bos, &ids, &n, err, sizeof(err)))
+        if (hf_tokenizer_encode(impl_, text.c_str(), bos, &tokens, &n, err, sizeof(err)))
             throw std::runtime_error(err);
-        std::vector<int> out(ids, ids + n);
-        hf_tokens_free(ids, n);
+        auto release = [n](HFToken *p) { hf_tokens_free(p, n); };
+        std::unique_ptr<HFToken, decltype(release)> owned(tokens, release);
+        return n ? std::vector<HFToken>(tokens, tokens + n) : std::vector<HFToken>{};
+    }
+    std::vector<int> encode(const std::string &text, bool bos = true) const {
+        auto tokens = tokenize(text, bos);
+        std::vector<int> out;
+        out.reserve(tokens.size());
+        for (auto token : tokens) out.push_back(int(token.id));
         return out;
     }
 };

@@ -1,10 +1,13 @@
 #include "engine/request_executor.h"
 #include "execution/model_runner.h"
 #include "runtime/mailbox.h"
+#include "runtime/error.h"
 #include "support/log.h"
+#include "support/profiler.h"
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tts {
 struct RequestExecutor::Impl {
@@ -12,6 +15,8 @@ struct RequestExecutor::Impl {
         ExecutionBatch batch;
         std::function<void(std::exception_ptr)> control;
         bool stop = false;
+        std::vector<PreparedTask> preparation;
+        PreparationCallback prepared;
     };
     ModelRunner &runner;
     uint64_t engine_id;
@@ -24,20 +29,36 @@ struct RequestExecutor::Impl {
     std::unordered_map<uint64_t, Request> requests;
     std::function<void(Completion)> completed;
     std::thread worker;
+    std::vector<const ExecutionRow *> rows;
+    std::vector<ModelRunner::RequestState *> prefill, batch_states;
+    std::vector<AudioCallback> callbacks;
     void execute(ExecutionBatch &batch, Completion &result) {
+        Range trace("tts.engine.execute");
+        result.resources_released = !batch.release.empty() || !batch.release_requests.empty();
         for (auto id : batch.release)
             states.erase(id);
         for (auto id : batch.release_requests)
             requests.erase(id);
         for (auto &request : batch.requests)
             requests.emplace(request.id, Request{std::move(request.plan), {}});
-        result.rows.resize(batch.rows.size());
         std::unordered_map<uint64_t, std::exception_ptr> rejected;
-        for (size_t i = 0; i < batch.rows.size(); ++i) {
-            auto &row = batch.rows[i];
-            auto &out = result.rows[i];
+        std::unordered_set<uint64_t> deferred;
+        rows.clear();
+        if (batch.rows.size() > result.rows.size())
+            throw std::logic_error("batch exceeds initialized completion capacity");
+        for (const auto &row : batch.rows) {
+            // A queued batch may still name a row that finished in the previous
+            // execution. Only explicit admission can create a GPU state.
+            if (!row.create && !states.count(row.id))
+                continue;
+            rows.push_back(&row);
+            auto &out = result.rows[result.valid_rows++];
             out.id = row.id;
-            if (rejected.count(row.request))
+            out.stats = {};
+            out.error = {};
+            out.done = out.prefilled = out.deferred = false;
+            out.pcm.clear();
+            if (rejected.count(row.request) || deferred.count(row.request))
                 continue;
             if (!states.count(row.id)) {
                 try {
@@ -45,8 +66,16 @@ struct RequestExecutor::Impl {
                     auto &request = requests.at(row.request);
                     if (!request.admission)
                         request.admission = runner.admit(*request.plan);
-                    states.emplace(row.id,
-                                   runner.prepare(*request.plan, row.input, *request.admission));
+                    if (!request.admission) {
+                        deferred.insert(row.request);
+                        continue;
+                    }
+                    auto state = runner.prepare(*request.plan, row.input, *request.admission);
+                    if (!state) {
+                        out.deferred = true;
+                        continue;
+                    }
+                    states.emplace(row.id, std::move(state));
                 } catch (const DeviceError &) {
                     throw;
                 } catch (...) {
@@ -54,12 +83,13 @@ struct RequestExecutor::Impl {
                 }
             }
         }
-        std::vector<ModelRunner::RequestState *> prefill;
-        for (auto id : batch.prefill) {
-            auto row = std::find_if(batch.rows.begin(), batch.rows.end(),
-                                    [&](const auto &row) { return row.id == id; });
-            auto found = states.find(id);
-            if (found != states.end() && row != batch.rows.end() && !rejected.count(row->request))
+        prefill.clear();
+        // A model can reach a new preparation checkpoint during the previous
+        // queued step. Use executor-owned progress rather than stale metadata.
+        for (const auto *row : rows) {
+            auto found = states.find(row->id);
+            if (found != states.end() && !found->second->prefilled() &&
+                !found->second->done() && !rejected.count(row->request))
                 prefill.push_back(found->second.get());
         }
         if (!prefill.empty()) {
@@ -72,21 +102,27 @@ struct RequestExecutor::Impl {
                             [](const auto *row) { return !row->prefilled() && !row->done(); }) &&
                 std::chrono::steady_clock::now() < deadline);
         }
-        std::vector<ModelRunner::RequestState *> batch_states;
-        std::vector<AudioCallback> callbacks;
-        for (size_t i = 0; i < batch.rows.size(); ++i) {
-            auto &row = batch.rows[i];
+        batch_states.clear();
+        callbacks.clear();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto &row = *rows[i];
             auto &out = result.rows[i];
+            if (out.deferred || deferred.count(row.request)) {
+                out.deferred = true;
+                continue;
+            }
             auto error = rejected.find(row.request);
             if (error != rejected.end()) {
                 out.error = error->second;
                 out.done = true;
             }
-            if (out.done || !states.at(row.id)->prefilled())
+            if (out.done || states.at(row.id)->done() || !states.at(row.id)->prefilled())
                 continue;
             batch_states.push_back(states.at(row.id).get());
-            callbacks.push_back([&, i](int, const int16_t *pcm, size_t count) {
-                result.rows[i].pcm.assign(pcm, pcm + count);
+            callbacks.push_back([output = &result.rows[i].pcm](int, const int16_t *pcm, size_t count) {
+                if (count > output->capacity() - output->size())
+                    throw std::logic_error("audio step exceeds initialized output capacity");
+                output->insert(output->end(), pcm, pcm + count);
                 return true;
             });
         }
@@ -97,7 +133,8 @@ struct RequestExecutor::Impl {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
         result.decoded_rows = int(batch_states.size());
-        for (auto &out : result.rows) {
+        for (size_t i = 0; i < result.valid_rows; ++i) {
+            auto &out = result.rows[i];
             auto found = states.find(out.id);
             if (found == states.end())
                 continue;
@@ -121,11 +158,39 @@ struct RequestExecutor::Impl {
             ready.wait_dequeue(command);
             if (command.stop)
                 break;
+            if (!command.preparation.empty()) {
+                Range trace("tts.engine.prepare_execute");
+                for (size_t i = 0; i < command.preparation.size(); ++i) {
+                    auto &item = command.preparation[i];
+                    if (fatal)
+                        item.error = fatal;
+                    else try {
+                        runner.prepare_task(*item.task);
+                    } catch (const DeviceError &) {
+                        item.error = fatal = std::current_exception();
+                        states.clear();
+                        requests.clear();
+                        Completion result;
+                        result.fatal = fatal;
+                        completed(std::move(result));
+                    } catch (...) {
+                        item.error = std::current_exception();
+                    }
+                    command.prepared(i, std::move(item));
+                }
+                continue;
+            }
             if (command.control) {
                 command.control(fatal);
                 continue;
             }
-            Completion result;
+            Completion result = std::move(command.batch.output);
+            result.valid_rows = 0;
+            result.fatal = {};
+            result.decode_ms = 0;
+            result.decoded_rows = 0;
+            result.resources_released = false;
+            result.executed = true;
             try {
                 if (fatal)
                     std::rethrow_exception(fatal);
@@ -142,8 +207,13 @@ struct RequestExecutor::Impl {
     }
 
   public:
-    Impl(ModelRunner &r, uint64_t id, std::function<void(Completion)> complete)
-        : runner(r), engine_id(id), completed(std::move(complete)) {}
+    Impl(ModelRunner &r, int capacity, uint64_t id, std::function<void(Completion)> complete)
+        : runner(r), engine_id(id), completed(std::move(complete)) {
+        rows.reserve(capacity);
+        prefill.reserve(capacity);
+        batch_states.reserve(capacity);
+        callbacks.reserve(capacity);
+    }
     ~Impl() {
         stop();
     }
@@ -152,6 +222,20 @@ struct RequestExecutor::Impl {
     }
     void submit(ExecutionBatch batch) {
         send(ready, Command{std::move(batch), {}, false});
+    }
+    void prepare_task(std::unique_ptr<PreparationTask> task,
+                      std::function<void(std::unique_ptr<PreparationTask>, std::exception_ptr)> reply) {
+        std::vector<PreparedTask> tasks;
+        tasks.push_back({std::move(task), {}});
+        prepare_tasks(std::move(tasks), [reply = std::move(reply)](size_t, PreparedTask result) {
+            reply(std::move(result.task), result.error);
+        });
+    }
+    void prepare_tasks(std::vector<PreparedTask> tasks, PreparationCallback reply) {
+        Command command;
+        command.preparation = std::move(tasks);
+        command.prepared = std::move(reply);
+        send(ready, std::move(command));
     }
     void control(std::function<void(std::exception_ptr)> operation) {
         send(ready, Command{{}, std::move(operation), false});
@@ -163,15 +247,23 @@ struct RequestExecutor::Impl {
         worker.join();
     }
 };
-RequestExecutor::RequestExecutor(ModelRunner &runner, uint64_t engine_id,
+RequestExecutor::RequestExecutor(ModelRunner &runner, int capacity, uint64_t engine_id,
                                  std::function<void(Completion)> completed)
-    : impl_(std::make_unique<Impl>(runner, engine_id, std::move(completed))) {}
+    : impl_(std::make_unique<Impl>(runner, capacity, engine_id, std::move(completed))) {}
 RequestExecutor::~RequestExecutor() = default;
 void RequestExecutor::start() {
     impl_->start();
 }
 void RequestExecutor::submit(ExecutionBatch batch) {
     impl_->submit(std::move(batch));
+}
+void RequestExecutor::prepare_task(
+    std::unique_ptr<PreparationTask> task,
+    std::function<void(std::unique_ptr<PreparationTask>, std::exception_ptr)> reply) {
+    impl_->prepare_task(std::move(task), std::move(reply));
+}
+void RequestExecutor::prepare_tasks(std::vector<PreparedTask> tasks, PreparationCallback reply) {
+    impl_->prepare_tasks(std::move(tasks), std::move(reply));
 }
 void RequestExecutor::control(std::function<void(std::exception_ptr)> operation) {
     impl_->control(std::move(operation));

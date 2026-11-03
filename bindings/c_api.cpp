@@ -23,7 +23,9 @@ static void set_error(char *dst, size_t cap, const char *text) {
 }
 extern "C" {
 const char *tts_version() {
-    return "tts.cpp/0.4.0 abi=3 quantization=fp8,int8";
+    static const std::string version = "tts.cpp/0.4.0 abi=" + std::to_string(TTS_ABI_VERSION) +
+                                       " quantization=fp8,int8";
+    return version.c_str();
 }
 tts_engine *tts_create(const char *path, int32_t device, int32_t batch, int32_t context,
                        const char *quantization, char *error, size_t cap) {
@@ -128,18 +130,25 @@ tts_options tts_default_options() {
             int(o.depth_do_sample),
             int(o.dual_cfg),
             o.cfg_scale_ref,
-            o.cfg_scale_ins};
+            o.cfg_scale_ins,
+            o.speed_factor,
+            o.sample_steps,
+            o.cfg_rate,
+            int(o.synthesis_mode),
+            o.streaming_chunk_seconds,
+            o.streaming_lookahead_seconds,
+            o.streaming_overlap_seconds,
+            o.semantic_lookahead_seconds};
 }
 tts_reference *tts_reference_from_audio(tts_engine *e, const void *bytes, size_t size,
-                                        const char *text, char *error, size_t cap) {
+                                        const char *text, const char *language, char *error, size_t cap) {
     try {
         if (!e)
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
-        return reference(
-            e->impl.encode_audio(tts::read_audio(bytes, size, e->impl.max_reference_samples(),
-                                                 e->impl.audio_format().sample_rate)),
-            std::move(t), e->impl.audio_format().codebooks, e->impl.audio_format().codebook_size);
+        return new tts_reference{e->impl.prepare_reference(
+            tts::read_audio(bytes, size, e->impl.max_reference_samples(),
+                             e->impl.audio_format().sample_rate), std::move(t), language ? language : "")};
     } catch (const std::exception &ex) {
         set_error(error, cap, ex.what());
         return nullptr;
@@ -149,16 +158,15 @@ tts_reference *tts_reference_from_audio(tts_engine *e, const void *bytes, size_t
     }
 }
 tts_reference *tts_reference_from_pcm(tts_engine *e, const float *pcm, size_t frames, int32_t sr,
-                                      int32_t channels, const char *text, char *error, size_t cap) {
+                                      int32_t channels, const char *text, const char *language,
+                                      char *error, size_t cap) {
     try {
         if (!e)
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
-        return reference(e->impl.encode_audio(tts::resample_audio(
-                             pcm, frames, sr, channels, e->impl.max_reference_samples(),
-                             e->impl.audio_format().sample_rate)),
-                         std::move(t), e->impl.audio_format().codebooks,
-                         e->impl.audio_format().codebook_size);
+        return new tts_reference{e->impl.prepare_reference(
+            tts::resample_audio(pcm, frames, sr, channels, e->impl.max_reference_samples(),
+                                e->impl.audio_format().sample_rate), std::move(t), language ? language : "")};
     } catch (const std::exception &ex) {
         set_error(error, cap, ex.what());
         return nullptr;
@@ -225,13 +233,28 @@ int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_opti
         native.dual_cfg = bool(o.dual_cfg);
         native.cfg_scale_ref = o.cfg_scale_ref;
         native.cfg_scale_ins = o.cfg_scale_ins;
+        native.speed_factor = o.speed_factor;
+        native.sample_steps = o.sample_steps;
+        native.cfg_rate = o.cfg_rate;
+        if (o.synthesis_mode < TTS_SYNTHESIS_OFFLINE || o.synthesis_mode > TTS_SYNTHESIS_HYBRID)
+            throw std::invalid_argument("invalid synthesis mode");
+        native.synthesis_mode = static_cast<tts::SynthesisMode>(o.synthesis_mode);
+        native.streaming_chunk_seconds = o.streaming_chunk_seconds;
+        native.streaming_lookahead_seconds = o.streaming_lookahead_seconds;
+        native.streaming_overlap_seconds = o.streaming_overlap_seconds;
+        native.semantic_lookahead_seconds = o.semantic_lookahead_seconds;
+        if (!options)
+            native = e->impl.default_options();
         std::vector<tts::Input> requests;
         for (size_t i = 0; i < n; i++) {
             if (!req[i].text)
                 throw std::invalid_argument("text is required");
             requests.push_back({req[i].text, req[i].instruction ? req[i].instruction : "",
                                 req[i].speaker ? req[i].speaker : "S0",
-                                req[i].reference ? req[i].reference->impl : nullptr});
+                                req[i].reference ? req[i].reference->impl : nullptr,
+                                req[i].language ? req[i].language : "",
+                                req[i].text_split_method ? req[i].text_split_method : "",
+                                req[i].fragment_interval});
         }
         tts::Stats r;
         int status = e->impl.generate(

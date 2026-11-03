@@ -1,9 +1,10 @@
 #pragma once
 #include "models/breeze/transformer.h"
 #include "models/breeze/audio_config.h"
-#include "kernels/audio/audio_kernels.h"
+#include "ops/audio.h"
+#include "runtime/sequence_state.h"
 
-namespace tts {
+namespace tts::breeze {
 // Every operation owns its streaming history. Weights remain immutable.
 struct Conv {
     TensorView weight, bias;
@@ -29,7 +30,7 @@ struct ConvState {
         : history(persistent ? c.history_bytes(b, t) : 0, arena),
           projected(c.depthwise ? 0 : size_t(b) * t * c.kernel * c.out * sizeof(float), arena),
           batch(b), time(t) {}
-    void run(Backend &, const Conv &, TensorView, TensorView, const int *frame, int rows = 0,
+    void run(const Conv &, TensorView, TensorView, const int *frame, int rows = 0,
              const ConvHistory *states = nullptr);
 };
 struct CodecOp {
@@ -44,14 +45,7 @@ struct CodecState {
     Buffer a, b, saves[2], rvq1, rvq2, latent, hidden, position, pcm;
     int batch, max_elements;
     CodecState(const class Codec &, int, BufferAllocator *arena, bool mapped = false);
-    void reset(Backend &);
-};
-// Request persistence only; all convolution/transformer compute workspace is shared.
-struct CodecHistory {
-    Buffer keys, values, position;
-    std::vector<Buffer> conv;
-    CodecHistory(const class Codec &, BufferAllocator *);
-    void reset(Backend &);
+    void reset();
 };
 struct CodecBatch {
     const int *const *codes;
@@ -69,9 +63,9 @@ class Codec {
     CodecConfig config;
     Transformer transformer;
     Codec(Weights &, CodecConfig);
-    TensorView forward(Backend &, CodecState &, const int *codes, int batch = 0,
+    TensorView forward(CodecState &, const int *codes, int batch = 0,
                        const CodecBatch *mapped = nullptr) const;
+    SequenceStateSpec history_spec() const;
     friend struct CodecState;
-    friend struct CodecHistory;
 };
-} // namespace tts
+} // namespace tts::breeze

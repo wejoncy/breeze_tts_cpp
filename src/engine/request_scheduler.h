@@ -1,5 +1,5 @@
 #pragma once
-#include "tts/request.h"
+#include "execution/request_planner.h"
 #include <memory>
 #include <functional>
 namespace tts {
@@ -23,6 +23,7 @@ class RequestScheduler {
     GenerationFrame read(const std::string &request_id, int timeout_ms);
     void cancel(const std::string &request_id);
     void stop();
-    void run_sync(std::function<void()>);
+    void run_sync(std::function<void()>,
+                  std::function<void(const PreparationExecutor &)> prepare = {});
 };
 } // namespace tts

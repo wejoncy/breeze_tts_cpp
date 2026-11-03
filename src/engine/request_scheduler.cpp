@@ -1,7 +1,9 @@
 #include "engine/request_scheduler.h"
 #include "engine/request_executor.h"
-#include "runtime/mailbox.h"
+#include "execution/model_runner.h"
+#include "runtime/ordered_mailbox.h"
 #include "support/log.h"
+#include "support/profiler.h"
 #include <thread>
 #include <deque>
 #include <map>
@@ -57,9 +59,13 @@ struct Job {
     GenerationOptions options;
     uint64_t execution_id = 0;
     std::unique_ptr<RequestPlan> plan;
+    std::unique_ptr<RequestPreparation> preparation;
+    std::unique_ptr<PreparationTask> task;
     Stats stats;
     std::exception_ptr error;
     size_t buffered = 0, next_lane = 0, completed = 0, buffer_limit = 0;
+    std::deque<size_t> waiting_inputs;
+    uint64_t retry_epoch = 0;
     bool done = false, cancelled = false;
     bool registered = false, released = false;
     Clock::time_point submitted = Clock::now();
@@ -73,11 +79,15 @@ struct Job {
 } // namespace
 struct RequestScheduler::Impl {
     struct Command {
-        enum class Kind { Run, Add, Cancel, Shutdown };
+        enum class Kind { Run, Add, Cancel, Shutdown, Prepared, Planned };
         Kind kind = Kind::Run;
         std::function<void()> run;
         std::string request_id;
         std::unique_ptr<Job> job;
+        std::unique_ptr<PreparationTask> preparation;
+        std::function<void(std::unique_ptr<PreparationTask>, std::exception_ptr)> prepared;
+        std::exception_ptr preparation_error;
+        uint64_t owner = 0;
     };
     struct Active {
         ExecutionRow row;
@@ -89,18 +99,26 @@ struct RequestScheduler::Impl {
     int capacity;
     double frame_period_ms, last_decode_ms = 0;
     uint64_t engine_id, lane_sequence = 0, sequence = 0;
-    Mailbox<Command> incoming;
+    OrderedMailbox<Command> incoming;
     // Admission transfers one slot through this queue; it shares no counter.
     Mailbox<bool> available;
     // The CPU scheduler exclusively owns the mutable scheduling state below.
     std::unordered_map<std::string, std::shared_ptr<Job>> jobs;
-    std::deque<std::shared_ptr<Job>> planning, pending;
+    std::deque<std::shared_ptr<Job>> planning, preparing, pending;
+    std::deque<Command> prepared_results;
+    std::unordered_map<uint64_t, std::shared_ptr<Job>> inflight_preparations;
     std::vector<Active> active;
     std::vector<uint64_t> releases;
     std::vector<uint64_t> request_releases;
     std::deque<std::function<void(std::exception_ptr)>> controls;
     size_t request_limit = 32, issued_slots = 32, buffer_limit = 1 << 20, control_count = 0;
-    bool stopping = false, busy = false;
+    bool stopping = false, busy = false, preparation_busy = false;
+    // One executing batch and one queued successor overlap CPU scheduling with
+    // GPU work. Result ownership remains with the scheduler, in queue order.
+    static constexpr size_t pipeline_depth = 2;
+    size_t inflight_batches = 0;
+    std::vector<Completion> output_pool;
+    uint64_t resource_epoch = 1;
     std::exception_ptr executor_error;
     // The caller owns lifecycle operations and stops ingress before shutdown.
     enum class State { Ready, Running, Stopped };
@@ -109,12 +127,26 @@ struct RequestScheduler::Impl {
     std::thread scheduler;
     Impl(RequestPlanner &p, ModelRunner &r, int batch, double period, uint64_t id)
         : planner(p), capacity(batch), frame_period_ms(period), engine_id(id),
-          executor(r, id, [this](Completion result) {
+          executor(r, batch, id, [this](Completion result) {
               send(incoming,
                    Command{Command::Kind::Run, [this, result = std::move(result)]() mutable {
-                               complete(std::move(result));
+                               complete(result);
+                               if (result.executed)
+                                   output_pool.push_back(std::move(result));
                            }});
           }) {
+        const size_t samples = r.max_step_samples();
+        if (!samples)
+            throw std::logic_error("model defines an empty audio step capacity");
+        output_pool.resize(pipeline_depth);
+        for (auto &output : output_pool) {
+            output.rows.resize(size_t(capacity));
+            for (auto &row : output.rows) {
+                // Touch pages during initialization, before execution starts.
+                row.pcm.resize(samples);
+                row.pcm.clear();
+            }
+        }
         for (size_t i = 0; i < issued_slots; ++i)
             send(available, true);
     }
@@ -192,13 +224,18 @@ struct RequestScheduler::Impl {
             release_slot();
     }
     void retire(const std::shared_ptr<Job> &job) {
-        if (job->released || std::find(pending.begin(), pending.end(), job) != pending.end() ||
+        if (job->released || inflight_preparations.count(job->execution_id) ||
+            std::find(planning.begin(), planning.end(), job) != planning.end() ||
+            std::find(preparing.begin(), preparing.end(), job) != preparing.end() ||
+            std::find(pending.begin(), pending.end(), job) != pending.end() ||
             std::any_of(active.begin(), active.end(),
                         [&](const Active &a) { return a.job == job; }))
             return;
         job->released = true;
         request_releases.push_back(job->execution_id);
         job->plan.reset();
+        job->preparation.reset();
+        job->task.reset();
         if (!job->registered)
             release_slot();
         log::Scope scope(engine_id, job->execution_id);
@@ -226,8 +263,11 @@ struct RequestScheduler::Impl {
         controls.clear();
         jobs.clear();
         planning.clear();
+        preparing.clear();
         pending.clear();
         executor.stop();
+        inflight_preparations.clear();
+        prepared_results.clear();
         active.clear();
         releases.clear();
         request_releases.clear();
@@ -247,10 +287,9 @@ struct RequestScheduler::Impl {
         auto [it, inserted] = jobs.emplace(job->request_id, job);
         if (!inserted) {
             release_slot();
-            // Report the protocol error without replacing or retiring live work.
-            Result rejected;
-            rejected.error = std::make_exception_ptr(std::invalid_argument("duplicate request_id"));
-            emit(it->second, std::move(rejected));
+            // Results are addressed only by request ID. A rejected duplicate
+            // must not insert an error into the original request's output stream.
+            TTS_LOG(TTS_LOG_WARN, "request", "ignored duplicate request_id={}", job->request_id);
             return;
         }
         job->registered = true;
@@ -303,6 +342,9 @@ struct RequestScheduler::Impl {
         result.frame.stats = job->stats;
         emit(job, std::move(result));
         unregister(job);
+        for (auto *queue : {&planning, &preparing, &pending})
+            queue->erase(std::remove(queue->begin(), queue->end(), job), queue->end());
+        retire(job);
     }
     void publish(const std::shared_ptr<Job> &job, GenerationFrame frame) {
         if (job->cancelled || job->done)
@@ -312,7 +354,7 @@ struct RequestScheduler::Impl {
         Result result;
         for (const auto &chunk : frame.chunks)
             result.bytes += chunk.second.size() * sizeof(int16_t);
-        if (result.bytes > job->buffer_limit - job->buffered) {
+        if (!job->reader && result.bytes > job->buffer_limit - job->buffered) {
             finish(job, std::make_exception_ptr(
                             std::runtime_error("audio consumer exceeded its buffer limit")));
             return;
@@ -368,9 +410,86 @@ struct RequestScheduler::Impl {
         }
         return next;
     }
-    void dispatch() {
-        if (busy || stopping || executor_error)
+    void continue_planning(const std::shared_ptr<Job> &job) {
+        job->task = job->preparation->next();
+        if (job->task) {
+            preparing.push_back(job);
+        } else {
+            job->plan = job->preparation->finish();
+            job->preparation.reset();
+            pending.push_back(job);
+        }
+    }
+    void plan_ready() {
+        // Yield to queue events after each CPU plan, keeping the executor fed
+        // while other requests wait for GPU conditioning.
+        if (!prepared_results.empty()) {
+            auto result = std::move(prepared_results.front());
+            prepared_results.pop_front();
+            planned(std::move(result));
             return;
+        }
+        if (!planning.empty()) {
+            Range trace("tts.engine.plan");
+            auto job = planning.front();
+            planning.pop_front();
+            if (job->aborted()) { retire(job); return; }
+            try {
+                job->preparation = planner.begin(job->requests, job->options);
+                continue_planning(job);
+            } catch (...) {
+                finish(job, std::current_exception());
+                retire(job);
+            }
+        }
+    }
+    void planned(Command command) {
+        Range trace("tts.engine.prepare_complete");
+        auto found = inflight_preparations.find(command.owner);
+        if (found != inflight_preparations.end()) {
+            auto job = std::move(found->second);
+            inflight_preparations.erase(found);
+            if (job->aborted()) retire(job);
+            else try {
+                if (command.preparation_error)
+                    std::rethrow_exception(command.preparation_error);
+                job->preparation->accept(std::move(command.preparation));
+                continue_planning(job);
+            } catch (...) {
+                finish(job, std::current_exception());
+                retire(job);
+            }
+        }
+        preparation_busy = !inflight_preparations.empty();
+    }
+    bool dispatch_preparation() {
+        std::vector<PreparedTask> tasks;
+        std::vector<uint64_t> owners;
+        const size_t available_rows = size_t(capacity) - active.size();
+        while (!preparing.empty() && tasks.size() < available_rows) {
+            auto job = preparing.front();
+            preparing.pop_front();
+            if (job->aborted()) { retire(job); continue; }
+            tasks.push_back({std::move(job->task), {}});
+            owners.push_back(job->execution_id);
+            inflight_preparations.emplace(job->execution_id, job);
+        }
+        if (tasks.empty()) return false;
+        preparation_busy = true;
+        executor.prepare_tasks(std::move(tasks), [this, owners = std::move(owners)](size_t index, PreparedTask result) {
+            Command command;
+            command.kind = Command::Kind::Planned;
+            command.owner = owners[index];
+            command.preparation = std::move(result.task);
+            command.preparation_error = result.error;
+            send(incoming, std::move(command));
+        });
+        return true;
+    }
+    void dispatch() {
+        if (busy || inflight_batches == pipeline_depth || stopping || executor_error)
+            return;
+        Range trace("tts.engine.dispatch");
         for (auto it = pending.begin(); it != pending.end();) {
             if (!(*it)->aborted()) {
                 ++it;
@@ -393,62 +512,86 @@ struct RequestScheduler::Impl {
             retire(job);
         }
         if (!controls.empty()) {
+            if (inflight_batches || preparation_busy)
+                return;
             auto control = std::move(controls.front());
             controls.pop_front();
             busy = true;
-            executor.control([this, control = std::move(control)](std::exception_ptr error) {
-                control(error);
-                send(incoming, Command{Command::Kind::Run, [this] {
-                                           busy = false;
-                                           --control_count;
-                                       }});
-            });
+            executor.control(std::move(control));
             return;
         }
-        // Keep decode rows resident and pack all ready inputs into free slots.
-        // A prefill batch retains its layer checkpoint until it completes.
-        bool prefilling = std::any_of(active.begin(), active.end(),
-                                      [](const Active &row) { return !row.prefilled; });
-        while (!prefilling && active.size() < size_t(capacity) && !pending.empty()) {
-            auto job = pending.front();
-            pending.pop_front();
-            active.push_back({{++lane_sequence, job->execution_id, job->next_lane++}, job, {}});
-            if (job->next_lane < job->requests.size())
+        // Existing prefill checkpoints retain their rows; newly ready inputs
+        // can occupy free slots without waiting for those checkpoints to finish.
+        while (active.size() < size_t(capacity) && !pending.empty()) {
+            auto ready = std::find_if(pending.begin(), pending.end(), [&](const auto &job) {
+                return job->retry_epoch < resource_epoch;
+            });
+            if (ready == pending.end()) break;
+            auto job = *ready;
+            pending.erase(ready);
+            size_t input;
+            if (!job->waiting_inputs.empty()) {
+                input = job->waiting_inputs.front();
+                job->waiting_inputs.pop_front();
+            } else input = job->next_lane++;
+            active.push_back({{++lane_sequence, job->execution_id, input}, job, {}});
+            if (job->next_lane < job->requests.size() || !job->waiting_inputs.empty())
                 pending.push_back(job);
         }
+        bool new_prefill = std::any_of(active.begin(), active.end(),
+                                       [](const Active &row) { return !row.prefilled; });
+        if (!new_prefill && !preparation_busy)
+            dispatch_preparation();
         if (active.empty() && releases.empty() && request_releases.empty())
             return;
         ExecutionBatch batch;
         batch.release.swap(releases);
         batch.release_requests.swap(request_releases);
-        for (const auto &entry : active) {
+        for (auto &entry : active) {
             if (entry.job->plan)
                 batch.requests.push_back({entry.job->execution_id, std::move(entry.job->plan)});
             batch.rows.push_back(entry.row);
-            if (!entry.prefilled)
-                batch.prefill.push_back(entry.row.id);
+            entry.row.create = false;
         }
         // Prefill runs first; newly ready rows join this iteration's decode.
         // Reserve the previous decode duration from the audio frame period.
         // An overloaded engine still advances one layer to avoid starvation.
         batch.prefill_budget_ms = std::max(0., frame_period_ms - last_decode_ms);
-        busy = true;
+        batch.output = std::move(output_pool.back());
+        output_pool.pop_back();
+        ++inflight_batches;
         executor.submit(std::move(batch));
     }
-    void complete(Completion result) {
-        busy = false;
+    void complete(Completion &result) {
+        Range trace("tts.engine.complete");
+        bool released = result.resources_released;
+        if (result.executed) {
+            if (!inflight_batches)
+                throw std::logic_error("unexpected execution completion");
+            --inflight_batches;
+        }
         if (result.decoded_rows)
             last_decode_ms = result.decode_ms;
         if (stopping)
             return;
         if (result.fatal) {
             executor_error = result.fatal;
+            std::vector<std::shared_ptr<Job>> interrupted;
+            for (auto &row : active)
+                interrupted.push_back(row.job);
+            for (auto *queue : {&pending, &planning, &preparing})
+                interrupted.insert(interrupted.end(), queue->begin(), queue->end());
             active.clear();
             pending.clear();
             planning.clear();
+            preparing.clear();
             releases.clear();
             for (auto it = jobs.begin(); it != jobs.end();) {
                 auto job = (it++)->second;
+                finish(job, result.fatal);
+                retire(job);
+            }
+            for (const auto &job : interrupted) {
                 finish(job, result.fatal);
                 retire(job);
             }
@@ -459,12 +602,23 @@ struct RequestScheduler::Impl {
         }
         std::map<Job *, GenerationFrame> output;
         std::vector<std::shared_ptr<Job>> updated;
-        for (auto &out : result.rows) {
+        for (size_t i = 0; i < result.valid_rows; ++i) {
+            auto &out = result.rows[i];
             auto found = std::find_if(active.begin(), active.end(),
                                       [&](const Active &a) { return a.row.id == out.id; });
+            // Cancellation can retire a row while its queued execution drains.
             if (found == active.end())
-                throw std::logic_error("unknown completed lane");
+                continue;
             auto job = found->job;
+            if (out.deferred) {
+                job->waiting_inputs.push_back(found->row.input);
+                job->retry_epoch = resource_epoch;
+                active.erase(found);
+                if (std::find(pending.begin(), pending.end(), job) == pending.end())
+                    pending.push_back(job);
+                continue;
+            }
+            released |= out.done || (!found->prefilled && out.prefilled);
             if (std::find(updated.begin(), updated.end(), job) == updated.end())
                 updated.push_back(job);
             auto &frame = output[job.get()];
@@ -478,7 +632,7 @@ struct RequestScheduler::Impl {
             found->previous = out.stats;
             found->prefilled = out.prefilled;
             if (!out.pcm.empty())
-                frame.chunks.emplace_back(int(found->row.input), std::move(out.pcm));
+                frame.chunks.emplace_back(int(found->row.input), out.pcm);
             if (out.done) {
                 ++job->completed;
                 active.erase(found);
@@ -488,6 +642,7 @@ struct RequestScheduler::Impl {
             publish(job, std::move(output[job.get()]));
             retire(job);
         }
+        if (released) ++resource_epoch;
     }
     void execute(Command command) {
         switch (command.kind) {
@@ -507,14 +662,21 @@ struct RequestScheduler::Impl {
         case Command::Kind::Shutdown:
             stop_work();
             break;
+        case Command::Kind::Prepared:
+            command.prepared(std::move(command.preparation), command.preparation_error);
+            break;
+        case Command::Kind::Planned:
+            if (!stopping)
+                prepared_results.push_back(std::move(command));
+            break;
         }
     }
     void schedule() {
         log::Scope scope(engine_id);
-        for (;;) {
+        while (!stopping) {
             auto deadline = expire_reads();
             Command command;
-            if (!planning.empty()) {
+            if (!planning.empty() || !prepared_results.empty()) {
                 incoming.try_dequeue(command);
             } else if (deadline == Clock::time_point::max()) {
                 incoming.wait_dequeue(command);
@@ -526,30 +688,62 @@ struct RequestScheduler::Impl {
             }
             expire_reads();
             execute(std::move(command));
+            service_commands();
             if (stopping)
                 break;
             dispatch();
-            if (planning.empty())
-                continue;
-            auto job = planning.front();
-            planning.pop_front();
-            if (job->cancelled) {
-                retire(job);
-                continue;
-            }
-            try {
-                job->plan = planner.prepare(job->requests, job->options);
-                pending.push_back(job);
-            } catch (...) {
-                finish(job, std::current_exception());
-                retire(job);
-            }
+            plan_ready();
             dispatch();
         }
         // The owner has stopped ingress; reject any remaining queued queries.
         Command discarded;
         while (incoming.try_dequeue(discarded))
             execute(std::move(discarded));
+    }
+    void service_commands() {
+        Command command;
+        // A bounded drain also makes progress under continuous client queries.
+        for (size_t i = 0, limit = request_limit + active.size() + control_count + 1;
+             i < limit && !stopping && incoming.try_dequeue(command); ++i)
+            execute(std::move(command));
+    }
+    std::unique_ptr<PreparationTask> prepare_task(std::unique_ptr<PreparationTask> task) {
+        bool done = false;
+        std::unique_ptr<PreparationTask> result;
+        std::exception_ptr error;
+        executor.prepare_task(std::move(task), [this, &done, &result, &error](auto returned,
+                                                                           auto failure) {
+            Command command;
+            command.kind = Command::Kind::Prepared;
+            command.preparation = std::move(returned);
+            command.preparation_error = failure;
+            command.prepared = [&done, &result, &error](auto value, auto exception) {
+                result = std::move(value);
+                error = exception;
+                done = true;
+            };
+            send(incoming, std::move(command));
+        });
+        // Continue the CPU actor's event loop while the executor owns the task.
+        // The reply itself is a queue event; no polling or shared completion flag.
+        while (!done) {
+            Command command;
+            if (planning.empty() && prepared_results.empty())
+                incoming.wait_dequeue(command);
+            else
+                incoming.try_dequeue(command);
+            execute(std::move(command));
+            if (!stopping) {
+                service_commands();
+                expire_reads();
+                dispatch();
+                plan_ready();
+                dispatch();
+            }
+        }
+        if (error)
+            std::rethrow_exception(error);
+        return result;
     }
 };
 GenerationFrame RequestScheduler::read(const std::string &request_id, int timeout_ms) {
@@ -574,25 +768,41 @@ void RequestScheduler::cancel(const std::string &request_id) {
         throw;
     }
 }
-void RequestScheduler::run_sync(std::function<void()> operation) {
+void RequestScheduler::run_sync(
+    std::function<void()> operation,
+    std::function<void(const PreparationExecutor &)> prepare) {
     Reply<void> reply;
-    impl_->post([&, operation = std::move(operation)]() mutable {
+    impl_->post([&, operation = std::move(operation), prepare = std::move(prepare)]() mutable {
+        bool admitted = false;
         try {
             impl_->check_running();
             if (impl_->control_count >= impl_->request_limit)
                 throw RequestOverloaded("control queue is full");
+            ++impl_->control_count;
+            admitted = true;
+            if (prepare)
+                prepare([&](auto task) { return impl_->prepare_task(std::move(task)); });
+            impl_->check_running();
             auto id = ++impl_->sequence;
             impl_->controls.push_back(
                 [&, id, operation = std::move(operation)](std::exception_ptr error) {
-                    reply.run([&] {
-                        if (error)
-                            std::rethrow_exception(error);
+                    if (!error) try {
                         log::Scope scope(impl_->engine_id, id);
                         operation();
+                    } catch (...) {
+                        error = std::current_exception();
+                    }
+                    // Release actor-owned capacity before publishing the reply.
+                    // Queued controls rejected by shutdown use this same path.
+                    impl_->post([&, error = std::move(error)] {
+                        impl_->busy = false;
+                        --impl_->control_count;
+                        if (error) reply.fail(error);
+                        else reply.run([] {});
                     });
                 });
-            ++impl_->control_count;
         } catch (...) {
+            if (admitted) --impl_->control_count;
             reply.fail(std::current_exception());
         }
     });

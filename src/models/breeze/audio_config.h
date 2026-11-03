@@ -1,7 +1,7 @@
 #pragma once
 #include "models/breeze/transformer_config.h"
 
-namespace tts {
+namespace tts::breeze {
 struct EncoderConfig {
     TransformerConfig transformer;
     std::vector<int> ratios;
@@ -15,4 +15,4 @@ struct CodecConfig {
     int latent_dim, codebook_dim, decoder_dim, samples_per_frame;
     int codebooks, semantic_codebooks, codebook_size;
 };
-} // namespace tts
+} // namespace tts::breeze

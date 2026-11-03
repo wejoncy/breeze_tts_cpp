@@ -3,11 +3,11 @@
 #include "core/quantization.h"
 #include <vector>
 
-namespace tts {
+namespace tts::breeze {
 struct TransformerConfig {
     int hidden, layers, heads, kvheads, dim, intermediate;
     float eps, theta;
-    bool gemma = false, causal = true, qknorm = false;
+    bool gemma = false, causal = true, qknorm = false, layer_scale = false;
     int window = 0, rope_type = 0;
     float factor = 1;
     Type type = Type::BF16;
@@ -17,4 +17,4 @@ struct TransformerConfig {
     std::vector<bool> full_attention;
     Quantization quantization = Quantization::None;
 };
-} // namespace tts
+} // namespace tts::breeze

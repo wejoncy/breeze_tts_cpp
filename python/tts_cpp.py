@@ -80,6 +80,12 @@ class Engine:
         return dict(self._format)
 
     @property
+    def model_info(self):
+        info = dict(self._module.model_info(self._native_handle()))
+        info["checkpoint_files"] = list(info["checkpoint_files"])
+        return info
+
+    @property
     def version(self):
         return self._module.version()
 
@@ -112,15 +118,17 @@ class Engine:
         self.close()
 
     def default_options(self):
-        return self._module.default_options()
+        return self._module.default_options(self._native_handle())
 
     def memory_stats(self):
         """Pool bytes between requests; excludes CUDA driver/library memory."""
         return dict(self._module.memory_stats(self._native_handle()))
 
-    def prepare_reference(self, audio, transcript, *, sample_rate=None, channels=1):
+    def prepare_reference(self, audio, transcript, *, sample_rate=None, channels=1, language=""):
         """File/encoded bytes, or interleaved float PCM with sample_rate specified."""
         check_not_in_callback()
+        if not isinstance(language, str) or "\0" in language or len(language) > 32:
+            raise ValueError("invalid reference language")
         if (
             not isinstance(transcript, str)
             or not transcript.strip()
@@ -141,11 +149,13 @@ class Engine:
                 raise ValueError("PCM must contain complete interleaved frames")
             data = array("f", audio).tobytes()
         handle = self._module.prepare_reference(
-            self._native_handle(), data, transcript, sample_rate or 0, channels
+            self._native_handle(), data, transcript, sample_rate or 0, channels, language
         )
         return Reference(self._module, handle)
 
     def reference_from_codes(self, codes, transcript):
+        if self._format["codebooks"] <= 0:
+            raise ValueError("loaded model does not expose discrete audio codes")
         if (
             not isinstance(transcript, str)
             or not transcript.strip()
@@ -201,6 +211,9 @@ class Engine:
                     instruction=request.get("instruction", ""),
                     speaker=request.get("speaker", "S0") or "",
                     reference=handle,
+                    language=request.get("language", ""),
+                    text_split_method=request.get("text_split_method", ""),
+                    fragment_interval=request.get("fragment_interval", 0.0),
                 )
             )
         return native, options
@@ -226,7 +239,7 @@ class Engine:
         self._module.add_request(handle, request_id, native, options)
 
     def read_result(self, request_id, timeout=None):
-        """Read by ID; terminal output/errors consume it. Duplicate errors preserve it."""
+        """Read by ID; terminal output/errors consume it."""
         check_not_in_callback()
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must be nonnegative or None")
@@ -274,7 +287,8 @@ class Engine:
             self.cancel_request(request_id)
         return stats if deliver else ([bytes(b) for b in buffers], stats)
 
-    def warmup(self, batch=1, **options):
+    def warmup(self, batch=1, *, text="你好。", reference=None, **options):
         return self.generate(
-            [{"text": "你好。"} for _ in range(batch)], dict(max_frames=2, **options)
+            [{"text": text, "reference": reference} for _ in range(batch)],
+            dict(max_frames=2, **options),
         )[1]

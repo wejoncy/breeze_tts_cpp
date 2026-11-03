@@ -1,17 +1,20 @@
 #pragma once
-#include "models/breeze/weights.h"
+#include "layers/weights.h"
 #include "models/breeze/audio_config.h"
-namespace tts {
+namespace tts::breeze {
 struct EncoderConv {
     TensorView weight, bias;
     int in, out, kernel, stride, dilation;
     bool replicate;
     EncoderConv(Weights &, const std::string &, int stride = 1, bool replicate = false,
                 int dilation = 1);
+    EncoderConv(Weights &, const std::string &, TensorView bias, int stride = 1,
+                bool replicate = false, int dilation = 1);
     int rows(int input) const {
         return input / stride + (input % stride != 0);
     }
-    void run(Backend &, TensorView x, TensorView projected, TensorView out, bool elu = false,
+    void project(TensorView x, TensorView projected, int max_input_rows = 0) const;
+    void run(TensorView x, TensorView projected, TensorView out, bool elu = false,
              TensorView residual = {}) const;
 };
 class AudioEncoder {
@@ -41,6 +44,7 @@ class AudioEncoder {
   public:
     AudioEncoder(Weights &, EncoderConfig);
     size_t workspace_bytes(int max_samples) const;
-    std::vector<int> encode(Backend &, BufferAllocator &, const std::vector<float> &mono) const;
+    std::unique_ptr<DeviceArena> prepare(Backend &, int max_samples) const;
+    std::vector<int> encode(BufferAllocator &, const std::vector<float> &mono) const;
 };
-} // namespace tts
+} // namespace tts::breeze

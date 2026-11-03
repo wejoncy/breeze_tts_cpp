@@ -5,9 +5,9 @@
 #include <stdexcept>
 
 namespace tts {
-enum class Type { BF16, F32, I32, FP8, I8 };
+enum class Type { BF16, F32, I32, FP8, I8, F16 };
 inline size_t bytes(Type t) {
-    return (t == Type::FP8 || t == Type::I8) ? 1 : t == Type::BF16 ? 2 : 4;
+    return (t == Type::FP8 || t == Type::I8) ? 1 : (t == Type::BF16 || t == Type::F16) ? 2 : 4;
 }
 // Operators flatten batch/time into rows. Only the innermost axis must be dense.
 // This metadata layer has no CUDA, allocator, model, or ABI dependencies.
@@ -26,9 +26,10 @@ struct TensorView : TensorShape {
     void *data = nullptr;
     Type type = Type::BF16;
     int stride = 0; // row stride in elements; zero means dense
+    int device = -1; // CUDA ordinal; -1 is host or metadata-only storage.
     TensorView() = default;
-    TensorView(void *p, int r, int c, Type t = Type::BF16, int s = 0)
-        : TensorShape(r, c), data(p), type(t), stride(s) {
+    TensorView(void *p, int r, int c, Type t = Type::BF16, int s = 0, int ordinal = -1)
+        : TensorShape(r, c), data(p), type(t), stride(s), device(ordinal) {
         if (s < 0 || (s && s < c) || (numel() && !p))
             throw std::invalid_argument("invalid tensor pointer/stride");
         if (span_elements() > std::numeric_limits<size_t>::max() / bytes(t))
@@ -49,27 +50,33 @@ struct TensorView : TensorShape {
     size_t span_bytes() const {
         return span_elements() * bytes(type);
     }
+    bool overlaps(TensorView other) const {
+        if (!data || !other.data) return false;
+        auto first = reinterpret_cast<uintptr_t>(data);
+        auto second = reinterpret_cast<uintptr_t>(other.data);
+        return first < second + other.span_bytes() && second < first + span_bytes();
+    }
     TensorView slice(int row, int n = 1) const {
         if (row < 0 || n < 0 || row > rows || n > rows - row)
             throw std::out_of_range("tensor row slice");
-        return {offset(size_t(row) * ld()), n, cols, type, stride};
+        return {offset(size_t(row) * ld()), n, cols, type, stride, device};
     }
     TensorView columns(int first, int count) const {
         if (first < 0 || count < 0 || first > cols || count > cols - first)
             throw std::out_of_range("tensor column slice");
-        return {offset(first), rows, count, type, ld()};
+        return {offset(first), rows, count, type, ld(), device};
     }
     TensorView every_rows(int first, int step, int count) const {
         if (first < 0 || step < 1 || count < 0 || first > rows ||
             (count && (first >= rows || size_t(count - 1) * step >= size_t(rows - first))) ||
             size_t(ld()) * step > size_t(INT32_MAX))
             throw std::out_of_range("strided tensor rows");
-        return {offset(size_t(first) * ld()), count, cols, type, ld() * step};
+        return {offset(size_t(first) * ld()), count, cols, type, ld() * step, device};
     }
     TensorView reshape(TensorShape s) const {
         if (!dense() || s.numel() != numel())
             throw std::invalid_argument("reshape requires dense storage and equal element count");
-        return {data, s.rows, s.cols, type};
+        return {data, s.rows, s.cols, type, 0, device};
     }
     template <typename T> T *ptr() const {
         return static_cast<T *>(data);

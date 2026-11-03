@@ -64,9 +64,9 @@ function(tts_fetch_dependencies)
   add_library(tts_cutlass INTERFACE)
   target_include_directories(tts_cutlass SYSTEM INTERFACE "${cutlass_SOURCE_DIR}/include")
   include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/FlashAttention.cmake")
+  include(GNUInstallDirs)
   include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Audio.cmake")
 
-  include(GNUInstallDirs)
   install(FILES "${json_SOURCE_DIR}/LICENSE.MIT"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/json")
   install(FILES "${cutlass_SOURCE_DIR}/LICENSE.txt"
@@ -77,5 +77,7 @@ function(tts_fetch_dependencies)
     install(FILES "${${name}_SOURCE_DIR}/LICENSE"
       DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/${name}")
   endforeach()
+  install(FILES "${PROJECT_SOURCE_DIR}/licenses/linguistics.txt"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tts.cpp/linguistics")
 endfunction()
 tts_fetch_dependencies()

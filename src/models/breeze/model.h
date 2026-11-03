@@ -3,8 +3,18 @@
 #include "models/breeze/audio_encoder.h"
 #include "models/breeze/model_config.h"
 #include "io/tokenizer.h"
+#include "execution/model_runtime.h"
+#include "ops/sampling.h"
 
-namespace tts {
+namespace tts::breeze {
+struct GenerationState;
+struct DecodeBatch {
+    int lanes;
+    const SamplingRow *sampling;
+    const int *const *codes;
+    const int *row_request;
+    const CacheSequence *cache;
+};
 // Construct once; runners borrow a const Model and own all mutable request state.
 struct Model {
     ModelConfig config;
@@ -17,6 +27,10 @@ struct Model {
     Tensor depth_embedding_storage;
     TensorView depth_embedding;
     std::vector<TensorView> depth_heads;
-    Model(Backend &, const std::string &directory, ModelConfig);
+    Model(Backend &, const ModelLoader &, ModelConfig);
+    void depth_frame(GenerationState &, int batch, const DecodeBatch &,
+                     bool debug = false) const;
+    void next_frame(GenerationState &, int batch, const DecodeBatch &) const;
 };
-} // namespace tts
+std::unique_ptr<ModelRuntime> load_model(const ModelLoader &, const ModelOptions &);
+} // namespace tts::breeze

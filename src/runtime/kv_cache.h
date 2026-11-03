@@ -62,6 +62,13 @@ class PagedKVCache {
     size_t storage_capacity_bytes() const {
         return size_t(capacity()) * page_bytes_ * 2;
     }
+    size_t runtime_storage_bytes() const {
+        size_t size = 0;
+        for (const auto &chunk : chunks_)
+            if (memory_.owns_runtime(chunk.data()))
+                size += BufferAllocator::aligned(chunk.size());
+        return size;
+    }
     size_t max_storage_bytes() const {
         return size_t(max_lanes_) * max_blocks_ * page_bytes_ * 2;
     }
@@ -92,18 +99,20 @@ class PagedKVCache {
             values_.push_back(base + (size_t(i) * 2 + 1) * page_bytes_);
             free_.push_back(old + i);
         }
-        CUDA(cudaMemcpyAsync(key_table_.ptr<void *>() + old, keys_.data() + old,
-                             added * sizeof(void *), cudaMemcpyHostToDevice, memory_.stream));
-        CUDA(cudaMemcpyAsync(value_table_.ptr<void *>() + old, values_.data() + old,
-                             added * sizeof(void *), cudaMemcpyHostToDevice, memory_.stream));
-        CUDA(cudaStreamSynchronize(memory_.stream));
+        memory_.upload(key_table_.ptr<void *>() + old, keys_.data() + old,
+                       added * sizeof(void *));
+        memory_.upload(value_table_.ptr<void *>() + old, values_.data() + old,
+                       added * sizeof(void *));
+        // The host tables reserve their full capacity at construction. Appended
+        // entries remain immutable and live until the pool is destroyed.
     }
     KVCacheView view(const int *table = nullptr) const {
         CacheLayout layout{table, max_blocks_, page_size_};
         layout.key_pages = key_table_.ptr<void *>();
         layout.value_pages = value_table_.ptr<void *>();
         layout.page_layer_bytes = layer_bytes_;
-        return {{nullptr, 0, width_, type_}, {nullptr, 0, width_, type_}, 0, layout};
+        return {{nullptr, 0, width_, type_, 0, memory_.device},
+                {nullptr, 0, width_, type_, 0, memory_.device}, 0, layout};
     }
     // Request-wide credits cover any simultaneously active subset of its inputs.
     // Credits do not own an execution context or a private page pool.
@@ -214,9 +223,11 @@ class PagedKVCache {
                 }
                 counts_[lane] = std::max(counts_[lane], needed);
             }
-            CUDA(cudaMemcpyAsync(table_, mapping_.data(), mapping_.size() * sizeof(int),
-                                 cudaMemcpyHostToDevice, pool_.memory_.stream));
-            CUDA(cudaStreamSynchronize(pool_.memory_.stream));
+            pool_.memory_.upload(table_, mapping_.data(), mapping_.size() * sizeof(int));
+            // Runtime uploads own a pinned snapshot; page IDs and table storage
+            // are reused in stream order without a host completion barrier.
+            if (!pool_.memory_.has_transfer_backing())
+                pool_.memory_.sync();
         }
 
       private:

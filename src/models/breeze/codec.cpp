@@ -1,20 +1,24 @@
-#include "kernels/audio/audio_kernels.h"
+#include "ops/audio.h"
 #include "models/breeze/codec.h"
 #include <algorithm>
 #include <iterator>
 
-namespace tts {
+namespace tts::breeze {
 Conv::Conv(Weights &weights, const std::string &name, int d, int s, bool trans, bool dw)
     : dilation(d), stride(s), transpose(trans), depthwise(dw) {
     const auto &e = weights.entry(name + ".weight");
-    if (e.type != Type::F32 || e.shape.size() != 3)
+    if (e.type != Type::F32 || e.shape.size() != 3 || e.shape[0] < 1 || e.shape[1] < 1 ||
+        e.shape[2] < 1 || d < 1 || s < 1 || (dw && (trans || e.shape[1] != 1)) ||
+        (trans && e.shape[2] < s))
         throw std::runtime_error("codec convolution requires F32");
     kernel = e.shape[2];
     in = trans ? e.shape[0] : e.shape[1];
     out = trans ? e.shape[1] : e.shape[0];
     if (dw)
         in = out;
-    bias = weights.optional(name + ".bias");
+    bias = weights.get(name + ".bias");
+    if (bias.type != Type::F32 || bias.numel() != size_t(out))
+        throw std::invalid_argument("codec convolution bias mismatch: " + name);
     if (dw) {
         weight = weights.get(name + ".weight");
         return;
@@ -32,8 +36,9 @@ Conv::Conv(Weights &weights, const std::string &name, int d, int s, bool trans, 
             }
     weight = weights.custom(name + ".tap_major", reordered.data(), kernel * out, in, Type::F32);
 }
-void ConvState::run(Backend &gpu, const Conv &c, TensorView x, TensorView y, const int *frame,
+void ConvState::run(const Conv &c, TensorView x, TensorView y, const int *frame,
                     int rows, const ConvHistory *states) {
+    auto &gpu = backend_for(x);
     int batch = rows ? rows : this->batch;
     if (c.depthwise) {
         auto h = states ? TensorView{} : history.view(batch * c.history(), c.in, Type::F32);
@@ -137,32 +142,55 @@ Codec::Codec(Weights &w, CodecConfig cfg)
     }
     op(CodecOp::Snake, "decoder." + std::to_string(config.upsample_rates.size() + 1));
     cv("decoder." + std::to_string(config.upsample_rates.size() + 2));
+    int channels = config.latent_dim, saved[2]{};
+    for (const auto &o : ops_) {
+        if ((o.w.data && o.w.type != Type::F32) || (o.b.data && o.b.type != Type::F32))
+            throw std::invalid_argument("codec operator requires F32 parameters");
+        if (o.kind == CodecOp::Convolution) {
+            if (o.conv->in != channels)
+                throw std::invalid_argument("codec convolution chain shape");
+            channels = o.conv->out;
+        } else if (o.kind == CodecOp::Linear) {
+            if (o.w.cols != channels || o.b.numel() != size_t(o.w.rows))
+                throw std::invalid_argument("codec linear weight/bias shape");
+            channels = o.w.rows;
+        } else {
+            if ((o.w.data && o.w.numel() != size_t(channels)) ||
+                (o.b.data && o.b.numel() != size_t(channels)))
+                throw std::invalid_argument("codec channel parameter shape");
+            if (o.kind == CodecOp::Save) saved[o.save] = channels;
+            if (o.kind == CodecOp::Add || o.kind == CodecOp::ScaleAdd) {
+                if (saved[o.save] != channels)
+                    throw std::invalid_argument("codec residual channel shape");
+                saved[o.save] = 0;
+            }
+        }
+    }
+    for (auto value : {first_proj_, rest_proj_, input_w_, input_b_, output_w_, output_b_})
+        if (value.type != Type::F32)
+            throw std::invalid_argument("codec projection requires F32 parameters");
     if (pre_conv_.in != config.codebook_dim || pre_conv_.out != config.latent_dim ||
         first_proj_.rows != config.codebook_dim || rest_proj_.rows != config.codebook_dim ||
         first_proj_.cols != first_embedding_.cols || rest_proj_.cols != rest_embedding_.cols ||
         input_w_.rows != config.transformer.hidden || input_w_.cols != config.latent_dim ||
-        output_w_.rows != config.latent_dim || output_w_.cols != config.transformer.hidden)
+        input_b_.numel() != size_t(config.transformer.hidden) ||
+        output_w_.rows != config.latent_dim || output_w_.cols != config.transformer.hidden ||
+        output_b_.numel() != size_t(config.latent_dim) || channels != 1)
         throw std::invalid_argument("codec projection weight/configuration mismatch");
 }
-CodecHistory::CodecHistory(const Codec &c, BufferAllocator *storage)
-    : keys(size_t(c.transformer.config.layers) * c.transformer.config.window *
-               c.transformer.config.kvheads * c.transformer.config.dim *
-               bytes(c.transformer.config.type),
-           storage),
-      values(keys.size(), storage), position(sizeof(int), storage) {
-    conv.emplace_back(c.pre_conv_.history_bytes(1, 1), storage);
+SequenceStateSpec Codec::history_spec() const {
+    SequenceStateSpec spec;
+    spec.kv_bytes = size_t(transformer.config.layers) * transformer.config.window *
+                    transformer.config.kvheads * transformer.config.dim * bytes(transformer.config.type);
+    spec.history_bytes.push_back(pre_conv_.history_bytes(1, 1));
     int time = 1;
-    for (const auto &op : c.ops_)
+    for (const auto &op : ops_)
         if (op.kind == CodecOp::Convolution) {
-            conv.emplace_back(op.conv->history_bytes(1, time), storage);
+            spec.history_bytes.push_back(op.conv->history_bytes(1, time));
             if (op.conv->transpose)
                 time *= op.conv->stride;
         }
-}
-void CodecHistory::reset(Backend &gpu) {
-    gpu.zero(position);
-    for (const auto &buffer : conv)
-        gpu.zero(buffer);
+    return spec;
 }
 CodecState::CodecState(const Codec &c, int b, BufferAllocator *arena, bool mapped)
     : transformer(c.transformer.config, b, c.transformer.config.window, b, arena, {}, true,
@@ -177,9 +205,8 @@ CodecState::CodecState(const Codec &c, int b, BufferAllocator *arena, bool mappe
     conv.push_back(std::make_unique<ConvState>(c.pre_conv_, b, 1, arena, !mapped));
     for (const auto &op : c.ops_) {
         if (op.kind == CodecOp::Convolution) {
-            if (op.conv->in != channels ||
-                (op.conv->transpose && time > INT32_MAX / op.conv->stride))
-                throw std::invalid_argument("codec convolution chain shape");
+            if (op.conv->transpose && time > INT32_MAX / op.conv->stride)
+                throw std::invalid_argument("codec convolution time overflow");
             conv.push_back(std::make_unique<ConvState>(*op.conv, b, time, arena, !mapped));
             if (op.conv->transpose)
                 time *= op.conv->stride;
@@ -199,13 +226,15 @@ CodecState::CodecState(const Codec &c, int b, BufferAllocator *arena, bool mappe
     for (auto &save : saves)
         save = Buffer(a.size(), arena);
 }
-void CodecState::reset(Backend &gpu) {
+void CodecState::reset(){
+    auto &gpu = backend_for(position.device());
     gpu.zero(position);
     for (auto &c : conv)
         gpu.zero(c->history);
 }
-TensorView Codec::forward(Backend &gpu, CodecState &s, const int *codes, int batch,
+TensorView Codec::forward(CodecState &s, const int *codes, int batch,
                           const CodecBatch *mapped) const {
+    auto &gpu = backend_for(s.a.device());
     batch = batch ? batch : s.batch;
     auto histories = [&](int op) {
         return mapped ? mapped->histories + op * mapped->stride : nullptr;
@@ -224,11 +253,14 @@ TensorView Codec::forward(Backend &gpu, CodecState &s, const int *codes, int bat
     gpu.add(a, b, a);
     auto latent = s.latent.view(batch, config.latent_dim, Type::F32),
          hidden = s.hidden.view(batch, config.transformer.hidden, Type::F32);
-    s.conv[0]->run(gpu, pre_conv_, a, latent, s.position.ptr<int>(), batch, histories(0));
+    s.conv[0]->run(pre_conv_, a, latent, s.position.ptr<int>(), batch, histories(0));
     gpu.linear(latent, input_w_, hidden);
     gpu.bias(hidden, input_b_);
-    transformer.forward(gpu, s.transformer, hidden, mapped ? nullptr : s.position.ptr<int>(), batch,
-                        1, 0, -1, {}, nullptr, mapped ? mapped->cache : nullptr);
+    ForwardBatch input{batch, 1};
+    input.positions = mapped ? nullptr : s.position.ptr<int>();
+    input.cache = s.transformer.external_kv;
+    input.cache.layout.sequences = mapped ? mapped->cache : nullptr;
+    transformer.forward(s.transformer, hidden, input);
     a = s.a.view(batch, config.latent_dim, Type::F32);
     gpu.linear(hidden, output_w_, a);
     gpu.bias(a, output_b_);
@@ -258,7 +290,7 @@ TensorView Codec::forward(Backend &gpu, CodecState &s, const int *codes, int bat
         TensorView y = buffers[next]->view(batch * newtime, newchannels, Type::F32);
         switch (op.kind) {
         case CodecOp::Convolution:
-            s.conv[ci]->run(gpu, *op.conv, x, y, s.position.ptr<int>(), batch, histories(ci));
+            s.conv[ci]->run(*op.conv, x, y, s.position.ptr<int>(), batch, histories(ci));
             ++ci;
             break;
         case CodecOp::Snake:
@@ -294,4 +326,4 @@ TensorView Codec::forward(Backend &gpu, CodecState &s, const int *codes, int bat
     gpu.increment(s.position.ptr<int>(), batch, 1, mapped ? mapped->cache : nullptr);
     return result;
 }
-} // namespace tts
+} // namespace tts::breeze

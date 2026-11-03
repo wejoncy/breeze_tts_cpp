@@ -13,14 +13,7 @@ struct ExecutionRow {
     uint64_t id;
     uint64_t request;
     size_t input;
-};
-struct ExecutionBatch {
-    std::vector<ExecutionRequest> requests;
-    std::vector<ExecutionRow> rows;
-    std::vector<uint64_t> release;
-    std::vector<uint64_t> release_requests;
-    std::vector<uint64_t> prefill;
-    double prefill_budget_ms = 0;
+    bool create = true;
 };
 struct CompletedRow {
     uint64_t id;
@@ -29,12 +22,28 @@ struct CompletedRow {
     std::exception_ptr error;
     bool done = false;
     bool prefilled = false;
+    bool deferred = false;
 };
 struct Completion {
     std::vector<CompletedRow> rows;
+    size_t valid_rows = 0;
     std::exception_ptr fatal;
     double decode_ms = 0;
     int decoded_rows = 0;
+    bool executed = false;
+    bool resources_released = false;
+};
+struct ExecutionBatch {
+    std::vector<ExecutionRequest> requests;
+    std::vector<ExecutionRow> rows;
+    std::vector<uint64_t> release;
+    std::vector<uint64_t> release_requests;
+    double prefill_budget_ms = 0;
+    Completion output;
+};
+struct PreparedTask {
+    std::unique_ptr<PreparationTask> task;
+    std::exception_ptr error;
 };
 // One execution thread owns the runner, admissions and live GPU request states.
 // The scheduling policy and client output queues are outside this boundary.
@@ -43,10 +52,14 @@ class RequestExecutor {
     std::unique_ptr<Impl> impl_;
 
   public:
-    RequestExecutor(ModelRunner &, uint64_t engine_id, std::function<void(Completion)>);
+    using PreparationCallback = std::function<void(size_t, PreparedTask)>;
+    RequestExecutor(ModelRunner &, int capacity, uint64_t engine_id, std::function<void(Completion)>);
     ~RequestExecutor();
     void start();
     void submit(ExecutionBatch);
+    void prepare_task(std::unique_ptr<PreparationTask>,
+                      std::function<void(std::unique_ptr<PreparationTask>, std::exception_ptr)>);
+    void prepare_tasks(std::vector<PreparedTask>, PreparationCallback);
     void control(std::function<void(std::exception_ptr)>);
     void stop();
 };
