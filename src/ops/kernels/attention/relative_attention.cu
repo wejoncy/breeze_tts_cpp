@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "ops/kernels/attention/relative_attention.h"
 #include "ops/relative_attention.h"
 #include "ops/kernels/common/cuda_math.cuh"
@@ -423,5 +424,28 @@ void cuda_relative_attention(cublasHandle_t blas, cudaStream_t stream, TensorVie
     else
         launch_value(float{});
     CUDA(cudaGetLastError());
+}
+void cuda_kernels::initialize_relative_attention() {
+    auto scalar = [](auto value) {
+        using T = decltype(value);
+        materialize(prepare_relative_qkv<T>);
+        materialize(relative_softmax<T, true>);
+        materialize(relative_softmax<T, false>);
+        materialize(relative_value<T>);
+    };
+    scalar(bf16{});
+    scalar(__half{});
+    scalar(float{});
+    auto flash = [](auto value) {
+        using E = decltype(value);
+        materialize(flash_outside<Flash_fwd_kernel_traits<32, 64, 64, 4, false, false, E>>);
+        materialize(flash_outside<Flash_fwd_kernel_traits<64, 64, 64, 4, false, false, E>>);
+        materialize(flash_outside<Flash_fwd_kernel_traits<96, 64, 64, 4, false, false, E>>);
+        materialize(flash_outside<Flash_fwd_kernel_traits<128, 64, 64, 4, false, false, E>>);
+    };
+    flash(cutlass::bfloat16_t{});
+    flash(cutlass::half_t{});
+    materialize(merge_relative<bf16>);
+    materialize(merge_relative<__half>);
 }
 } // namespace tts

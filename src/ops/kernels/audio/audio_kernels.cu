@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/audio.h"
 #include "ops/kernels/common/cuda_math.cuh"
@@ -205,5 +206,15 @@ void pcm( TensorView x, int16_t *out) {
     else if (x.type == Type::F16) launch(__half{});
     else if (x.type == Type::BF16) launch(bf16{});
     else throw std::invalid_argument("invalid PCM input dtype");
+}
+void cuda_kernels::initialize_audio() {
+    materialize(audio_embed_kernel);
+    materialize(rvq_kernel);
+    materialize(snake_kernel);
+    materialize(conv_accumulate_kernel);
+    materialize(depthwise_kernel);
+    materialize(pcm_kernel<bf16>);
+    materialize(pcm_kernel<__half>);
+    materialize(pcm_kernel<float>);
 }
 } // namespace tts

@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/spectral.h"
 #include "runtime/device.h"
@@ -83,5 +84,16 @@ void spectral_log( TensorView input, TensorView out, float floor,
     else if (out.type == Type::BF16) launch(__nv_bfloat16{});
     else launch(float{});
     CUDA(cudaGetLastError());
+}
+void cuda_kernels::initialize_spectral() {
+    materialize(frame_window);
+    auto outputs = [](auto value) {
+        using T = decltype(value);
+        materialize(magnitude<T>);
+        materialize(logarithm<T>);
+    };
+    outputs(__nv_bfloat16{});
+    outputs(__half{});
+    outputs(float{});
 }
 } // namespace tts

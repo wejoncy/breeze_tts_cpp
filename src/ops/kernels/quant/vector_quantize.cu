@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/vector_quantization.h"
 #include "ops/kernels/common/cuda_math.cuh"
@@ -78,5 +79,10 @@ void vector_quantize( TensorView x, TensorView scores, TensorView table,
     else if (x.type == Type::F16) launch(__half{});
     else launch(float{});
     CUDA(cudaGetLastError());
+}
+void cuda_kernels::initialize_vector_quantization() {
+    materialize(quantize<bf16>);
+    materialize(quantize<__half>);
+    materialize(quantize<float>);
 }
 } // namespace tts

@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/pronunciation.h"
 #include "runtime/device.h"
@@ -105,3 +106,10 @@ void select_pronunciation( TensorView logits, TensorView pos,
     CUDA(cudaGetLastError());
 }
 } // namespace tts::ops
+
+namespace tts {
+void cuda_kernels::initialize_pronunciation() {
+    materialize(ops::selection_kernel<__half>);
+    materialize(ops::selection_kernel<__nv_bfloat16>);
+}
+} // namespace tts

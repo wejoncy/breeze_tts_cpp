@@ -1,3 +1,4 @@
+#include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/basic.h"
 #include "ops/cuda/blas_check.h"
@@ -116,6 +117,11 @@ static bool compiled_pdl_support() {
     return compiled.ptxVersion >= 90;
 }
 void initialize_cuda_kernels(CudaContext &cuda) {
+    cuda_kernels::initialize_pronunciation();
+    cuda_kernels::initialize_vector_quantization();
+    cuda_kernels::initialize_spectral();
+    cuda_kernels::initialize_relative_attention();
+    cuda_kernels::initialize_audio();
     initialize_flash_attention();
     for (auto type : {Type::BF16, Type::F16})
         for (int dimensions : {32, 64, 96, 128}) {
