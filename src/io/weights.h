@@ -62,12 +62,12 @@ class Weights {
         return TensorView::metadata(rows, columns, type);
     }
     void copy_sources(TensorView destination, const std::vector<std::string> &parts) const {
-        size_t offset = 0;
+        int row = 0;
         for (const auto &name : parts) {
             const auto &source = files_.get(name);
-            ops::upload_bytes(device_.index(),
-                static_cast<char *>(destination.data) + offset, source.data, source.size);
-            offset += source.size;
+            const int count = checkpoint_shape(source).rows;
+            ops::upload_bytes(destination.slice(row, count), source.data, source.size);
+            row += count;
         }
     }
 
@@ -170,7 +170,7 @@ class Weights {
         std::vector<char> packed(view.size());
         std::memcpy(packed.data(), data, packed.size());
         uploads_.push_back([this, view, packed = std::move(packed)] {
-            ops::upload_bytes(device_.index(), view.data, packed.data(), packed.size());
+            ops::upload_bytes(view, packed.data(), packed.size());
         });
         return view;
     }

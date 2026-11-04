@@ -175,7 +175,7 @@ TensorView DiT::forward(const Condition &condition, ForwardContext &context,
             if (source.rows != rows || source.cols != 1 || source.type != type ||
                 source.device != -1 || !source.dense())
                 throw std::invalid_argument("invalid DiT conditioning row metadata");
-            ops::upload_bytes(destination.device, destination.data, source.data, source.size());
+            ops::upload_bytes(destination, source.data, source.size());
         }
         return source.numel() ? destination : TensorView{};
     };

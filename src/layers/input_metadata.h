@@ -8,7 +8,7 @@ inline TensorView upload_metadata(ForwardContext &context, const void *source,
                                    TensorShape shape, Type type) {
     auto result = context.tensor(shape, type);
     if (context.mode == ForwardContext::Execute && result.size())
-        ops::upload_bytes(result.device, result.data, source, result.size());
+        ops::upload_bytes(result, source, result.size());
     return result;
 }
 inline SequenceLayout upload_sequence(ForwardContext &context, const SequenceBuilder &builder) {

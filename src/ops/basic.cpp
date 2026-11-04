@@ -58,9 +58,11 @@ void quantized_gated(TensorView input, RowScaledView output, int kind) {
 void matmul(RowScaledView input, RowScaledView weight, TensorView output) {
     execution_context(output).quantization->linear(input, weight, output);
 }
-void upload_bytes(int device, void *destination, const void *source, size_t bytes) {
-    if (device < 0) { if (bytes) std::memcpy(destination, source, bytes); }
-    else execution_context(device).memory.upload(destination, source, bytes);
+void upload_bytes(TensorView destination, const void *source, size_t bytes) {
+    if (!destination.dense() || bytes > destination.size() || (bytes && (!source || !destination.data)))
+        throw std::invalid_argument("upload exceeds dense tensor storage");
+    if (destination.device < 0) { if (bytes) std::memcpy(destination.data, source, bytes); }
+    else execution_context(destination).memory.upload(destination.data, source, bytes);
 }
 void synchronize(int device) { if (device >= 0) execution_context(device).memory.sync(); }
 void download_bytes(TensorView source, void *destination, size_t bytes) {

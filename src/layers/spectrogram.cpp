@@ -30,7 +30,7 @@ Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device
     for (int coefficient_index = 0; coefficient_index < configuration.window; ++coefficient_index)
         window[(configuration.fft - configuration.window) / 2 + coefficient_index] = .5 - .5 * std::cos(2. * std::acos(-1.) * coefficient_index / configuration.window);
     window_ = Tensor({1, configuration.fft}, Type::F32, device);
-    ops::upload_bytes(device.index(), window_.view().data, window.data(), window_.view().size());
+    ops::upload_bytes(window_.view(), window.data(), window_.view().size());
     if (configuration.mel_channels) {
         double low = to_mel(configuration.min_frequency),
                high = to_mel(configuration.max_frequency ? configuration.max_frequency : configuration.sample_rate / 2.);
@@ -52,7 +52,7 @@ Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device
                     weight * (2. / (frequencies[mel_index + 2] - frequencies[mel_index]));
             }
         mel_ = Tensor({configuration.mel_channels, bins}, Type::F32, device);
-        ops::upload_bytes(device.index(), mel_.view().data, coefficients.data(), mel_.view().size());
+        ops::upload_bytes(mel_.view(), coefficients.data(), mel_.view().size());
         ops::synchronize(device.index());
     }
     for (int64_t rows = 1; rows <= max_frames;) {

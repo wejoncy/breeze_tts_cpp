@@ -125,7 +125,7 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
         condition.mel_rows = TensorView(mel_rows.data(), int(mel_rows.size()), 1, Type::I32);
         if (!retained_features.empty())
             condition.retained_feature_rows = TensorView(retained_features.data(), int(retained_features.size()), 1, Type::I64);
-        ops::upload_bytes(prefix_tensor.device, prefix_tensor.data, prefixes.data(), prefixes.size() * sizeof(int));
+        ops::upload_bytes(prefix_tensor, prefixes.data(), prefixes.size() * sizeof(int));
         const auto parameters = sampling(steps, guidance);
         auto conditioned = estimator_.forward(condition, invocation, parameters.guidance > 1.e-5f);
         {

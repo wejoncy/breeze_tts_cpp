@@ -215,7 +215,7 @@ struct ModelRunner::Impl {
         ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
         auto outputs = output_views(description.outputs);
         run_forward(network, description.name, input, {}, {outputs.data(), outputs.size()},
-                    context, &runtime.memory);
+                    context);
         HostResults result;
         for (const auto &field : outputs) {
             auto tensor = Tensor::empty({field.value.rows, field.value.cols}, field.value.type);
@@ -580,7 +580,7 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     auto arguments = implementation.bindings(int(rows.size()), packed.sequence.shape.batch);
     auto outputs = output_views(program.description.outputs);
     run_forward(implementation.network, program.description.name, packed, {arguments.data(), arguments.size()},
-                {outputs.data(), outputs.size()}, context, &implementation.runtime.memory);
+                {outputs.data(), outputs.size()}, context);
     implementation.sampled(rows);
     for (auto *state : rows) {
         state->is_prefilled = true;
@@ -750,8 +750,7 @@ std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
     Tensor::Scope scope(storage);
     ForwardContext context(1, int(mono.size()), int(mono.size()));
     NamedTensor outputs[] = {{"codes", {}}};
-    run_forward(implementation.network, description.name, input, {}, {outputs, std::size(outputs)}, context,
-                &implementation.runtime.memory);
+    run_forward(implementation.network, description.name, input, {}, {outputs, std::size(outputs)}, context);
     std::vector<int> result(outputs[0].value.numel());
     implementation.runtime.memory.download(result.data(), outputs[0].value.data, outputs[0].value.size());
     return result;

@@ -1,10 +1,10 @@
 #include "execution/input_staging.h"
-#include "runtime/device.h"
+#include "ops/storage.h"
+#include <algorithm>
 
 namespace tts {
 void run_forward(const Model &model, std::string_view program, const InputBatch &input,
-                 TensorInputs bindings, TensorOutputs outputs, ForwardContext &context,
-                 DeviceContext *transfers) {
+                 TensorInputs bindings, TensorOutputs outputs, ForwardContext &context) {
     std::vector<std::pair<TensorView, TensorView>> uploaded;
     auto upload = [&](TensorView source) {
         for (const auto &entry : uploaded)
@@ -14,9 +14,9 @@ void run_forward(const Model &model, std::string_view program, const InputBatch 
                 return entry.second;
         auto destination = context.tensor({source.rows, source.cols}, source.type);
         if (context.mode == ForwardContext::Execute && source.numel()) {
-            if (!transfers || source.device != -1 || !source.dense() || !source.data)
+            if (source.device != -1 || !source.dense() || !source.data)
                 throw std::invalid_argument("input upload requires dense host data");
-            transfers->upload(destination.data, source.data, source.size());
+            ops::upload_bytes(destination, source.data, source.size());
         }
         uploaded.emplace_back(source, destination);
         return destination;
