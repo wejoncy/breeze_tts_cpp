@@ -71,7 +71,6 @@ def main():
     parser.add_argument("--language-detector", type=Path, help="Official full FastText lid.176.bin classifier")
     parser.add_argument("--language-splitter", type=Path, help="split_lang package directory")
     parser.add_argument("--language-budoux", type=Path, help="BudouX package directory; enables auto routing with the other two assets")
-    parser.add_argument("--japanese-openjtalk", type=Path, help="Open JTalk UTF-8 rule source directory")
     parser.add_argument("--japanese-dictionary", type=Path, help="UTF-8 Open JTalk dictionary directory")
     parser.add_argument("--japanese-user-dictionary", type=Path, help="Official GPT-SoVITS compiled Japanese user dictionary")
     args = parser.parse_args()
@@ -81,9 +80,9 @@ def main():
     routing = (args.language_splitter, args.language_budoux, args.language_detector)
     if any(routing) and not all(routing):
         parser.error("Automatic routing requires --language-detector, --language-splitter and --language-budoux together")
-    japanese = (args.japanese_openjtalk, args.japanese_dictionary, args.japanese_user_dictionary)
+    japanese = (args.japanese_dictionary, args.japanese_user_dictionary)
     if any(japanese) and not all(japanese):
-        parser.error("Japanese requires --japanese-openjtalk, --japanese-dictionary and --japanese-user-dictionary together")
+        parser.error("Japanese requires --japanese-dictionary and --japanese-user-dictionary together")
     dtype = {"float16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
@@ -92,23 +91,24 @@ def main():
     export_english(args.text_source / "GPT_SoVITS/text", args.english_g2p,
                    args.english_segmenter, args.english_tagger, output)
     languages = {
-        "zh": ["tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.bin",
+        "zh": ["tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.dict.utf8", "jieba.hmm.utf8",
                "pinyin.bin", "polyphone.bin", "linguistics.json"],
         "en": ["english.json", "english.safetensors", "linguistics.json"],
     }
+    mecab_files = ["char.bin", "matrix.bin", "sys.dic", "unk.dic", "dicrc"]
     if args.cantonese_jyutping:
         export_cantonese(args.text_source / "GPT_SoVITS/text", args.cantonese_jyutping, output)
         languages["yue"] = ["cantonese.bin", "pinyin.bin", "linguistics.json"]
     if all(korean):
         export_korean(args.text_source / "GPT_SoVITS/text", *korean, output)
-        languages["ko"] = ["korean.json", "korean_morphology.bin", "linguistics.json"]
+        languages["ko"] = ["korean.json", "linguistics.json"] + ["korean_mecab/" + name for name in mecab_files]
     if all(routing):
         export_router(args.text_source / "GPT_SoVITS/text", *routing, output)
-        languages["auto"] = ["language_detector.json", "language_detector.safetensors",
+        languages["auto"] = ["language_policy.json", "language_detector.bin",
                              "language_splitter.json"]
     if all(japanese):
         export_japanese(args.text_source / "GPT_SoVITS/text", *japanese, output)
-        languages["ja"] = ["japanese.json", "japanese_morphology.bin", "linguistics.json"]
+        languages["ja"] = ["japanese.json", "japanese_user.dic", "linguistics.json"] + ["japanese_mecab/" + name for name in mecab_files]
     sources = {
         "semantic": args.source / "s1v3.ckpt",
         "acoustic": args.source / "gsv-v5-pretrained" / f"s2G{args.variant}.pth",

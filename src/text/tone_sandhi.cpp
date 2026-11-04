@@ -22,12 +22,12 @@ bool reduplicated(std::u32string_view word) { return word.size() == 2 && word.fr
 bool contains(std::u32string_view characters, char32_t cp) { return characters.find(cp) != std::u32string_view::npos; }
 }
 struct ToneSandhi::Impl {
-    const WeightedSegmenter &segmenter;
+    const JiebaSegmenter &segmenter;
     const PypinyinResolver &dictionary;
     std::set<std::u32string, std::less<>> neutral, stressed;
     std::u32string punctuation;
     std::map<std::string, std::u32string> groups;
-    Impl(const std::string &directory, const WeightedSegmenter &s, const PypinyinResolver &d) : segmenter(s), dictionary(d) {
+    Impl(const std::string &directory, const JiebaSegmenter &s, const PypinyinResolver &d) : segmenter(s), dictionary(d) {
         auto data = read_json(directory + "/linguistics.json");
         for (auto item : {std::pair{"neutral_words", &neutral}, std::pair{"not_neutral_words", &stressed}})
             for (const auto &value : data.at(item.first)) item.second->insert(decode(value.get<std::string>()));
@@ -105,7 +105,7 @@ struct ToneSandhi::Impl {
         }
     }
 };
-ToneSandhi::ToneSandhi(const std::string &directory, const WeightedSegmenter &segmenter, const PypinyinResolver &dictionary)
+ToneSandhi::ToneSandhi(const std::string &directory, const JiebaSegmenter &segmenter, const PypinyinResolver &dictionary)
     : impl_(std::make_unique<Impl>(directory, segmenter, dictionary)) {}
 ToneSandhi::~ToneSandhi() = default;
 std::vector<SegToken> ToneSandhi::premerge(std::vector<SegToken> segments) const {

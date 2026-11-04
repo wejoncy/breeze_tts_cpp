@@ -1,5 +1,5 @@
 #include "inputs/token_inputs.h"
-#include "inputs/input_fields.h"
+#include "core/input_fields.h"
 #include "ops/sampling.h"
 #include "core/row_capacity.h"
 #include <cmath>
@@ -155,14 +155,14 @@ std::unique_ptr<ReferencePlan> TokenInputs::prepare_reference(const std::vector<
     result->input.limits = {1, int(mono.size()), int(mono.size())};
     result->input.sequence.shape = {1, int(mono.size()), int(mono.size())};
     TensorView source(const_cast<float *>(mono.data()), int(mono.size()), 1, Type::F32);
-    auto storage = std::make_shared<HostTensor>(source);
+    auto storage = std::make_shared<Tensor>(source);
     result->input.uploads.push_back({"waveform", storage->view()});
     result->input.owners.push_back(std::move(storage));
     result->outputs = {"codes"};
     return result;
 }
 std::shared_ptr<const Reference> TokenInputs::finish_reference(ReferencePlan &plan, HostResults outputs) const {
-    const auto tensor = outputs.at("codes")->view();
+    const auto tensor = outputs.at("codes").view();
     const auto *values = tensor.ptr<int>();
     return std::make_shared<const Reference>(std::move(plan.transcript),
         std::vector<int>(values, values + tensor.numel()), config_.codebooks, config_.codec.codebook_size);

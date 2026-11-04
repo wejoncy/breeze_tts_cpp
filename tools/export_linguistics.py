@@ -8,6 +8,7 @@ import ast
 import json
 from pathlib import Path
 import struct
+import shutil
 
 
 def literal_assignments(path):
@@ -72,63 +73,20 @@ def integers(values):
 
 
 def export_jieba(package, output):
-    import jieba_fast.posseg as pos
+    """Preserve the source dictionary/probabilities in cppjieba's UTF-8 formats."""
     import jieba_fast.finalseg as final
-    freq, word_tags, total = {}, {}, 0
-    for line in (package / "dict.txt").read_text(encoding="utf-8").splitlines():
-        word, frequency, tag = line.split(" ")
-        freq[word], word_tags[word] = int(frequency), tag
-        total += int(frequency)
-        for end in range(1, len(word) + 1):
-            freq.setdefault(word[:end], 0)
-    tags = sorted(set(word_tags.values()) | {tag for _, tag in pos.trans_P})
-    tag_ids = {tag: index for index, tag in enumerate(tags)}
-    states = sorted(pos.trans_P)
-    state_ids = {state: index for index, state in enumerate(states)}
-    codepoints, entries = [], bytearray(struct.pack("<I", len(freq)))
-    for word in sorted(freq):
-        entries += struct.pack("<IHHq", len(codepoints), len(word), tag_ids.get(word_tags.get(word), 65535), freq[word])
-        codepoints.extend(map(ord, word))
-
-    def transitions(order, probabilities, ids):
-        data = bytearray()
-        for state in order:
-            row = sorted((ids[next_state], probability) for next_state, probability in probabilities[state].items())
-            data += struct.pack("<I", len(row))
-            for destination, probability in row:
-                data += struct.pack("<HHd", destination, 0, probability)
-        return data
-
-    def emissions(order, probabilities):
-        data = bytearray()
-        for state in order:
-            row = sorted((ord(character), probability) for character, probability in probabilities[state].items())
-            data += struct.pack("<I", len(row))
-            for character, probability in row:
-                data += struct.pack("<Id", character, probability)
-        return data
-
-    chars, pool = bytearray(struct.pack("<I", len(pos.char_state_tab_P))), []
-    for char, candidates in sorted(pos.char_state_tab_P.items()):
-        chars += struct.pack("<III", ord(char), len(pool), len(candidates))
-        pool.extend(state_ids[state] for state in candidates)
-    chars += struct.pack("<I", len(pool)) + b"".join(struct.pack("<H", state) for state in pool)
-    final_states = "BEMS"
-    final_ids = {state: index for index, state in enumerate(final_states)}
-    sections = [
-        ("dictmeta", struct.pack("<q", total)),
-        ("tags", struct.pack("<I", len(tags)) + b"".join(bytes([len(tag.encode())]) + tag.encode() for tag in tags)),
-        ("cps", integers(codepoints)), ("entries", entries),
-        ("states", struct.pack("<I", len(states)) + b"".join(struct.pack("<BHB", ord(boundary), tag_ids[tag], 0) for boundary, tag in states)),
-        ("hmmstart", b"".join(struct.pack("<d", pos.start_P[state]) for state in states)),
-        ("hmmtrans", transitions(states, pos.trans_P, state_ids)),
-        ("hmmitmap", emissions(states, pos.emit_P)), ("chars", chars),
-        ("fstart", b"".join(struct.pack("<d", final.start_P[state]) for state in final_states)),
-        ("ftrans", transitions(final_states, final.trans_P, final_ids)),
-        ("femit", emissions(final_states, final.emit_P)),
-    ]
-    container(output / "jieba.bin", b"GSVJTB01", sections)
-    return dict(states=final_states, previous=[[final_ids[s] for s in final.PrevStatus[state]] for state in final_states], terminals=[final_ids[s] for s in "ES"])
+    shutil.copyfile(package / "dict.txt", output / "jieba.dict.utf8")
+    states = "BEMS"
+    lines = [" ".join(repr(final.start_P[state]) for state in states)]
+    lines.extend(" ".join(repr(final.trans_P[state].get(next_state, -3.14e100))
+                          for next_state in states) for state in states)
+    for state in states:
+        probabilities = final.emit_P[state]
+        if any(character in ",:\r\n" or character.isspace() for character in probabilities):
+            raise ValueError("HMM emissions contain characters unsupported by cppjieba's format")
+        lines.append(",".join(character + ":" + repr(probabilities[character])
+                              for character in sorted(probabilities)))
+    (output / "jieba.hmm.utf8").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def export_pinyin(package, text, output):
@@ -284,7 +242,7 @@ def export_rules(text):
 def export_linguistics(text, jieba, pinyin, output):
     output = Path(output)
     data = export_rules(Path(text))
-    data["finalseg"] = export_jieba(Path(jieba), output)
+    export_jieba(Path(jieba), output)
     data["pinyin"] = export_pinyin(Path(pinyin), Path(text), output)
     (output / "linguistics.json").write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
@@ -372,55 +330,18 @@ def export_cantonese(text, jyutping, output):
     (output / "linguistics.json").write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
-def export_morphology(dictionary, destination, users=()):
-    """Repackage UTF-8 MeCab dictionaries for the shared native analyzer."""
-    dictionary = Path(dictionary)
-    sections = []
-    dimensions = None
-    inputs = [(dictionary / "sys.dic", "sys", 0), (dictionary / "unk.dic", "unk", 2)]
-    inputs.extend((Path(path), f"u{i}", 1) for i, path in enumerate(users))
-    for path, prefix, kind in inputs:
-        raw = path.read_bytes()
-        if len(raw) < 72:
-            raise ValueError("truncated MeCab dictionary")
-        magic, version, category, count, left, right, da_size, token_size, features, _ = struct.unpack_from("<10I", raw)
-        if version != 102 or category != kind or magic ^ 0xef718f77 != len(raw) or raw[40:72].split(b"\0")[0].lower() != b"utf-8":
-            raise ValueError("unsupported MeCab dictionary format")
-        if 72 + da_size + token_size + features != len(raw) or token_size != count * 16:
-            raise ValueError("inconsistent MeCab dictionary sections")
-        if dimensions is not None and dimensions != (left, right):
-            raise ValueError("incompatible MeCab dictionaries")
-        dimensions = left, right
-        sections.extend(((prefix + "da", raw[72:72 + da_size]),
-                         (prefix + "token", raw[72 + da_size:72 + da_size + token_size]),
-                         (prefix + "feat", raw[72 + da_size + token_size:])))
-    characters = (dictionary / "char.bin").read_bytes()
-    count = struct.unpack_from("<I", characters)[0]
-    names = bytearray(struct.pack("<I", count))
-    for i in range(count):
-        name = characters[4 + 32 * i:4 + 32 * (i + 1)].split(b"\0")[0]
-        names += bytes([len(name)]) + name
-    matrix = (dictionary / "matrix.bin").read_bytes()
-    left, right = struct.unpack_from("<HH", matrix)
-    if dimensions != (left, right) or len(matrix) != 4 + 2 * left * right:
-        raise ValueError("MeCab connection matrix dimensions")
-    config = {}
-    if (dictionary / "dicrc").exists():
-        for line in (dictionary / "dicrc").read_text(encoding="utf-8").splitlines():
-            line = line.split("#")[0].strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                config[key.strip()] = value.strip()
-    penalties = [int(value) for value in config.get("left-space-penalty-factor", "").split(",") if value]
-    if len(penalties) % 2:
-        raise ValueError("unpaired MeCab space penalty")
-    penalty_data = struct.pack("<I", len(penalties) // 2)
-    penalty_data += b"".join(struct.pack("<Hi", pos, cost) for pos, cost in zip(penalties[::2], penalties[1::2]))
-    grouping = int(config.get("max-grouping-size", 24)) or 24
-    sections.extend((("charmap", characters[4 + 32 * count:]), ("names", names),
-                     ("matrix", matrix[4:]), ("penalty", penalty_data),
-                     ("meta", struct.pack("<IIII", left, right, grouping, len(users)))))
-    container(destination, b"GSVMOR02", sections)
+def export_morphology(dictionary, destination):
+    """Keep MeCab's native dictionary files; the library validates their format."""
+    dictionary, destination = Path(dictionary), Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ["char.bin", "matrix.bin", "sys.dic", "unk.dic"]:
+        shutil.copyfile(dictionary / name, destination / name)
+    configuration = (dictionary / "dicrc").read_text(encoding="utf-8") if (dictionary / "dicrc").is_file() else ""
+    # Open JTalk dictionaries can omit dicrc; standalone MeCab requires this
+    # standard boundary feature. Other supplied dictionary settings stay intact.
+    if not any(line.partition("=")[0].strip() == "bos-feature" for line in configuration.splitlines()):
+        configuration += "\nbos-feature = BOS/EOS,*,*,*,*,*,*,*,*\n"
+    (destination / "dicrc").write_text(configuration, encoding="utf-8")
 
 
 if __name__ == "__main__":

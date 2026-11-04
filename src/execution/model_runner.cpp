@@ -4,7 +4,7 @@
 #include "ops/audio.h"
 #include "ops/sampling.h"
 #include "ops/attention.h"
-#include "inputs/input_fields.h"
+#include "core/input_fields.h"
 #include "support/profiler.h"
 #include <array>
 #include <cmath>
@@ -165,25 +165,51 @@ struct ModelRunner::Impl {
                  {"histories", histories.view(1, int(histories.size()), Type::I8)},
                  {"destination", TensorView{}}}};
     }
-    size_t workspace(const ProgramSpec &description, ForwardContext::Mode mode) {
-        return Tensor::plan([&] {
-            ForwardContext context(description.input.limits.batch,
-                description.input.limits.time, description.input.limits.rows);
-            context.mode = mode;
-            context.batch.forward_mode = description.mode;
-            context.batch.capacity = runtime.context;
-            context.batch.cache = runtime.kv.view(runtime.states.rows().front()->operator[]("table").ptr<int>());
-            context.batch.cache.layout.sequences = caches.ptr<CacheSequence>();
-            auto state = state_bindings({}, capacity);
-            state.bind(context);
-            auto arguments = bindings(capacity, lane_capacity);
-            auto outputs = output_views(description.outputs);
-            run_forward(network, description.name, description.input,
-                {arguments.data(), arguments.size()}, {outputs.data(), outputs.size()}, context);
-        });
+    void prepare_forward(const ProgramSpec &description, ForwardContext::Mode mode) {
+        ForwardContext context(description.input.limits.batch,
+            description.input.limits.time, description.input.limits.rows);
+        context.mode = mode;
+        context.batch.forward_mode = description.mode;
+        context.batch.capacity = runtime.context;
+        context.batch.cache = runtime.kv.view(runtime.states.rows().front()->operator[]("table").ptr<int>());
+        context.batch.cache.layout.sequences = caches.ptr<CacheSequence>();
+        auto state = state_bindings({}, capacity);
+        state.bind(context);
+        auto arguments = bindings(capacity, lane_capacity);
+        auto outputs = output_views(description.outputs);
+        run_forward(network, description.name, description.input,
+            {arguments.data(), arguments.size()}, {outputs.data(), outputs.size()}, context);
     }
-    HostResults evaluate(const ProgramSpec &description) {
-        DeviceArena storage(runtime.memory, workspace(description, ForwardContext::Plan));
+    size_t workspace(const ProgramSpec &description, ForwardContext::Mode mode) {
+        return Tensor::plan([&] { prepare_forward(description, mode); });
+    }
+    struct PackedProgram {
+        ProgramSpec description;
+        size_t count = 0, workspace_bytes = 0;
+    };
+    PackedProgram pack(std::string_view name, const std::vector<std::string> &outputs,
+                       ArrayView<const InputBatch *> sources, size_t bytes_per_sequence = 0) {
+        if (!sources.size) throw std::invalid_argument("cannot pack an empty forward batch");
+        PackedProgram result;
+        auto fits = [&](size_t count) {
+            ProgramSpec candidate{std::string(name), merge_inputs({sources.data, count}), outputs};
+            const size_t required = workspace(candidate, ForwardContext::Plan);
+            const size_t extra = Tensor::aligned(size_t(candidate.input.sequence.shape.batch) * bytes_per_sequence);
+            if (!runtime.memory.can_allocate({required + extra})) return false;
+            result = {std::move(candidate), count, required};
+            return true;
+        };
+        // Check the whole ready batch once, then retain FIFO prefix selection
+        // under memory pressure without assuming workspace monotonicity.
+        if (!fits(sources.size)) {
+            size_t count = 1;
+            while (count < sources.size && fits(count)) ++count;
+            if (!result.count) throw RequestOverloaded("forward input exceeds initialized runtime workspace");
+        }
+        return result;
+    }
+    HostResults evaluate(const ProgramSpec &description, size_t workspace_bytes) {
+        DeviceArena storage(runtime.memory, workspace_bytes);
         Tensor::Scope scope(storage);
         const auto &input = description.input;
         ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
@@ -192,8 +218,8 @@ struct ModelRunner::Impl {
                     context, &runtime.memory);
         HostResults result;
         for (const auto &field : outputs) {
-            auto tensor = std::make_shared<HostTensor>(TensorShape{field.value.rows, field.value.cols}, field.value.type);
-            runtime.memory.download(tensor->view().data, field.value.data, field.value.size());
+            auto tensor = Tensor::empty({field.value.rows, field.value.cols}, field.value.type);
+            runtime.memory.download(tensor.data_ptr(), field.value.data, field.value.size());
             result.emplace(field.name, std::move(tensor));
         }
         return result;
@@ -333,7 +359,7 @@ struct ModelRunner::Impl {
             runtime.memory.upload(destination.data(), field.value.data, field.value.size());
         }
         for (const auto &address : input.input.addresses) {
-            auto values = std::make_shared<HostTensor>(TensorShape{int(address.offsets.size()), 1}, Type::I64);
+            auto values = std::make_shared<Tensor>(Tensor::zeros({int(address.offsets.size()), 1}, Type::I64));
             auto *pointers = values->view().ptr<uint64_t>();
             auto &buffer = state.data[address.state];
             for (size_t row = 0; row < address.offsets.size(); ++row) {
@@ -406,18 +432,7 @@ struct ModelRunner::Impl {
             DeviceArena storage(runtime.memory, preparation);
             for (const auto &description : programs) {
                 Tensor::Scope scope(storage);
-                ForwardContext context(description.input.limits.batch,
-                    description.input.limits.time, description.input.limits.rows);
-                context.mode = ForwardContext::Prepare;
-                context.batch.forward_mode = description.mode;
-                context.batch.cache = runtime.kv.view(runtime.states.rows().front()->operator[]("table").ptr<int>());
-                context.batch.capacity = runtime.context;
-                auto state = state_bindings({}, capacity);
-                state.bind(context);
-                auto arguments = bindings(capacity, lane_capacity);
-                auto outputs = output_views(description.outputs);
-                run_forward(network, description.name, description.input, {arguments.data(), arguments.size()},
-                    {outputs.data(), outputs.size()}, context);
+                prepare_forward(description, ForwardContext::Prepare);
             }
         }
         auto &graphs = runtime.execution.graphs();
@@ -516,36 +531,20 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
         sources.push_back(&state.current().input);
     }
     if (rows.empty()) return 0;
-    InputBatch packed;
-    size_t workspace_bytes = 0;
-    auto fits = [&](size_t count) {
-        auto candidate = merge_inputs({sources.data(), count});
-        ProgramSpec description{implementation.definition.main_program, candidate, {"hidden_states", "logits", "done"}};
-        const size_t required = implementation.workspace(description, ForwardContext::Plan);
-        const size_t bytes = required +
-            Tensor::aligned(size_t(candidate.sequence.shape.batch) * implementation.runtime.kv.block_stride() * sizeof(int));
-        if (!implementation.runtime.memory.can_allocate({bytes})) return false;
-        packed = std::move(candidate);
-        workspace_bytes = required;
-        return true;
-    };
-    // The usual case packs all ready rows once. Under memory pressure, retain
-    // the original FIFO prefix policy without assuming workspace monotonicity.
-    if (!fits(rows.size())) {
-        size_t count = 0;
-        while (count + 1 < rows.size() && fits(count + 1)) ++count;
-        if (!count) throw RequestOverloaded("input does not fit its admitted workspace");
-        rows.resize(count);
-    }
+    auto program = implementation.pack(implementation.definition.main_program,
+        {"hidden_states", "logits", "done"}, {sources.data(), sources.size()},
+        size_t(implementation.runtime.kv.block_stride()) * sizeof(int));
+    rows.resize(program.count);
+    auto &packed = program.description.input;
     std::vector<int> blocks;
     blocks.reserve(size_t(packed.sequence.shape.batch) * implementation.runtime.kv.block_stride());
     for (const auto *state : rows) {
         const auto &table = state->cache->block_table();
         blocks.insert(blocks.end(), table.begin(), table.end());
     }
-    const size_t bytes = workspace_bytes + Tensor::aligned(blocks.size() * sizeof(int));
+    const size_t bytes = program.workspace_bytes + Tensor::aligned(blocks.size() * sizeof(int));
     DeviceArena storage(implementation.runtime.memory, bytes);
-    auto block_values = std::make_shared<HostTensor>(TensorShape{int(blocks.size()), 1}, Type::I32);
+    auto block_values = std::make_shared<Tensor>(Tensor::zeros({int(blocks.size()), 1}, Type::I32));
     std::copy(blocks.begin(), blocks.end(), block_values->view().ptr<int>());
     packed.uploads.push_back({"cache_blocks", block_values->view()});
     packed.owners.push_back(block_values);
@@ -556,8 +555,8 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     context.batch.capacity = implementation.runtime.context;
     context.batch.cache = implementation.runtime.kv.view();
     auto arguments = implementation.bindings(int(rows.size()), packed.sequence.shape.batch);
-    std::array<NamedTensor, 3> outputs{{{"hidden_states", {}}, {"logits", {}}, {"done", {}}}};
-    run_forward(implementation.network, implementation.definition.main_program, packed, {arguments.data(), arguments.size()},
+    auto outputs = output_views(program.description.outputs);
+    run_forward(implementation.network, program.description.name, packed, {arguments.data(), arguments.size()},
                 {outputs.data(), outputs.size()}, context, &implementation.runtime.memory);
     implementation.sampled(rows);
     for (auto *state : rows) {
@@ -711,8 +710,9 @@ void ModelRunner::step(const std::vector<RequestState *> &requests,
     }
 }
 std::shared_ptr<const Reference> ModelRunner::prepare_reference(ReferencePlan &plan) {
-    return impl_->planner.finish_reference(plan,
-        impl_->evaluate({plan.program, plan.input, plan.outputs}));
+    ProgramSpec description{plan.program, plan.input, plan.outputs};
+    return impl_->planner.finish_reference(plan, impl_->evaluate(description,
+        impl_->workspace(description, ForwardContext::Plan)));
 }
 std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
     auto &implementation = *impl_;
@@ -789,7 +789,57 @@ std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
     }
     return result;
 }
-void ModelRunner::prepare_task(PreparationTask &task) {
-    task.accept(impl_->evaluate({std::string(task.program()), task.input(), task.outputs()}));
+void ModelRunner::prepare_tasks(std::vector<PreparedTask> &tasks) {
+    for (size_t first = 0; first < tasks.size();) {
+        if (tasks[first].error) { ++first; continue; }
+        const auto &prototype = tasks[first].program;
+        size_t end = first + 1;
+        std::vector<const InputBatch *> sources{&prototype.input};
+        while (end < tasks.size() && !tasks[end].error) {
+            const auto &program = tasks[end].program;
+            const auto &parameters = program.input.parameters;
+            const auto &expected = prototype.input.parameters;
+            if (program.name != prototype.name || program.outputs != prototype.outputs ||
+                program.input.fixed_position != prototype.input.fixed_position ||
+                parameters.size() != expected.size() ||
+                !std::equal(parameters.begin(), parameters.end(), expected.begin(),
+                    [](const auto &left, const auto &right) { return left.name == right.name && left.value == right.value; }))
+                break;
+            sources.push_back(&program.input);
+            ++end;
+        }
+        try {
+            auto packed = impl_->pack(prototype.name, prototype.outputs, {sources.data(), sources.size()});
+            end = first + packed.count;
+            auto outputs = impl_->evaluate(packed.description, packed.workspace_bytes);
+            std::vector<int> offsets(prototype.outputs.size());
+            for (size_t field = 0; field < offsets.size(); ++field) {
+                int64_t rows = 0;
+                for (size_t index = first; index < end; ++index) rows += tasks[index].outputs[field].rows;
+                if (rows != outputs.at(prototype.outputs[field]).size(0))
+                    throw std::logic_error("preparation output does not match its row partitions");
+            }
+            for (size_t index = first; index < end; ++index) {
+                HostResults result;
+                for (size_t field = 0; field < offsets.size(); ++field) {
+                    const auto &partition = tasks[index].outputs[field];
+                    auto tensor = outputs.at(partition.name).narrow(0, offsets[field], partition.rows);
+                    offsets[field] += partition.rows;
+                    result.emplace(partition.name, std::move(tensor));
+                }
+                try { tasks[index].task->accept(std::move(result)); }
+                catch (const DeviceError &) { throw; }
+                catch (...) { tasks[index].error = std::current_exception(); }
+            }
+        } catch (const DeviceError &) { throw; }
+        catch (const RequestOverloaded &) {
+            end = first + 1;
+            tasks[first].error = std::current_exception();
+        } catch (...) {
+            auto error = std::current_exception();
+            for (size_t index = first; index < end; ++index) tasks[index].error = error;
+        }
+        first = end;
+    }
 }
 } // namespace tts

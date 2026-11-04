@@ -7,6 +7,6 @@ namespace tts::ops {
 void select_pronunciation( TensorView logits, TensorView pos_logits,
                           TensorView bias, TensorView pos_bias, TensorView descriptor_bias,
                           TensorView char_descriptor, TensorView second_order_descriptor,
-                          TensorView legal, const int *query_positions, const int *char_ids,
+                          TensorView legal, const int *char_ids,
                           int *output_ids);
 } // namespace tts::ops

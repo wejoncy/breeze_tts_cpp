@@ -1,5 +1,5 @@
 #include "inputs/input_registry.h"
-#include "inputs/input_fields.h"
+#include "core/input_fields.h"
 #include "core/row_capacity.h"
 #include "text/frontend.h"
 #include "text/segmentation.h"
@@ -60,7 +60,7 @@ class PhonemeInputs final : public RequestPlanner {
         dummy_text.bert_ids = {0, 0, 0}; dummy_text.bert_offsets = {0, 3};
         PhonemeReference dummy_reference;
         dummy_reference.text = dummy_text; dummy_reference.type = type;
-        dummy_reference.tensors["codes"] = std::make_shared<HostTensor>(TensorShape{1, 1}, Type::I32);
+        dummy_reference.tensors["codes"] = Tensor::zeros({1, 1}, Type::I32);
         auto input = fields(dummy_text, dummy_reference);
         input.limits = {batch, context, batch * context};
         definition_.programs.push_back({"tokens", std::move(input), {"logits", "done"}});
@@ -81,11 +81,14 @@ class PhonemeInputs final : public RequestPlanner {
                                        ForwardMode::Prefill, ProgramSpec::Replay::Regions});
         InputBatch auxiliary;
         const int tokens = read_json(loader.path("g2pw.json")).at("max_tokens");
-        auxiliary.limits = {1, tokens, tokens}; auxiliary.sequence.shape = {1, tokens, tokens};
-        for (const char *name : {"input_ids", "positions", "characters", "token_positions"})
-            auxiliary.uploads.push_back({name, own_tensor(auxiliary, {tokens, 1}, Type::I32)});
-        auxiliary.uploads.push_back({"cu_seqlens", own_tensor(auxiliary, {2, 1}, Type::I32)});
-        auxiliary.parameters = {{"queries", double(tokens)}};
+        if (tokens < 1 || batch > INT32_MAX / tokens)
+            throw std::invalid_argument("pronunciation batch capacity exceeds tensor dimensions");
+        const int rows = batch * tokens;
+        auxiliary.limits = {rows, tokens, rows};
+        for (const char *name : {"input_ids", "positions", "characters"})
+            auxiliary.uploads.push_back({name, own_tensor(auxiliary, {rows, 1}, Type::I32)});
+        // Positive sequence lengths bound the sequence count by total rows.
+        auxiliary.sequence = own_sequence(auxiliary, std::vector<int>(rows, 1));
         definition_.programs.push_back({"pronunciation", std::move(auxiliary), {"labels"}});
         InputBatch reference;
         reference.limits = {1, context, context};
@@ -114,7 +117,7 @@ InputBatch PhonemeInputs::fields(const text::TextInput &text, const PhonemeRefer
     auto upload = [&](const char *name, const std::vector<int> &values, int columns = 1) {
         input.uploads.push_back({name, own_integers(input, values, columns)});
     };
-    const auto codes = reference.tensors.at("codes")->view();
+    const auto codes = reference.tensors.at("codes").view();
     const int phones = int(reference.text.phones.size() + text.phones.size()), prompt = phones + codes.rows;
     std::vector<int> phone_ids = reference.text.phones;
     phone_ids.insert(phone_ids.end(), text.phones.begin(), text.phones.end());
@@ -182,7 +185,7 @@ GenerationInput PhonemeInputs::encode(const Input &request, std::vector<text::Te
         if (prompt >= context_) throw std::invalid_argument("reference and text leave no output context");
         segment.max_tokens = rate_.codes_for_frames(options.max_frames, options.speed_factor, context_ - prompt);
         segment.lengths = {prompt}; segment.capacities = {prompt + segment.max_tokens};
-        segment.position_offset = reference->tensors.at("codes")->view().rows;
+        segment.position_offset = reference->tensors.at("codes").size(0);
         segment.seed = request_seed(request_seed(options.seed, index), segment_index);
         auto phones = own_integers(segment.input, text.phones);
         segment.initializers.push_back({"phones", phones});
@@ -191,10 +194,10 @@ GenerationInput PhonemeInputs::encode(const Input &request, std::vector<text::Te
             if (name == "codes") continue;
             if (name == "mel") name = "reference_mel";
             else if (name == "features") name = "reference_features";
-            segment.initializers.push_back({name, field.second->view()});
+            segment.initializers.push_back({name, field.second.view()});
         }
         auto seen = own_tensor(segment.input, {definition_.vocabulary, 1}, Type::I32);
-        const auto codes = reference->tensors.at("codes")->view();
+        const auto codes = reference->tensors.at("codes").view();
         for (size_t token = 0; token < codes.numel(); ++token) seen.ptr<int>()[codes.ptr<int>()[token]] = 1;
         segment.initializers.push_back({"seen", seen});
         result.segments.push_back(std::move(segment));
@@ -298,11 +301,10 @@ std::shared_ptr<const Reference> PhonemeInputs::finish_reference(ReferencePlan &
     auto &plan = dynamic_cast<PhonemeReferencePlan &>(base);
     auto result = std::make_shared<PhonemeReference>();
     result->text = std::move(plan.text); result->type = type_;
-    const int available = std::min(outputs.at("mel")->view().rows, outputs.at("features")->view().rows);
+    const int available = std::min(outputs.at("mel").size(0), outputs.at("features").size(0));
     result->frames = std::min(available, reference_frames_);
     for (const char *name : {"mel", "features"}) {
-        const auto tensor = outputs.at(name)->view().slice(available - result->frames, result->frames);
-        outputs[name] = std::make_shared<HostTensor>(tensor);
+        outputs[name] = outputs.at(name).narrow(0, available - result->frames, result->frames).clone();
     }
     result->tensors = std::move(outputs);
     return std::make_shared<const Reference>(std::move(plan.transcript), std::move(result));

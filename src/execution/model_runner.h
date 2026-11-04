@@ -46,7 +46,7 @@ class ModelRunner {
     // Init-time host staging bound for all audio callbacks of one input in one
     // step(), including any pending tail and inter-segment silence.
     size_t max_step_samples() const;
-    void prepare_task(PreparationTask &);
+    void prepare_tasks(std::vector<PreparedTask> &);
     // Empty means temporarily unavailable; retry after a release checkpoint.
     // Invalid requests and requests that cannot fit alone throw a terminal error.
     std::unique_ptr<RequestAdmission> admit(RequestPlan &);

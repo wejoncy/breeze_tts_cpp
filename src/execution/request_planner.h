@@ -1,20 +1,26 @@
 #pragma once
 #include "tts/request.h"
 #include "core/input_batch.h"
-#include "core/host_tensor.h"
+#include "core/tensor_storage.h"
 #include "core/synthesis_windows.h"
 #include "core/sequence_rate.h"
+#include <exception>
 #include <map>
 
 namespace tts {
-using HostResults = std::map<std::string, std::shared_ptr<HostTensor>, std::less<>>;
+using HostResults = std::map<std::string, Tensor, std::less<>>;
+struct PreparationOutput {
+    std::string name;
+    int rows;
+};
 // Model-defined preparation exchanged by ownership through the executor queue.
 // CPU tokenization and GPU conditioning can alternate without sharing state.
 struct PreparationTask {
     virtual ~PreparationTask() = default;
     virtual std::string_view program() const = 0;
     virtual InputBatch input() const = 0;
-    virtual std::vector<std::string> outputs() const = 0;
+    // Each output concatenates these row counts when compatible tasks merge.
+    virtual std::vector<PreparationOutput> outputs() const = 0;
     virtual void accept(HostResults) = 0;
 };
 struct GenerationSegment {
@@ -54,6 +60,29 @@ struct ProgramSpec {
     ForwardMode mode = ForwardMode::Prefill;
     Replay replay = Replay::None;
     std::string history;
+};
+// Construct on the scheduler; move the complete CPU input through the queue.
+struct PreparedTask {
+    std::unique_ptr<PreparationTask> task;
+    ProgramSpec program;
+    std::vector<PreparationOutput> outputs;
+    std::exception_ptr error;
+    explicit PreparedTask(std::unique_ptr<PreparationTask> value) : task(std::move(value)) {
+        try {
+            if (!task) throw std::invalid_argument("empty preparation task");
+            program.name = task->program();
+            program.input = task->input();
+            outputs = task->outputs();
+            if (program.name.empty() || outputs.empty())
+                throw std::invalid_argument("preparation task has no forward program or outputs");
+            for (const auto &field : outputs) {
+                if (field.name.empty() || field.rows < 0 ||
+                    std::find(program.outputs.begin(), program.outputs.end(), field.name) != program.outputs.end())
+                    throw std::invalid_argument("invalid preparation output partition");
+                program.outputs.push_back(field.name);
+            }
+        } catch (...) { error = std::current_exception(); }
+    }
 };
 struct InputDefinition {
     std::string main_program = "tokens", audio_program = "waveform", reference_program = "reference";

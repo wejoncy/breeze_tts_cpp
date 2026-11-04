@@ -1,11 +1,11 @@
 #pragma once
 #include "core/input_batch.h"
-#include "core/host_tensor.h"
+#include "core/tensor_storage.h"
 #include "core/sequence_builder.h"
 
 namespace tts {
 inline TensorView own_tensor(InputBatch &input, TensorShape shape, Type type) {
-    auto storage = std::make_shared<HostTensor>(shape, type);
+    auto storage = std::make_shared<Tensor>(Tensor::zeros(shape, type));
     auto result = storage->view();
     input.owners.push_back(std::move(storage));
     return result;

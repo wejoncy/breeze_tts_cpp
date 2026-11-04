@@ -162,22 +162,19 @@ struct RequestExecutor::Impl {
                 break;
             if (!command.preparation.empty()) {
                 Range trace("tts.engine.prepare_execute");
+                if (!fatal) try {
+                    runner.prepare_tasks(command.preparation);
+                } catch (...) {
+                    fatal = std::current_exception();
+                    states.clear();
+                    requests.clear();
+                    Completion result;
+                    result.fatal = fatal;
+                    completed(std::move(result));
+                }
                 for (size_t i = 0; i < command.preparation.size(); ++i) {
                     auto &item = command.preparation[i];
-                    if (fatal)
-                        item.error = fatal;
-                    else try {
-                        runner.prepare_task(*item.task);
-                    } catch (const DeviceError &) {
-                        item.error = fatal = std::current_exception();
-                        states.clear();
-                        requests.clear();
-                        Completion result;
-                        result.fatal = fatal;
-                        completed(std::move(result));
-                    } catch (...) {
-                        item.error = std::current_exception();
-                    }
+                    if (fatal) item.error = fatal;
                     command.prepared(i, std::move(item));
                 }
                 continue;
@@ -230,7 +227,7 @@ struct RequestExecutor::Impl {
     void prepare_task(std::unique_ptr<PreparationTask> task,
                       std::function<void(std::unique_ptr<PreparationTask>, std::exception_ptr)> reply) {
         std::vector<PreparedTask> tasks;
-        tasks.push_back({std::move(task), {}});
+        tasks.emplace_back(std::move(task));
         prepare_tasks(std::move(tasks), [reply = std::move(reply)](size_t, PreparedTask result) {
             reply(std::move(result.task), result.error);
         });

@@ -173,4 +173,4 @@ def export_korean(text, g2pk, dictionary, jamo, output):
         tens="열 스물 서른 마흔 쉰 예순 일흔 여든 아흔".split(),
         scales="십백천만십백천억십백천조십백천", twenty="스무")
     (output / "korean.json").write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    export_morphology(dictionary, output / "korean_morphology.bin")
+    export_morphology(dictionary, output / "korean_mecab")

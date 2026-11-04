@@ -28,10 +28,10 @@ template <class Bias>
 __global__ void selection_kernel(View logits, View pos_logits, const Bias *bias,
                                   const Bias *pos_bias, const float *descriptor_bias,
                                   View char_descriptor, View second_order_descriptor,
-                                  View legal, const int *positions, const int *char_ids,
+                                  View legal, const int *char_ids,
                                   int *output_ids) {
     int row = blockIdx.x, ch = char_ids[row], tid = threadIdx.x;
-    if (positions[row] < 0 || positions[row] >= logits.rows || ch < 0 || ch >= char_descriptor.rows) {
+    if (ch < 0 || ch >= char_descriptor.rows) {
         if (!tid)
             output_ids[row] = -1;
         return;
@@ -80,10 +80,10 @@ __global__ void selection_kernel(View logits, View pos_logits, const Bias *bias,
 void select_pronunciation( TensorView logits, TensorView pos,
                           TensorView bias, TensorView pos_bias, TensorView descriptor_bias,
                           TensorView chars, TensorView second, TensorView legal,
-                          const int *positions, const int *char_ids, int *output_ids) {
+                          const int *char_ids, int *output_ids) {
     const auto stream = execution_context(logits).stream;
     if (!logits.data || !pos.data || !bias.data || !pos_bias.data || !descriptor_bias.data ||
-        !chars.data || !second.data || !legal.data || !positions || !char_ids || !output_ids ||
+        !chars.data || !second.data || !legal.data || !char_ids || !output_ids ||
         logits.rows < 1 || logits.cols < 1 || pos.cols < 1 || pos.rows != logits.rows ||
         logits.type != Type::F32 || pos.type != Type::F32 ||
         (bias.type != Type::F16 && bias.type != Type::BF16) || pos_bias.type != bias.type ||
@@ -97,11 +97,11 @@ void select_pronunciation( TensorView logits, TensorView pos,
     if (bias.type == Type::F16)
         selection_kernel<<<logits.rows, 256, 0, stream>>>(
             View(logits), View(pos), bias.ptr<const __half>(), pos_bias.ptr<const __half>(),
-            descriptor_bias.ptr<const float>(), View(chars), View(second), View(legal), positions, char_ids, output_ids);
+            descriptor_bias.ptr<const float>(), View(chars), View(second), View(legal), char_ids, output_ids);
     else
         selection_kernel<<<logits.rows, 256, 0, stream>>>(
             View(logits), View(pos), bias.ptr<const __nv_bfloat16>(), pos_bias.ptr<const __nv_bfloat16>(),
-            descriptor_bias.ptr<const float>(), View(chars), View(second), View(legal), positions, char_ids, output_ids);
+            descriptor_bias.ptr<const float>(), View(chars), View(second), View(legal), char_ids, output_ids);
     CUDA(cudaGetLastError());
 }
 } // namespace tts::ops

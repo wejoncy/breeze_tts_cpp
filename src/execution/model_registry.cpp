@@ -49,7 +49,7 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader, c
 }
 ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &loader, const ModelOptions &options) {
     auto checkpoint = loader.open({{"", ""}},
-        {"tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.bin", "pinyin.bin",
+        {"tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.dict.utf8", "jieba.hmm.utf8", "pinyin.bin",
          "polyphone.bin", "linguistics.json", "english.json", "english.safetensors"});
     text::FrontendAssets assets(loader);
     checkpoint.files.insert(checkpoint.files.end(), assets.files().begin(), assets.files().end());

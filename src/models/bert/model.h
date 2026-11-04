@@ -9,7 +9,6 @@ class Bert {
     AffineNorm embedding_norm_;
     TransformerEncoder encoder_;
 
-  public:
     struct Workspace {
         TransformerEncoder::Workspace encoder;
         Buffer features;
@@ -18,12 +17,13 @@ class Bert {
             : encoder(b.encoder_, batch, time, rows_capacity),
               features(size_t(encoder.max_rows) * b.encoder_.hidden() * bytes(b.encoder_.type())) {}
     };
+    TensorView forward(Workspace &, const int *ids, const ForwardBatch &) const;
+
+  public:
     Bert(Weights &, const Json &, const std::string &prefix, int output_layers,
          bool quantize = false);
     int hidden() const { return encoder_.hidden(); }
     Type type() const { return encoder_.type(); }
-    void prepare(int max_rows) const { encoder_.prepare(max_rows); }
-    TensorView forward(Workspace &, const int *ids, const ForwardBatch &) const;
     TensorView forward(TensorView input_ids, ForwardContext &) const;
 };
 } // namespace tts

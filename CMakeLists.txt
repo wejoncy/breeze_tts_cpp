@@ -13,6 +13,28 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 include(cmake/Dependencies.cmake)
 corrosion_import_crate(MANIFEST_PATH tokenizer/Cargo.toml LOCKED)
+add_library(tts_text OBJECT
+  src/text/frontend.cpp
+  src/text/language_router.cpp
+  src/text/g2pw.cpp
+  src/text/english.cpp
+  src/text/cantonese.cpp
+  src/text/morphology.cpp
+  src/text/korean.cpp
+  src/text/japanese.cpp
+  src/text/language_detector.cpp
+  src/text/budoux.cpp
+  src/text/segmentation.cpp
+  src/text/jieba.cpp
+  src/text/pinyin.cpp
+  src/text/tone_sandhi.cpp
+  src/text/normalization.cpp
+  src/text/phonemizer.cpp
+  src/text/regex.cpp
+)
+set_target_properties(tts_text PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(tts_text PRIVATE include src "${PROJECT_SOURCE_DIR}")
+target_link_libraries(tts_text PRIVATE nlohmann_json::nlohmann_json tts_cppjieba tts_fasttext openjtalk tts_mecab)
 add_library(tts SHARED
   bindings/c_api.cpp
   src/ops/kernels/tensor_kernels.cu
@@ -35,8 +57,6 @@ add_library(tts SHARED
   src/layers/spectrogram.cpp
   src/execution/model_registry.cpp
   src/models/gpt_sovits/model.cpp
-  src/text/frontend.cpp
-  src/text/language_router.cpp
   src/models/g2pw/model.cpp
   src/models/gpt_sovits/vocoder.cpp
   src/models/gpt_sovits/dit.cpp
@@ -63,23 +83,6 @@ add_library(tts SHARED
   src/io/model_loader.cpp
   src/io/weights.cpp
   src/io/safetensors.cpp
-  src/text/g2pw.cpp
-  src/text/english.cpp
-  src/text/cantonese.cpp
-  src/text/morphology.cpp
-  src/text/korean.cpp
-  src/text/japanese.cpp
-  src/text/japanese_grammar.cpp
-  src/text/japanese_document.cpp
-  src/text/language_detector.cpp
-  src/text/budoux.cpp
-  src/text/segmentation.cpp
-  src/text/weighted_segmenter.cpp
-  src/text/pinyin.cpp
-  src/text/tone_sandhi.cpp
-  src/text/normalization.cpp
-  src/text/phonemizer.cpp
-  src/text/regex.cpp
   src/ops/kernels/attention/flash_attention.cu
   src/ops/kernels/attention/flash_decoding.cu
   src/ops/kernels/attention/relative_attention.cu
@@ -111,7 +114,7 @@ if(TTS_BUILD_HOPPER_KERNELS)
   target_sources(tts PRIVATE $<TARGET_OBJECTS:tts_quant_hopper>)
 endif()
 target_include_directories(tts PUBLIC include PRIVATE src "${PROJECT_SOURCE_DIR}")
-target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(tts PRIVATE tts_text nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
   src/ops/kernels/tensor_kernels.cu

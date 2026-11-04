@@ -471,7 +471,7 @@ struct RequestScheduler::Impl {
             auto job = preparing.front();
             preparing.pop_front();
             if (job->aborted()) { retire(job); continue; }
-            tasks.push_back({std::move(job->task), {}});
+            tasks.emplace_back(std::move(job->task));
             owners.push_back(job->execution_id);
             inflight_preparations.emplace(job->execution_id, job);
         }

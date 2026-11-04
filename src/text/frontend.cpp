@@ -53,7 +53,7 @@ std::vector<TextFrontend::Span> TextFrontend::normalize(const std::string &input
         if (selected == Language::Korean && !korean_)
             throw std::invalid_argument("Korean assets are absent from this checkpoint; reconvert with --korean-g2p, --korean-dictionary and --korean-jamo");
         if (selected == Language::Japanese && !japanese_)
-            throw std::invalid_argument("Japanese assets are absent from this checkpoint; reconvert with --japanese-openjtalk, --japanese-dictionary and --japanese-user-dictionary");
+            throw std::invalid_argument("Japanese assets are absent from this checkpoint; reconvert with --japanese-dictionary and --japanese-user-dictionary");
     };
     if (cantonese) require(Language::Cantonese);
     if (korean) require(Language::Korean);

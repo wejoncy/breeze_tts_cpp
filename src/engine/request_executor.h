@@ -41,10 +41,6 @@ struct ExecutionBatch {
     double prefill_budget_ms = 0;
     Completion output;
 };
-struct PreparedTask {
-    std::unique_ptr<PreparationTask> task;
-    std::exception_ptr error;
-};
 // One execution thread owns the runner, admissions and live GPU request states.
 // The scheduling policy and client output queues are outside this boundary.
 class RequestExecutor {

@@ -2,7 +2,7 @@
 // and PaddleSpeech's pronunciation rules (Apache-2.0).
 #include "text/phonemizer.h"
 #include "text/normalization.h"
-#include "text/weighted_segmenter.h"
+#include "text/jieba.h"
 #include "text/tone_sandhi.h"
 #include "text/linguistic_data.h"
 #include "text/utf8.h"
@@ -13,7 +13,7 @@
 #include <set>
 namespace tts::text {
 struct ChinesePhonemizer::Impl {
-    WeightedSegmenter segmenter;
+    JiebaSegmenter segmenter;
     PypinyinResolver dictionary;
     TextNormalizer normalizer;
     ToneSandhi sandhi;

@@ -105,7 +105,7 @@ struct KoreanPhonemizer::Impl {
     std::map<char32_t, int> symbols;
     int unknown;
     explicit Impl(const std::string &directory)
-        : morphology(directory + "/korean_morphology.bin") {
+        : morphology(directory + "/korean_mecab") {
         auto data = read_json(directory + "/korean.json");
         for (const auto &item : {std::pair{"idioms", &idioms}, {"special", &special},
                                  {"regular", &regular}, {"links", &links}})

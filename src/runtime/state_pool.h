@@ -1,6 +1,7 @@
 #pragma once
 #include "runtime/sequence_state.h"
-#include "core/host_tensor.h"
+#include "core/tensor_storage.h"
+#include <cstring>
 #include <map>
 #include <string_view>
 
@@ -19,7 +20,7 @@ class StatePool {
     };
     class Row {
         std::map<std::string, Buffer, std::less<>> tensors_;
-        std::map<std::string, HostTensor, std::less<>> host_;
+        std::map<std::string, Tensor, std::less<>> host_;
         std::map<std::string, TensorView, std::less<>> views_;
         std::map<std::string, SequenceState, std::less<>> histories_;
 
@@ -31,7 +32,7 @@ class StatePool {
                 const auto shape = field.shape;
                 TensorView view;
                 if (field.host) {
-                    auto tensor = host_.try_emplace(field.name, shape, field.type);
+                    auto tensor = host_.try_emplace(field.name, Tensor::zeros(shape, field.type));
                     if (!tensor.second) throw std::invalid_argument("duplicate host state: " + field.name);
                     view = tensor.first->second.view();
                 } else {
