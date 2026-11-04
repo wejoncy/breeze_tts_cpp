@@ -12,10 +12,9 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from text_frontend import export_frontend
 from english_linguistics import export_english
-from export_linguistics import export_cantonese
+from export_linguistics import export_cantonese, export_japanese
 from korean_linguistics import export_korean
 from language_routing import export_router
-from japanese_linguistics import export_japanese
 
 
 def load(path):
