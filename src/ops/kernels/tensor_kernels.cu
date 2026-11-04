@@ -1,3 +1,4 @@
+#include "ops/kernels/common/storage_dispatch.cuh"
 #include "ops/cuda/kernel_initialization.h"
 #include "runtime/cuda_context.h"
 #include "ops/basic.h"
@@ -343,14 +344,7 @@ static void check_float_storage(TensorView source, std::initializer_list<TensorV
         if (operand.data && operand.type != source.type)
             throw std::invalid_argument("operator storage types do not match");
 }
-template <class Launch> static void dispatch_float_storage(Type type, Launch &&launch) {
-    switch (type) {
-    case Type::BF16: launch(bf16{}); break;
-    case Type::F16: launch(__half{}); break;
-    case Type::F32: launch(float{}); break;
-    default: throw std::invalid_argument("operator requires F16, BF16 or F32 storage");
-    }
-}
+
 void ops::norm(TensorView x, TensorView w, TensorView y, float eps, bool gemma,
                    TensorView bias) {
     auto &cuda = execution_context(x);
@@ -362,7 +356,7 @@ void ops::norm(TensorView x, TensorView w, TensorView y, float eps, bool gemma,
         throw std::invalid_argument("norm shape/dtype/layout mismatch");
     if (!bias.data && fast_rms<false>(stream, x, {}, w, y, {}, eps, gemma))
         return;
-    dispatch_float_storage(x.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
         using T = decltype(storage);
         if (!bias.data && x.cols <= 2048)
             rms_kernel<T, false><<<x.rows, 256, 0, stream>>>(
@@ -381,7 +375,7 @@ void ops::residual_norm(TensorView x, TensorView update, TensorView w, TensorVie
         return;
     if (x.cols > 2048)
         throw std::runtime_error("fused RMS width exceeds 2048");
-    dispatch_float_storage(x.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
         using T = decltype(storage);
         rms_kernel<T, true><<<x.rows, 256, 0, stream>>>(x.ptr<T>(), update.ptr<T>(),
             w.ptr<T>(), out.ptr<T>(), scale.ptr<T>(), x.cols, eps, gemma);
@@ -408,7 +402,7 @@ void ops::add(TensorView a, TensorView b, TensorView out, TensorView scale) {
     const auto stream = cuda.stream;
     check_float_storage(a, {b, out, scale});
     size_t n = size_t(a.rows) * a.cols;
-    dispatch_float_storage(a.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(a.type, [&](auto storage) {
         using T = decltype(storage);
         add_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
             a.ptr<T>(), b.ptr<T>(), out.ptr<T>(), scale.ptr<T>(), n, a.cols);
@@ -426,7 +420,7 @@ void ops::bias(TensorView x, TensorView b) {
     if (!b.data)
         return;
     size_t n = size_t(x.rows) * x.cols;
-    dispatch_float_storage(x.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
         using T = decltype(storage);
         bias_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x.ptr<T>(), b.ptr<T>(), n, x.cols);
     });
@@ -450,7 +444,7 @@ void ops::activation(TensorView x, TensorView y, int kind) {
     const auto stream = cuda.stream;
     check_float_storage(x, {y});
     size_t n = size_t(x.rows) * x.cols;
-    dispatch_float_storage(x.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
         using T = decltype(storage);
         activation_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x.ptr<T>(), y.ptr<T>(), n, kind);
     });
@@ -467,7 +461,7 @@ void ops::gated_activation(TensorView gu, TensorView y, int kind) {
     const auto stream = cuda.stream;
     check_float_storage(y, {gu});
     size_t n = size_t(y.rows) * y.cols;
-    dispatch_float_storage(y.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(y.type, [&](auto storage) {
         using T = decltype(storage);
         gated_kernel<<<(n + 255) / 256, 256, 0, stream>>>(gu.ptr<T>(), y.ptr<T>(), n, y.cols, kind);
     });
@@ -489,7 +483,7 @@ void ops::lookup(TensorView table, const int *ids, TensorView out, float scale,
     const auto stream = cuda.stream;
     check_float_storage(out, {table, replacement});
     size_t n = size_t(out.rows) * out.cols;
-    dispatch_float_storage(out.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(out.type, [&](auto storage) {
         using T = decltype(storage);
         embedding_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
             table.ptr<T>(), ids, out.ptr<T>(), out.rows, out.cols, scale,
@@ -526,7 +520,7 @@ void ops::rotary_table(TensorView table, int dim, float theta, float factor, int
     if (rope_type == 2 && !(low_wave > high_wave && high_wave > 0))
         throw std::invalid_argument("invalid Llama3 RoPE wavelength bounds");
     int n = table.rows * dim / 2;
-    dispatch_float_storage(table.type, [&](auto storage) {
+    cuda_kernels::dispatch_storage(table.type, [&](auto storage) {
         using T = decltype(storage);
         rope_table_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
             table.ptr<T>(), table.rows, dim, theta, factor, rope_type, low_wave, high_wave);
@@ -859,7 +853,7 @@ void ops::attention(TensorView q, TensorView k, TensorView v, TensorView out, co
         else
             launch(type, std::integral_constant<int, 0>{});
     };
-    dispatch_float_storage(q.type, dispatch);
+    cuda_kernels::dispatch_storage(q.type, dispatch);
 }
 __global__ void increment_kernel(int *p, int n, int v) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

@@ -1,3 +1,4 @@
+#include "ops/kernels/common/storage_dispatch.cuh"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include <curand_kernel.h>
@@ -28,15 +29,10 @@ void positional_add( TensorView x, TensorView y, TensorView table, int time,
         (alpha.data && (alpha.numel() != 1 || alpha.type != y.type)))
         throw std::invalid_argument("invalid positional embedding");
     int blocks = (y.numel() + 255) / 256;
-    if (y.type == Type::BF16)
-        position_kernel<bf16><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
-                                                     y.rows, y.cols, time, offset, sources, retained);
-    else if (y.type == Type::F16)
-        position_kernel<__half><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
-                                                       y.rows, y.cols, time, offset, sources, retained);
-    else
-        position_kernel<float><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
-                                                      y.rows, y.cols, time, offset, sources, retained);
+    cuda_kernels::dispatch_storage(y.type, [&](auto storage) {
+        position_kernel<decltype(storage)><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
+            y.rows, y.cols, time, offset, sources, retained);
+    });
     CUDA(cudaGetLastError());
 }
 template <class T> __device__ __forceinline__ void rotate(float &a, float &b, float co, float si) {
@@ -185,19 +181,11 @@ void global_response_norm( TensorView x, TensorView y, TensorView gamma,
         stats.cols != y.cols || stats.type != Type::F32)
         throw std::invalid_argument("invalid global response normalization workspace");
     dim3 grid(batch, y.cols);
-    if (x.type == Type::BF16) {
-        response_stats<bf16><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
-        response_apply<bf16><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma), View(beta),
-                                                          View(stats), time, y.cols);
-    } else if (x.type == Type::F16) {
-        response_stats<__half><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
-        response_apply<__half><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma),
-                                                            View(beta), View(stats), time, y.cols);
-    } else {
-        response_stats<float><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
-        response_apply<float><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma),
-                                                           View(beta), View(stats), time, y.cols);
-    }
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
+        response_stats<decltype(storage)><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
+        response_apply<decltype(storage)><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma), View(beta),
+            View(stats), time, y.cols);
+    });
     CUDA(cudaGetLastError());
 }
 template <class T>
@@ -257,15 +245,10 @@ void gaussian_noise( TensorView out, int time, const int *prefix,
         !std::isfinite(temperature) || temperature < 0)
         throw std::invalid_argument("invalid noise initialization");
     int grid = (size_t(out.rows) * ((out.cols + 3) / 4) + 255) / 256;
-    if (out.type == Type::BF16)
-        noise_kernel<bf16><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix, seeds,
-                                                subsequences, temperature);
-    else if (out.type == Type::F16)
-        noise_kernel<__half><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix,
-                                                  seeds, subsequences, temperature);
-    else
-        noise_kernel<float><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix, seeds,
-                                                 subsequences, temperature);
+    cuda_kernels::dispatch_storage(out.type, [&](auto storage) {
+        noise_kernel<decltype(storage)><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix, seeds,
+            subsequences, temperature);
+    });
     CUDA(cudaGetLastError());
 }
 void euler_step( TensorView x, TensorView v, TensorView negative, int time,
@@ -286,21 +269,12 @@ void euler_step( TensorView x, TensorView v, TensorView negative, int time,
           out.values.type != x.type || out.values.data == x.data)))
         throw std::invalid_argument("invalid Euler output range");
     int grid = (x.numel() + 255) / 256;
-    if (x.type == Type::BF16)
-        euler_kernel<bf16><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
-                                                time, prefix, delta, cfg, View(out.values),
-                                                out.offset, out.frames, out.minimum, out.maximum,
-                                                out.prompt_rows, out.history_rows, out.value_rows);
-    else if (x.type == Type::F16)
-        euler_kernel<__half><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
-                                                  time, prefix, delta, cfg, View(out.values),
-                                                  out.offset, out.frames, out.minimum, out.maximum,
-                                                  out.prompt_rows, out.history_rows, out.value_rows);
-    else
-        euler_kernel<float><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
-                                                 time, prefix, delta, cfg, View(out.values),
-                                                 out.offset, out.frames, out.minimum, out.maximum,
-                                                 out.prompt_rows, out.history_rows, out.value_rows);
+    cuda_kernels::dispatch_storage(x.type, [&](auto storage) {
+        euler_kernel<decltype(storage)><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
+            time, prefix, delta, cfg, View(out.values),
+            out.offset, out.frames, out.minimum, out.maximum,
+            out.prompt_rows, out.history_rows, out.value_rows);
+    });
     CUDA(cudaGetLastError());
 }
 struct EmbeddingInput {
@@ -421,15 +395,10 @@ void embedding( TensorView table, const int *ids, TensorView out,
         (f.position_alpha.data &&
          (f.position_alpha.numel() != 1 || f.position_alpha.type != out.type)))
         throw std::invalid_argument("invalid fused embedding");
-    if (out.type == Type::BF16)
-        embedding_kernel<bf16><<<int(rows), 256, 0, stream>>>(ids, View(out), out.cols,
-                                                         EmbeddingInput(table, f), f.input_repeat);
-    else if (out.type == Type::F16)
-        embedding_kernel<__half><<<int(rows), 256, 0, stream>>>(
-            ids, View(out), out.cols, EmbeddingInput(table, f), f.input_repeat);
-    else
-        embedding_kernel<float><<<int(rows), 256, 0, stream>>>(ids, View(out), out.cols,
-                                                          EmbeddingInput(table, f), f.input_repeat);
+    cuda_kernels::dispatch_storage(out.type, [&](auto storage) {
+        embedding_kernel<decltype(storage)><<<int(rows), 256, 0, stream>>>(ids, View(out), out.cols,
+            EmbeddingInput(table, f), f.input_repeat);
+    });
     CUDA(cudaGetLastError());
 }
 template <class T>
@@ -553,12 +522,9 @@ void temporal_mean( TensorView x, TensorView y, int time) {
     if (time < 1 || x.rows != int64_t(y.rows) * time || x.cols != y.cols || x.type != y.type)
         throw std::invalid_argument("invalid temporal mean");
     dim3 grid((y.cols + 31) / 32, y.rows);
-    if (y.type == Type::BF16)
-        mean_kernel<bf16><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
-    else if (y.type == Type::F16)
-        mean_kernel<__half><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
-    else
-        mean_kernel<float><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
+    cuda_kernels::dispatch_storage(y.type, [&](auto storage) {
+        mean_kernel<decltype(storage)><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
+    });
     CUDA(cudaGetLastError());
 }
 template <class T>

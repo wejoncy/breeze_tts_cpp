@@ -1,3 +1,4 @@
+#include "ops/kernels/common/storage_dispatch.cuh"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include <cstring>
@@ -444,18 +445,11 @@ static void convolution(cudaStream_t stream, TensorView x, TensorView weight, Te
         }
     }
     int grid = (y.numel() + 255) / 256;
-    if (y.type == Type::BF16)
-        conv_kernel<bf16, Depthwise, decltype(finish)><<<grid, 256, 0, stream>>>(
+    cuda_kernels::dispatch_storage(y.type, [&](auto storage) {
+        conv_kernel<decltype(storage), Depthwise, decltype(finish)><<<grid, 256, 0, stream>>>(
             View(x), View(weight), View(y), y.rows, input_length, output_length, g, finish,
             input ? *input : SequenceLayout{}, output ? *output : SequenceLayout{});
-    else if (y.type == Type::F16)
-        conv_kernel<__half, Depthwise, decltype(finish)><<<grid, 256, 0, stream>>>(
-            View(x), View(weight), View(y), y.rows, input_length, output_length, g, finish,
-            input ? *input : SequenceLayout{}, output ? *output : SequenceLayout{});
-    else
-        conv_kernel<float, Depthwise, decltype(finish)><<<grid, 256, 0, stream>>>(
-            View(x), View(weight), View(y), y.rows, input_length, output_length, g, finish,
-            input ? *input : SequenceLayout{}, output ? *output : SequenceLayout{});
+    });
     CUDA(cudaGetLastError());
     };
     if (input || output || e.packed || e.condition_sources || e.output_rows) run(PackedFinish(e));

@@ -1,3 +1,4 @@
+#include "ops/kernels/common/storage_dispatch.cuh"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include "ops/kernels/sequence/norm_projection.h"
@@ -385,15 +386,10 @@ void layer_norm( TensorView x, TensorView y, TensorView w, TensorView bias,
     bool register_cached = y.cols <= norm_threads * norm_register_values;
     size_t shared_bytes = !register_cached && y.cols <= norm_cache_bytes / int(sizeof(float))
                               ? size_t(y.cols) * sizeof(float) : 0;
-    if (y.type == Type::BF16)
-        norm_kernel<bf16><<<y.rows, norm_threads, shared_bytes, stream>>>(
+    cuda_kernels::dispatch_storage(y.type, [&](auto storage) {
+        norm_kernel<decltype(storage)><<<y.rows, norm_threads, shared_bytes, stream>>>(
             View(x), View(y), View(w), View(bias), NormalizedInput(f), y.cols, eps, register_cached, DenseRowOutput{});
-    else if (y.type == Type::F16)
-        norm_kernel<__half><<<y.rows, norm_threads, shared_bytes, stream>>>(
-            View(x), View(y), View(w), View(bias), NormalizedInput(f), y.cols, eps, register_cached, DenseRowOutput{});
-    else
-        norm_kernel<float><<<y.rows, norm_threads, shared_bytes, stream>>>(
-            View(x), View(y), View(w), View(bias), NormalizedInput(f), y.cols, eps, register_cached, DenseRowOutput{});
+    });
     CUDA(cudaGetLastError());
 }
 void layer_norm_quantize( TensorView x, RowScaledView q, TensorView w,
