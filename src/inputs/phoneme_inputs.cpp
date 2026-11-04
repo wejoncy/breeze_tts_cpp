@@ -72,13 +72,22 @@ class PhonemeInputs final : public RequestPlanner {
         const int time = limits_.left + limits_.core + limits_.future;
         audio.limits = {batch, definition_.max_audio_frames, context};
         audio.sequence.shape = {batch, time, batch * time};
-        audio.parameters = {{"core_frames", double(limits_.core)}, {"future_frames", double(limits_.future)},
-            {"left_frames", double(limits_.left)}, {"minimum_reference_frames",
-                std::min(double(reference_frames_), config_.at("reference").at("min_seconds").get<double>() *
-                    config_.at("reference").at("mel_sample_rate").get<int>() /
-                    config_.at("reference").at("mel_hop").get<int>())}};
-        definition_.programs.push_back({"waveform", std::move(audio), {"waveform", "audio_layout"},
-                                       ForwardMode::Prefill, ProgramSpec::Replay::Regions});
+        const int minimum_reference = int(std::min(double(reference_frames_),
+            config_.at("reference").at("min_seconds").get<double>() *
+            config_.at("reference").at("mel_sample_rate").get<int>() /
+            config_.at("reference").at("mel_hop").get<int>()));
+        ProgramSpec waveform{"waveform", std::move(audio), {"waveform", "audio_layout"},
+                              ForwardMode::Prefill, ProgramSpec::Replay::Regions};
+        waveform.regions = {
+            {"flow", {reference_frames_ + limits_.core + limits_.future,
+                       reference_frames_ + limits_.core,
+                       minimum_reference + limits_.core + limits_.future,
+                       minimum_reference + limits_.core},
+                std::min(config_.at("synthesis").at("window_frames").get<int>(),
+                         reference_frames_ + definition_.max_audio_frames)},
+            {"vocoder", {limits_.core + limits_.future, limits_.left + limits_.core + limits_.future,
+                          limits_.left + limits_.core}, definition_.max_audio_frames}};
+        definition_.programs.push_back(std::move(waveform));
         InputBatch auxiliary;
         const int tokens = read_json(loader.path("g2pw.json")).at("max_tokens");
         if (tokens < 1 || batch > INT32_MAX / tokens)

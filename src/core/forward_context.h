@@ -61,7 +61,7 @@ struct ForwardContext {
     NamedView<const NamedValue<double>> parameters;
     NamedView<const NamedValue<ArrayView<const TensorView>>> state;
     ArrayView<const TensorRegion> regions;
-    ArrayView<const int> batches;
+    NamedView<const NamedValue<ArrayView<const ForwardShape>>> examples;
     bool allow_replay = true;
     void *executor = nullptr;
     bool (*dispatch)(void *, const ForwardCall &, bool) = nullptr;
@@ -75,6 +75,13 @@ struct ForwardContext {
         result.max_time = sequence.max_length;
         result.max_rows = sequence.rows;
         return result;
+    }
+    template <class Function>
+    bool for_each_shape(std::string_view name, const Function &function) const {
+        if (!examples.contains(name)) return false;
+        const auto shapes = examples[name];
+        for (size_t index = 0; index < shapes.size; ++index) function(shapes[index]);
+        return true;
     }
     template <class Function>
     void run(const void *owner, const char *name, std::initializer_list<int> shape,

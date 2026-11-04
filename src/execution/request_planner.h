@@ -53,6 +53,11 @@ struct ReferencePlan {
     virtual ~ReferencePlan() = default;
 };
 struct ProgramSpec {
+    struct Region {
+        std::string name;
+        std::vector<int> lengths;
+        int maximum_time;
+    };
     enum class Replay { None, Batch, Cache, Regions };
     std::string name;
     InputBatch input;
@@ -60,6 +65,7 @@ struct ProgramSpec {
     ForwardMode mode = ForwardMode::Prefill;
     Replay replay = Replay::None;
     std::string history;
+    std::vector<Region> regions;
 };
 // Construct on the scheduler; move the complete CPU input through the queue.
 struct PreparedTask {

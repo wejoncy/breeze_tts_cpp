@@ -11,28 +11,16 @@ TensorView Vocoder::forward(const TensorBatch &input, TensorView layout, Forward
     if (context.mode == ForwardContext::Execute &&
         (layout.device != -1 || layout.type != Type::I32 || layout.cols != 2 || layout.rows < input.rows))
         throw std::invalid_argument("audio output layout must contain host offset/count pairs");
-    if (context.mode == ForwardContext::Capture) {
-        const int core = int(context.parameters["core_frames"]);
-        const int future = int(context.parameters["future_frames"]);
-        const int left = int(context.parameters["left_frames"]);
-        std::vector<int> times{core + future, left + core + future, left + core};
-        std::sort(times.begin(), times.end(), std::greater<int>());
-        times.erase(std::unique(times.begin(), times.end()), times.end());
-        for (size_t index = context.batches.size; index; --index)
-            for (int time : times) {
-                if (time > context.max_time) continue;
-                Tensor::Scope scratch;
-                const int batch = context.batches[index - 1];
-                auto invocation = context;
-                invocation.max_batch = batch;
-                invocation.max_time = time;
-                invocation.max_rows = batch * time;
-                invocation.batch = ForwardBatch(batch, time);
-                forward(input.chunks.front().values.slice(0, batch * time),
-                    output.slice(0, batch * samples(time)), invocation);
-            }
-        return output;
-    }
+    if (context.for_each_shape("vocoder", [&](ForwardShape shape) {
+        Tensor::Scope scratch;
+        auto invocation = context;
+        invocation.max_batch = shape.batch;
+        invocation.max_time = shape.time;
+        invocation.max_rows = shape.rows;
+        invocation.batch = ForwardBatch(shape.batch, shape.time);
+        forward(input.chunks.front().values.slice(0, shape.rows),
+            output.slice(0, shape.batch * samples(shape.time)), invocation);
+    })) return output;
     int written = 0;
     for (const auto &chunk : input.chunks) {
         Tensor::Scope scratch;
@@ -68,9 +56,8 @@ TensorView Vocoder::forward(TensorView mel, TensorView destination, ForwardConte
         if (workspace.activations[0].data()) prepare(workspace, context.max_batch, context.max_time);
     } else {
         Workspace workspace(*this, context.max_batch, context.max_time);
-        if (context.mode == ForwardContext::Execute || context.mode == ForwardContext::Capture)
-            context.run(this, "vocoder", {context.max_batch, context.max_time},
-                {mel.data, destination.data}, [&] { forward(workspace, mel, destination, context.batch); });
+        context.run(this, "vocoder", {context.max_batch, context.max_time},
+            {mel.data, destination.data}, [&] { forward(workspace, mel, destination, context.batch); });
     }
     return destination;
 }

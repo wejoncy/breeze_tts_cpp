@@ -237,9 +237,30 @@ struct ModelRunner::Impl {
         ForwardContext context(input.limits.batch,
                                 input.limits.time, input.limits.rows);
         context.mode = mode;
+        std::vector<std::vector<ForwardShape>> shapes;
+        std::vector<NamedValue<ArrayView<const ForwardShape>>> examples;
         if (description.replay == ProgramSpec::Replay::Regions) {
-            const auto &batches = runtime.shapes.rows();
-            context.batches = {batches.data(), batches.size()};
+            if (mode == ForwardContext::Capture) {
+                shapes.reserve(description.regions.size());
+                examples.reserve(description.regions.size());
+                for (const auto &region : description.regions) {
+                    auto lengths = region.lengths;
+                    lengths.erase(std::remove_if(lengths.begin(), lengths.end(),
+                        [&](int length) { return length < 1 || length > region.maximum_time; }), lengths.end());
+                    std::sort(lengths.begin(), lengths.end(), std::greater<int>());
+                    lengths.erase(std::unique(lengths.begin(), lengths.end()), lengths.end());
+                    auto &samples = shapes.emplace_back();
+                    const auto &batches = runtime.shapes.rows();
+                    for (auto batch = batches.rbegin(); batch != batches.rend(); ++batch)
+                        for (int length : lengths) {
+                            if (*batch > INT32_MAX / length)
+                                throw std::invalid_argument("graph shape exceeds tensor dimensions");
+                            samples.push_back({*batch, length, *batch * length});
+                        }
+                    examples.push_back({region.name, {samples.data(), samples.size()}});
+                }
+                context.examples = {examples.data(), examples.size()};
+            }
             context.allow_replay = replay;
             context.executor = &runtime.execution.graphs();
             context.dispatch = [](void *executor, const ForwardCall &call, bool capture) {

@@ -11,24 +11,11 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
     auto output = context.tensor({context.max_batch * context.max_time, mel_channels_}, estimator_.type());
     TensorBatch result;
     if (context.mode != ForwardContext::Execute) {
-        if (context.mode == ForwardContext::Capture) {
-            const int core = int(context.parameters["core_frames"]);
-            const int future = int(context.parameters["future_frames"]);
-            const int minimum = int(context.parameters["minimum_reference_frames"]);
-            std::vector<int> times;
-            for (int prefix : {prefix_capacity, minimum})
-                for (int lookahead : {future, 0}) times.push_back(prefix + core + lookahead);
-            std::sort(times.begin(), times.end(), std::greater<int>());
-            times.erase(std::unique(times.begin(), times.end()), times.end());
-            for (size_t index = context.batches.size; index; --index)
-                for (int time : times) {
-                    if (time > maximum_time) continue;
-                    Tensor::Scope scratch;
-                    const int batch = context.batches[index - 1];
-                    Workspace workspace(*this, batch, time);
-                    advance(workspace, ForwardBatch(batch, time), sampling(), {}, context);
-                }
-        }
+        context.for_each_shape("flow", [&](ForwardShape shape) {
+            Tensor::Scope scratch;
+            Workspace workspace(*this, shape.batch, shape.time);
+            advance(workspace, ForwardBatch(shape.batch, shape.time), sampling(), {}, context);
+        });
         Tensor::Scope scratch;
         Workspace workspace(*this, context.mode == ForwardContext::Prepare ? 1 : context.max_batch,
                               context.mode == ForwardContext::Prepare ? 1 : maximum_time);
