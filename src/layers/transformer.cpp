@@ -45,13 +45,6 @@ TransformerEncoder::Workspace::Workspace(const TransformerEncoder &encoder, int 
     lse = Buffer(rows * encoder.heads_ * sizeof(float));
     linear = Linear::Workspace(max_rows, encoder.quant_input_channels_);
 }
-void TransformerEncoder::prepare(int max_rows) const {
-    for (const auto &block : blocks_) {
-        for (const auto *linear : {&block.qkv, &block.out, &block.down})
-            linear->prepare_range(max_rows);
-        block.up.prepare_range(max_rows, block.activation);
-    }
-}
 void TransformerEncoder::prepare(Workspace &workspace, int max_rows) const {
     if (!max_rows) max_rows = workspace.max_rows;
     auto hidden_states = workspace.update.view(1, hidden_, type_);
@@ -66,10 +59,12 @@ void TransformerEncoder::prepare(Workspace &workspace, int max_rows) const {
     }
 }
 TensorView TransformerEncoder::forward(TensorView hidden_states, ForwardContext &context) const {
-    Workspace workspace(*this, context.max_batch, context.max_time,
-                        context.max_rows);
-    if (context.mode == ForwardContext::Prepare)
-        prepare(workspace);
+    Tensor::Scope scratch;
+    const bool preparing = context.mode == ForwardContext::Prepare;
+    Workspace workspace(*this, preparing ? 1 : context.max_batch,
+                         preparing ? 1 : context.max_time, preparing ? 1 : context.max_rows);
+    if (preparing && workspace.projected.data())
+        prepare(workspace, context.max_rows);
     else if (context.mode == ForwardContext::Execute)
         forward(workspace, hidden_states, context.batch);
     return context.batch.output.numel() ? context.batch.output : hidden_states;

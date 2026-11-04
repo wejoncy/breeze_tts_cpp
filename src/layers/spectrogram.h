@@ -1,6 +1,7 @@
 #pragma once
 #include "core/buffer.h"
 #include "core/tensor_storage.h"
+#include "core/forward_context.h"
 
 namespace tts {
 struct SpectrogramConfig {
@@ -18,17 +19,21 @@ class Spectrogram {
     SpectrogramConfig config_;
     Tensor window_, mel_;
     int capacity_;
+    Type type_;
 
-  public:
     struct Workspace {
         Buffer frames, spectrum, magnitude, mel;
         explicit Workspace(const Spectrogram &);
     };
-    Spectrogram(SpectrogramConfig, int max_frames, Device device);
+  public:
+    Spectrogram(SpectrogramConfig, int max_frames, Device device, Type output_type = Type::F32);
     int frames(int samples) const;
     int output_channels() const {
         return config_.mel_channels ? config_.mel_channels : config_.fft / 2 + 1;
     }
+    TensorView forward(TensorView waveform, ForwardContext &) const;
+
+  private:
     void prepare(Workspace &) const;
     void forward(Workspace &, TensorView waveform, int batch, int samples,
                  TensorView output) const;

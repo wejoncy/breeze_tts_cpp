@@ -68,39 +68,23 @@ Bert::Bert(Weights &weights, const Json &cfg, const std::string &prefix, int out
         !std::isfinite(embedding_norm_.epsilon))
         throw std::invalid_argument("BERT embedding norm/configuration mismatch: " + prefix);
 }
-TensorView Bert::forward(Workspace &workspace, const int *ids,
-                         const ForwardBatch &attention) const {
-
-    int batch = attention.batch(), time = attention.time();
-    if (batch < 1 || batch > workspace.encoder.max_batch || time < 1 || time > workspace.encoder.max_time)
-        throw std::invalid_argument("BERT exceeds initialized workspace");
-    int rows = attention.rows();
-    if (attention.sequence.addressing() && !attention.positions)
-        throw std::invalid_argument("packed BERT requires token positions");
-    auto hidden_states = workspace.features.view(rows, encoder_.hidden(), encoder_.type());
-    ops::EmbeddingFusion embedding;
-    embedding.positions = positions_;
-    embedding.segment = segments_;
-    embedding.norm_weight = embedding_norm_.weight;
-    embedding.norm_bias = embedding_norm_.bias;
-    embedding.epsilon = embedding_norm_.epsilon;
-    embedding.sequence_length = time;
-    embedding.position_ids = attention.positions;
-    ops::embedding( words_, ids, hidden_states, embedding);
-    encoder_.forward(workspace.encoder, hidden_states, attention);
-    return hidden_states;
-}
 TensorView Bert::forward(TensorView input_ids, ForwardContext &context) const {
-    if (context.mode == ForwardContext::Prepare) {
-        Workspace workspace(*this, 1, 1, 1);
-        if (workspace.features.data()) encoder_.prepare(workspace.encoder, context.max_rows);
-        return workspace.features.view(1, encoder_.hidden(), encoder_.type());
+    const int rows = context.mode == ForwardContext::Prepare ? 1 : context.batch.rows();
+    const int capacity = context.mode == ForwardContext::Prepare ? 1 : context.max_rows;
+    auto hidden_states = context.tensor({capacity, encoder_.hidden()}, encoder_.type()).slice(0, rows);
+    if (context.mode == ForwardContext::Execute) {
+        if (context.batch.sequence.addressing() && !context.batch.positions)
+            throw std::invalid_argument("packed BERT requires token positions");
+        ops::EmbeddingFusion embedding;
+        embedding.positions = positions_;
+        embedding.segment = segments_;
+        embedding.norm_weight = embedding_norm_.weight;
+        embedding.norm_bias = embedding_norm_.bias;
+        embedding.epsilon = embedding_norm_.epsilon;
+        embedding.sequence_length = context.batch.time();
+        embedding.position_ids = context.batch.positions;
+        ops::embedding(words_, input_ids.ptr<int>(), hidden_states, embedding);
     }
-    Workspace workspace(*this, context.max_batch, context.max_time,
-                        context.max_rows);
-    if (context.mode == ForwardContext::Execute)
-        forward(workspace, input_ids.ptr<int>(), context.batch);
-    return context.batch.output.numel() ? context.batch.output
-        : workspace.features.view(context.batch.rows(), encoder_.hidden(), encoder_.type());
+    return encoder_.forward(hidden_states, context);
 }
 } // namespace tts

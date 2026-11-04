@@ -48,6 +48,14 @@ StyleEncoder::Workspace::Workspace(const StyleEncoder &s, int batch, int time)
     convolution = Buffer(scratch);
     lse = Buffer(rows * s.heads_ * sizeof(float));
 }
+TensorView StyleEncoder::forward(TensorView spectrum, ForwardContext &context) const {
+    auto output = context.tensor({context.batch.batch(), final_.output_channels()}, first_.activation_type());
+    Tensor::Scope scratch;
+    Workspace workspace(*this, context.batch.batch(), context.batch.time());
+    if (context.mode == ForwardContext::Prepare && output.data) prepare(workspace, spectrum);
+    else if (context.mode == ForwardContext::Execute) forward(workspace, spectrum, output, context.batch);
+    return output;
+}
 void StyleEncoder::prepare(Workspace &workspace, TensorView spectrum) const {
     const auto type = first_.activation_type();
     const int hidden = first_.output_channels(), rows = workspace.max_batch * workspace.max_time;

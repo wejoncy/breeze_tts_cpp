@@ -8,28 +8,46 @@
 namespace tts {
 ReferenceEncoder::Output ReferenceEncoder::forward(TensorView waveform, TensorView speech_waveform,
                                                      ForwardContext &context) const {
-    Workspace workspace(*this);
-    if (context.mode == ForwardContext::Execute)
-        return forward(workspace, waveform, speech_waveform);
-    if (context.mode == ForwardContext::Prepare && workspace.projected.data()) {
-        hubert_.prepare(workspace.hubert, max_hubert_samples_);
-        const int frames = hubert_.frames(max_hubert_samples_);
-        const int codes = projection_.geometry().output_length(frames);
-        if (projection_.workspace_bytes(1, frames))
-            projection_.prepare(workspace.hubert.projected.view(1, projection_.geometry().input_channels, type_),
-                workspace.convolution.view(1, projection_.geometry().kernel * projection_.geometry().output_channels,
-                                            Type::F32), frames);
-        ops::prepare_matmul(workspace.projected.view(1, codebook_.cols, type_), codebook_,
-            workspace.scores.view(1, codebook_.rows, type_), false, 0, 2, 1, codes);
-        style_.prepare(workspace.style_encoder, workspace.magnitude.view(1, spectrum_.output_channels(), type_)
-                                                  .columns(0, style_bins_));
-        mel_.prepare(workspace.mel_spectrum);
+    if (waveform.rows < 2 || waveform.rows > max_wave_samples_ || waveform.cols != 1 ||
+        waveform.type != Type::F32 || speech_waveform.rows < 1 || speech_waveform.rows > max_hubert_samples_ ||
+        speech_waveform.cols != 1 || speech_waveform.type != type_)
+        throw std::invalid_argument("reference waveform exceeds initialized capacity");
+    auto speech_context = context;
+    speech_context.batch = ForwardBatch{1, speech_waveform.rows};
+    auto features = hubert_.forward(speech_waveform, speech_context);
+    const int time = projection_.geometry().output_length(features.rows);
+    auto codes = context.tensor({time, 1}, Type::I32);
+    {
+        Tensor::Scope quantization;
+        auto projected = context.tensor({time, codebook_.cols}, type_);
+        auto scores = context.tensor({time, codebook_.rows}, type_);
+        Buffer storage(projection_.workspace_bytes(1, features.rows));
+        TensorView scratch;
+        if (storage.size())
+            scratch = storage.view(features.rows,
+                projection_.geometry().kernel * projection_.geometry().output_channels, Type::F32);
+        if (context.mode == ForwardContext::Prepare && projected.data) {
+            const int maximum_frames = hubert_.frames(max_hubert_samples_);
+            if (projection_.workspace_bytes(1, maximum_frames))
+                projection_.prepare(features.slice(0), scratch.slice(0), maximum_frames);
+            ops::prepare_matmul(projected.slice(0), codebook_, scores.slice(0), false, 0, 2, 1,
+                projection_.geometry().output_length(maximum_frames));
+        } else if (context.mode == ForwardContext::Execute) {
+            projection_.forward(features, projected, ForwardBatch{1, features.rows}, scratch);
+            ops::matmul(projected, codebook_, scores, false, 0, 2);
+            vector_quantize(projected, scores, codebook_, norms_, codes.ptr<int>(), 0, 1, false, true);
+        }
     }
-    const int codes = projection_.geometry().output_length(hubert_.frames(speech_waveform.rows));
-    return {workspace.codes.view(codes, 1, Type::I32),
-            workspace.style.view(1, style_channels_, type_),
-            workspace.mel.view(mel_.frames(waveform.rows), mel_.output_channels(), type_)};
+    auto waveform_context = context;
+    waveform_context.batch = ForwardBatch{1, waveform.rows};
+    auto spectrum = spectrum_.forward(waveform, waveform_context);
+    auto style_context = context;
+    style_context.batch = ForwardBatch{1, spectrum.rows};
+    auto style = style_.forward(spectrum.columns(0, style_bins_), style_context);
+    auto mel = mel_.forward(waveform, waveform_context);
+    return {codes, style, mel};
 }
+
 namespace {
 SpectrogramConfig spectral_config(const Json &configuration, int channels) {
     int fft = configuration.at(channels ? "mel_fft" : "filter_length");
@@ -91,9 +109,9 @@ ReferenceEncoder::ReferenceEncoder(Weights &weights, const std::string &speech_p
       style_(weights, acoustic_prefix + ".ref_enc", acoustic_config.at("style_heads"),
              acoustic_config.at("style_temporal_layers")),
       spectrum_(spectral_config(reference_config, 0),
-                spectral_capacity(reference_config, 0), weights.device()),
+                spectral_capacity(reference_config, 0), weights.device(), projection_.type()),
       mel_(spectral_config(reference_config, mel_channels),
-           spectral_capacity(reference_config, mel_channels), weights.device()),
+           spectral_capacity(reference_config, mel_channels), weights.device(), projection_.type()),
       max_wave_samples_(int(reference_config.at("max_seconds").get<float>() *
                             reference_config.at("sampling_rate").get<int>())),
       max_hubert_samples_(int(reference_config.at("max_seconds").get<float>() *
@@ -101,53 +119,11 @@ ReferenceEncoder::ReferenceEncoder(Weights &weights, const std::string &speech_p
                               reference_config.at("semantic_silence_seconds").get<float>() *
                                   reference_config.at("sampling_rate").get<int>())),
       style_bins_(reference_config.at("style_bins")),
-      style_channels_(acoustic_config.at("gin_channels")), type_(projection_.type()) {
+      type_(projection_.type()) {
     if (reference_config.at("sampling_rate") !=
             reference_config.at("mel_sample_rate") ||
         codebook_.cols != projection_.geometry().output_channels || codebook_.type != type_ ||
         style_bins_ < 1 || style_bins_ > spectrum_.output_channels())
         throw std::invalid_argument("inconsistent reference feature configuration");
-}
-ReferenceEncoder::Workspace::Workspace(const ReferenceEncoder &encoder)
-    : hubert(encoder.hubert_, 1, encoder.max_hubert_samples_),
-      style_encoder(encoder.style_, 1, encoder.spectrum_.frames(encoder.max_wave_samples_)),
-      spectrum(encoder.spectrum_), mel_spectrum(encoder.mel_) {
-    int frames = encoder.hubert_.frames(encoder.max_hubert_samples_);
-    int projected_frames = encoder.projection_.geometry().output_length(frames);
-    projected = Buffer(size_t(projected_frames) * encoder.codebook_.cols * bytes(encoder.type_));
-    convolution = Buffer(encoder.projection_.workspace_bytes(1, frames));
-    scores = Buffer(size_t(projected_frames) * encoder.codebook_.rows * bytes(encoder.type_));
-    codes = Buffer(size_t(projected_frames) * sizeof(int));
-    magnitude = Buffer(size_t(encoder.spectrum_.frames(encoder.max_wave_samples_)) *
-                           encoder.spectrum_.output_channels() * bytes(encoder.type_));
-    style = Buffer(size_t(encoder.style_channels_) * bytes(encoder.type_));
-    mel = Buffer(size_t(encoder.mel_.frames(encoder.max_wave_samples_)) * encoder.mel_.output_channels() *
-                     bytes(encoder.type_));
-}
-ReferenceEncoder::Output ReferenceEncoder::forward(Workspace &workspace, TensorView waveform,
-                                                   TensorView speech_waveform) const {
-    if (waveform.rows < 2 || waveform.rows > max_wave_samples_ || waveform.cols != 1 ||
-        waveform.type != Type::F32 || speech_waveform.rows < 1 || speech_waveform.rows > max_hubert_samples_ ||
-        speech_waveform.cols != 1 || speech_waveform.type != type_)
-        throw std::invalid_argument("reference waveform exceeds initialized capacity");
-    auto features = hubert_.forward(workspace.hubert, speech_waveform, ForwardBatch{1, speech_waveform.rows});
-    int time = projection_.geometry().output_length(features.rows);
-    auto projected = workspace.projected.view(time, codebook_.cols, type_);
-    auto scratch = workspace.convolution.view(
-        features.rows, projection_.geometry().kernel * projection_.geometry().output_channels,
-        Type::F32);
-    projection_.forward(features, projected, ForwardBatch{1, features.rows}, scratch);
-    auto scores = workspace.scores.view(time, codebook_.rows, type_);
-    ops::matmul(projected, codebook_, scores, false, 0, 2);
-    vector_quantize( projected, scores, codebook_, norms_, workspace.codes.ptr<int>(), 0, 1,
-                    false, true);
-    int spec_frames = spectrum_.frames(waveform.rows), mel_frames = mel_.frames(waveform.rows);
-    auto spectrum = workspace.magnitude.view(spec_frames, spectrum_.output_channels(), type_);
-    spectrum_.forward(workspace.spectrum, waveform, 1, waveform.rows, spectrum);
-    auto style = workspace.style.view(1, style_channels_, type_);
-    style_.forward(workspace.style_encoder, spectrum.columns(0, style_bins_), style, ForwardBatch{1, spec_frames});
-    auto mel = workspace.mel.view(mel_frames, mel_.output_channels(), type_);
-    mel_.forward(workspace.mel_spectrum, waveform, 1, waveform.rows, mel);
-    return {workspace.codes.view(time, 1, Type::I32), style, mel};
 }
 } // namespace tts

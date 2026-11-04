@@ -15,8 +15,10 @@ double to_hz(double mel) {
     return mel < 15 ? mel * (200. / 3.) : 1000. * std::exp((mel - 15.) * (std::log(6.4) / 27.));
 }
 } // namespace
-Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device device)
-    : config_(configuration), capacity_(max_frames) {
+Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device device, Type output_type)
+    : config_(configuration), capacity_(max_frames), type_(output_type) {
+    if (output_type != Type::F32 && output_type != Type::F16 && output_type != Type::BF16)
+        throw std::invalid_argument("invalid spectrogram output type");
     if (configuration.fft < 2 || configuration.hop < 1 || configuration.window < 1 || configuration.window > configuration.fft || configuration.padding < 0 ||
         configuration.sample_rate < 1 || configuration.mel_channels < 0 || max_frames < 1 || configuration.min_frequency < 0 ||
         configuration.max_frequency < 0 || configuration.magnitude_epsilon < 0 || !std::isfinite(configuration.min_frequency) ||
@@ -62,6 +64,17 @@ Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device
 }
 int Spectrogram::frames(int samples) const {
     return config_.frames(samples);
+}
+TensorView Spectrogram::forward(TensorView waveform, ForwardContext &context) const {
+    const int batch = context.batch.batch(), samples = context.batch.time(), time = frames(samples);
+    if (batch < 1 || int64_t(batch) * time > capacity_)
+        throw std::invalid_argument("spectrogram exceeds initialized capacity");
+    auto output = context.tensor({batch * time, output_channels()}, type_);
+    Tensor::Scope scratch;
+    Workspace workspace(*this);
+    if (context.mode == ForwardContext::Prepare && output.data) prepare(workspace);
+    else if (context.mode == ForwardContext::Execute) forward(workspace, waveform, batch, samples, output);
+    return output;
 }
 int SpectrogramConfig::frames(int samples) const {
     int64_t padded_samples = int64_t(samples) + 2LL * padding - fft;

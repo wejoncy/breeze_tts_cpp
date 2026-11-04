@@ -12,16 +12,8 @@ class ReferenceEncoder {
     TensorView codebook_, norms_;
     StyleEncoder style_;
     Spectrogram spectrum_, mel_;
-    int max_wave_samples_, max_hubert_samples_, style_bins_, style_channels_;
+    int max_wave_samples_, max_hubert_samples_, style_bins_;
     Type type_;
-
-    struct Workspace {
-        Hubert::Workspace hubert;
-        StyleEncoder::Workspace style_encoder;
-        Spectrogram::Workspace spectrum, mel_spectrum;
-        Buffer projected, convolution, scores, codes, magnitude, style, mel;
-        explicit Workspace(const ReferenceEncoder &);
-    };
 
   public:
     struct Output {
@@ -32,7 +24,5 @@ class ReferenceEncoder {
                      const Json &reference_config, int mel_channels);
     Output forward(TensorView waveform, TensorView speech_waveform, ForwardContext &) const;
 
-  private:
-    Output forward(Workspace &, TensorView wave, TensorView hubert_wave) const;
 };
 } // namespace tts

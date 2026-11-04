@@ -51,28 +51,16 @@ Semantic::Semantic(Weights &weights, const std::string &prefix, const Json &conf
         weights.generated(prefix + ".position_table", positions, context, dim, transformer_.type());
 }
 TensorView Semantic::forward(TensorInputs inputs, ForwardContext &context) const {
-    if (context.mode == ForwardContext::Prepare) {
-        auto hidden_states = context.tensor({1, hidden()}, type());
-        auto logits = context.tensor({1, head_.output_channels()}, type());
-        TransformerEncoder::Workspace workspace(transformer_, 1, 1, 1);
-        if (hidden_states.data) {
-            transformer_.prepare(workspace, context.max_rows);
-            head_.prepare_range(hidden_states, logits, context.max_batch);
-        }
-        return logits;
-    }
-    auto hidden_states = context.tensor({context.max_rows, hidden()}, type())
-                             .slice(0, context.batch.rows());
-    auto logits = context.tensor({context.max_batch, head_.output_channels()}, type())
-                      .slice(0, context.batch.batch());
-    TransformerEncoder::Workspace workspace(transformer_, context.max_batch, context.max_time, context.max_rows);
-    auto attention = context.batch;
-    auto final_states = hidden_states;
-    if (!attention.is_decode()) {
-        final_states = context.tensor({context.max_batch, hidden()}, type())
-                           .slice(0, attention.batch());
-        attention.output = final_states;
-    }
+    const bool preparing = context.mode == ForwardContext::Prepare;
+    auto hidden_states = context.tensor({preparing ? 1 : context.max_rows, hidden()}, type())
+                             .slice(0, preparing ? 1 : context.batch.rows());
+    auto logits = context.tensor({preparing ? 1 : context.max_batch, head_.output_channels()}, type())
+                      .slice(0, preparing ? 1 : context.batch.batch());
+    auto encoder_context = context;
+    auto &attention = encoder_context.batch;
+    if (!attention.is_decode())
+        attention.output = context.tensor({preparing ? 1 : context.max_batch, hidden()}, type())
+                               .slice(0, preparing ? 1 : attention.batch());
     if (context.mode == ForwardContext::Execute) {
 
         ops::EmbeddingFusion embedding;
@@ -102,9 +90,10 @@ TensorView Semantic::forward(TensorInputs inputs, ForwardContext &context) const
             ops::embedding( audio_, inputs["codes"].ptr<int>(), hidden_states,
                            embedding);
         }
-        transformer_.forward(workspace, hidden_states, attention);
-        head_.forward(final_states, logits);
     }
-    return logits;
+    auto final_states = transformer_.forward(hidden_states, encoder_context);
+    auto head_context = context;
+    head_context.max_rows = context.max_batch;
+    return head_.forward(final_states, logits, head_context);
 }
 } // namespace tts

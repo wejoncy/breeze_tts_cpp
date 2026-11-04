@@ -20,7 +20,6 @@ class TransformerEncoder {
     int hidden_, heads_, quant_input_channels_ = 0;
     Type type_;
 
-  public:
     struct Workspace {
         Linear::Workspace linear;
         Buffer projected, attended, update, expanded, lse;
@@ -28,6 +27,7 @@ class TransformerEncoder {
         Workspace(const TransformerEncoder &, int batch, int time,
                   int rows_capacity = 0);
     };
+  public:
     TransformerEncoder(std::vector<EncoderBlock>, int heads);
     int hidden() const {
         return hidden_;
@@ -41,9 +41,10 @@ class TransformerEncoder {
     Type type() const {
         return type_;
     }
-    void prepare(int max_rows) const;
-    void prepare(Workspace &, int max_rows = 0) const;
     TensorView forward(TensorView hidden_states, ForwardContext &) const;
+
+  private:
+    void prepare(Workspace &, int max_rows) const;
     // A nonzero prefix has bidirectional queries followed by a causal suffix.
     void forward(Workspace &, TensorView x, const ForwardBatch &) const;
 };

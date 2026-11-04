@@ -81,89 +81,75 @@ int Hubert::frames(int samples) const {
         samples = c.geometry().output_length(samples);
     return samples;
 }
-Hubert::Workspace::Workspace(const Hubert &h, int batch, int samples)
-    : encoder(h.encoder_, batch, h.frames(samples)), max_batch(batch),
-      max_samples(samples) {
+TensorView Hubert::forward(TensorView waveform, ForwardContext &context) const {
+    const int batch = context.batch.batch(), samples = context.batch.time();
+    if (batch < 1 || samples < 1 || waveform.rows != int64_t(batch) * samples ||
+        waveform.cols != 1 || waveform.type != features_.front().type())
+        throw std::invalid_argument("invalid HuBERT waveform shape/type");
     int time = samples;
     size_t activation_bytes = 0, projection_bytes = 0;
-    for (const auto &c : h.features_) {
-        projection_bytes = std::max(projection_bytes, c.workspace_bytes(batch, time));
-        time = c.geometry().output_length(time);
-        activation_bytes =
-            std::max(activation_bytes,
-                     size_t(batch) * time * c.geometry().output_channels * bytes(c.type()));
-    }
-    projection_bytes = std::max(projection_bytes, h.position_.workspace_bytes(batch, time));
-    activation_bytes = std::max(activation_bytes, size_t(batch) * time * h.encoder_.hidden() *
-                                                      bytes(h.encoder_.type()));
-    for (auto &a : activations)
-        a = Buffer(activation_bytes);
-    projected =
-        Buffer(size_t(batch) * time * h.encoder_.hidden() * bytes(h.encoder_.type()));
-    convolution = Buffer(projection_bytes);
-    statistics =
-        Buffer(size_t(batch) * h.features_.front().geometry().output_channels * 2 * sizeof(float));
-}
-void Hubert::prepare(Workspace &workspace, int max_samples) const {
-    int time = max_samples;
     for (const auto &convolution : features_) {
+        projection_bytes = std::max(projection_bytes, convolution.workspace_bytes(batch, time));
+        time = convolution.geometry().output_length(time);
+        activation_bytes = std::max(activation_bytes,
+            size_t(batch) * time * convolution.geometry().output_channels * bytes(convolution.type()));
+    }
+    projection_bytes = std::max(projection_bytes, position_.workspace_bytes(batch, time));
+    activation_bytes = std::max(activation_bytes,
+        size_t(batch) * time * encoder_.hidden() * bytes(encoder_.type()));
+    auto projected = context.tensor({batch * time, encoder_.hidden()}, encoder_.type());
+    Tensor::Scope scratch;
+    Buffer activations[] = {Buffer(activation_bytes), Buffer(activation_bytes)};
+    Buffer convolution_storage(projection_bytes);
+    Buffer statistics(size_t(batch) * features_.front().geometry().output_channels * 2 * sizeof(float));
+    time = samples;
+    auto hidden_states = waveform;
+    for (size_t layer_index = 0; layer_index < features_.size(); ++layer_index) {
+        const auto &convolution = features_[layer_index];
         const auto geometry = convolution.geometry();
-        if (convolution.workspace_bytes(1, time))
-            convolution.prepare(workspace.activations[0].view(1, geometry.input_channels, convolution.type()),
-                workspace.convolution.view(1, geometry.kernel * geometry.output_channels, Type::F32), time);
-        time = geometry.output_length(time);
-    }
-    projection_.prepare_range(workspace.activations[0].view(1, projection_.input_channels(), encoder_.type()),
-        workspace.projected.view(1, projection_.output_channels(), encoder_.type()), time);
-    const auto geometry = position_.geometry();
-    if (position_.workspace_bytes(1, time))
-        position_.prepare(workspace.projected.view(1, geometry.input_channels, position_.type()),
-            workspace.convolution.view(1, geometry.kernel * geometry.output_channels, Type::F32), time);
-    encoder_.prepare(workspace.encoder, time);
-}
-TensorView Hubert::forward(Workspace &w, TensorView waveform, const ForwardBatch &input) const {
-
-    int batch = input.batch(), samples = input.time();
-    if (batch < 1 || batch > w.max_batch || samples < 1 || samples > w.max_samples ||
-        waveform.rows != int64_t(batch) * samples || waveform.cols != 1)
-        throw std::invalid_argument("HuBERT waveform exceeds initialized workspace");
-    int time = samples;
-    TensorView x = waveform;
-    for (size_t i = 0; i < features_.size(); ++i) {
-        const auto &c = features_[i];
-        int output = c.geometry().output_length(time), channels = c.geometry().output_channels;
-        auto y = w.activations[i % 2].view(batch * output, channels, c.type());
-        ops::Epilogue e;
-        if (i)
-            e.activation = ops::Activation::Gelu;
+        const int output_time = geometry.output_length(time), channels = geometry.output_channels;
+        auto output = activations[layer_index % 2].view(batch * output_time, channels, convolution.type());
         TensorView projection;
-        if (c.workspace_bytes(batch, time))
-            projection =
-                w.convolution.view(batch * time, c.geometry().kernel * channels, Type::F32);
-        c.forward(x, y, ForwardBatch{batch, time}, projection, e);
-        if (!i)
-            ops::temporal_norm( y, y, temporal_weight_, temporal_bias_, batch, output,
-                               1.e-5f, ops::Activation::Gelu,
-                               w.statistics.view(batch, 2 * channels, Type::F32));
-        time = output;
-        x = y;
+        if (convolution.workspace_bytes(batch, time))
+            projection = convolution_storage.view(batch * time, geometry.kernel * channels, Type::F32);
+        if (context.mode == ForwardContext::Prepare && projection.data)
+            convolution.prepare(hidden_states.slice(0), projection.slice(0), batch * time);
+        if (context.mode == ForwardContext::Execute) {
+            ops::Epilogue activation;
+            if (layer_index) activation.activation = ops::Activation::Gelu;
+            convolution.forward(hidden_states, output, ForwardBatch{batch, time}, projection, activation);
+            if (!layer_index)
+                ops::temporal_norm(output, output, temporal_weight_, temporal_bias_, batch, output_time,
+                    1.e-5f, ops::Activation::Gelu, statistics.view(batch, 2 * channels, Type::F32));
+        }
+        time = output_time;
+        hidden_states = output;
     }
-    ops::layer_norm( x, x, feature_norm_.weight, feature_norm_.bias,
-                    feature_norm_.epsilon);
-    auto projected = w.projected.view(batch * time, encoder_.hidden(), encoder_.type());
-    projection_.forward(x, projected);
-    auto position = w.activations[0].view(batch * time, encoder_.hidden(), encoder_.type());
-    ops::Epilogue e;
-    e.activation = ops::Activation::Gelu;
-    position_.forward(projected, position, ForwardBatch{batch, time},
-                      w.convolution.view(
-                          batch * time, position_.geometry().kernel * encoder_.hidden(), Type::F32),
-                      e);
-    ops::NormFusion f;
-    f.residual = projected;
-    ops::layer_norm( position, projected, input_norm_.weight, input_norm_.bias,
-                    input_norm_.epsilon, f);
-    encoder_.forward(w.encoder, projected, {batch, time});
-    return projected;
+    if (context.mode == ForwardContext::Execute)
+        ops::layer_norm(hidden_states, hidden_states, feature_norm_.weight, feature_norm_.bias,
+                         feature_norm_.epsilon);
+    auto encoder_context = context;
+    encoder_context.batch = ForwardBatch{batch, time};
+    encoder_context.max_batch = batch;
+    encoder_context.max_time = time;
+    encoder_context.max_rows = batch * time;
+    projection_.forward(hidden_states, projected, encoder_context);
+    auto position = activations[0].view(batch * time, encoder_.hidden(), encoder_.type());
+    TensorView projection;
+    if (position_.workspace_bytes(batch, time))
+        projection = convolution_storage.view(batch * time,
+            position_.geometry().kernel * encoder_.hidden(), Type::F32);
+    if (context.mode == ForwardContext::Prepare && projection.data)
+        position_.prepare(projected.slice(0), projection.slice(0), batch * time);
+    if (context.mode == ForwardContext::Execute) {
+        ops::Epilogue activation;
+        activation.activation = ops::Activation::Gelu;
+        position_.forward(projected, position, encoder_context.batch, projection, activation);
+        ops::NormFusion normalization;
+        normalization.residual = projected;
+        ops::layer_norm(position, projected, input_norm_.weight, input_norm_.bias,
+                         input_norm_.epsilon, normalization);
+    }
+    return encoder_.forward(projected, encoder_context);
 }
 } // namespace tts
