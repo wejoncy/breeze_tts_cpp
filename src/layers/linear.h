@@ -90,6 +90,15 @@ class Linear {
     }
     TensorView forward(TensorView input, TensorView output, ForwardContext &context,
                         const ops::Epilogue &finish = {}) const {
+        return apply_context(input, output, context, bias_, finish);
+    }
+    TensorView project(TensorView input, TensorView output, ForwardContext &context) const {
+        return apply_context(input, output, context, {}, {});
+    }
+
+  private:
+    TensorView apply_context(TensorView input, TensorView output, ForwardContext &context,
+                             TensorView bias, const ops::Epilogue &finish) const {
         if (input.rows < 1 || input.rows > context.max_rows || input.cols != input_channels() ||
             input.type != activation_type_ || output.rows != input.rows ||
             output.cols != output_channels() || output.type != activation_type_)
@@ -98,9 +107,11 @@ class Linear {
         if (context.mode == ForwardContext::Prepare && input.data && output.data)
             prepare_range(input, output, context.max_rows, finish.activation);
         else if (context.mode == ForwardContext::Execute)
-            forward(workspace, input, output, finish);
+            apply(input, output, bias, finish, &workspace);
         return output;
     }
+
+  public:
     TensorView forward_segments(TensorView input, TensorView segments, TensorView output,
                                  ForwardContext &context) const {
         Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0);

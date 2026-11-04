@@ -10,15 +10,12 @@ Acoustic::Output Acoustic::forward(TensorView codes, TensorView phones, TensorVi
         codes.cols != 1 || phones.cols != 1 || codes.rows < 1 || phones.rows < 1 ||
         codes.rows % batch || phones.rows % batch)
         throw std::invalid_argument("acoustic token tensor shape/type mismatch");
-    Workspace workspace(*this, context.max_batch, context.max_time, context.max_rows);
     const auto layout = describe(batch, codes.rows / batch, phones.rows / batch);
-    auto features = workspace.features.view(layout.features.rows, bridge_.output_channels(), type_);
-    if (context.mode == ForwardContext::Prepare && workspace.ssl.data())
-        prepare(workspace);
-    else if (context.mode == ForwardContext::Execute)
-        forward(workspace, codes.ptr<int>(), phones.ptr<int>(), style, features, layout);
-    return {features, workspace.waveform_features.condition.view(
-                          batch, waveform_features_.condition_channels(), type_)};
+    auto features = context.tensor({layout.features.rows, bridge_.output_channels()}, type_);
+    auto condition = waveform_features_.condition(style, context);
+    Tensor::Scope intermediate;
+    forward(codes.ptr<int>(), phones.ptr<int>(), style, features, layout, context, condition);
+    return {features, condition};
 }
 Acoustic::Acoustic(Weights &w, const std::string &prefix, const Json &cfg)
     : phones_(w.get(prefix + ".enc_p.text_embedding.weight")),
@@ -55,66 +52,6 @@ Acoustic::Acoustic(Weights &w, const std::string &prefix, const Json &cfg)
         project.forward(codebook, output);
     });
 }
-namespace {
-int acoustic_rows(int batch, int time) {
-    if (batch < 1 || time < 1 || int64_t(batch) * time > INT32_MAX)
-        throw std::invalid_argument("invalid acoustic capacity");
-    return batch * time;
-}
-}
-Acoustic::Capacity Acoustic::checked_capacity(Capacity capacity, int repeat) {
-    if (capacity.sequences < 1 || capacity.codes < 1 || capacity.phones < 1 ||
-        capacity.frames < 1 || capacity.frames % repeat)
-        throw std::invalid_argument("invalid acoustic capacity");
-    return capacity;
-}
-Acoustic::Workspace::Workspace(const Acoustic &a, int batch, int codes, int phones, int frames)
-    : Workspace(a, Capacity{batch, acoustic_rows(batch, codes), acoustic_rows(batch, phones),
-                            acoustic_rows(batch, frames ? frames : a.feature_frames(codes))}) {}
-Acoustic::Workspace::Workspace(const Acoustic &a, Capacity cap)
-    : ssl_encoder(a.ssl_encoder_, 1, a.hidden_frames(checked_capacity(cap, a.rate_.feature_repeat).codes)),
-      text_encoder(a.text_encoder_, 1, cap.phones),
-      output_encoder(a.output_encoder_, 1, a.hidden_frames(cap.codes)),
-      waveform_features(a.waveform_features_, 1, cap.frames, cap.sequences),
-      max_batch(cap.sequences), max_codes(cap.codes), max_phones(cap.phones), max_frames(cap.frames) {
-    ssl_encoder.max_batch = text_encoder.max_batch = output_encoder.max_batch = cap.sequences;
-    size_t rows = a.hidden_frames(cap.codes), phone_rows = cap.phones;
-    size_t resized_rows = cap.frames / a.rate_.feature_repeat;
-    auto tensor = [&](size_t n, int width) {
-        return Buffer(n * width * bytes(a.type_));
-    };
-    ssl = tensor(rows, a.content_.input_channels());
-    text = tensor(phone_rows, a.text_.input_channels());
-    content = Buffer(std::max(rows * a.content_.output_channels(),
-                              resized_rows * a.content_out_.output_channels()) * bytes(a.type_));
-    projected_text = tensor(phone_rows, a.text_.output_channels());
-    query = tensor(rows, a.query_.output_channels());
-    key_value = tensor(phone_rows, a.key_value_.output_channels());
-    attended = tensor(rows, a.query_.output_channels());
-    update = tensor(std::max(rows, resized_rows), a.attention_out_.output_channels());
-    if (a.bridge_.output_channels() != a.attention_out_.output_channels())
-        throw std::invalid_argument("acoustic bridge scratch width mismatch");
-    features = tensor(cap.frames, a.bridge_.output_channels());
-    lse = Buffer(rows * a.heads_ * sizeof(float));
-}
-void Acoustic::prepare(Workspace &w) const {
-    int rows = hidden_frames(w.max_codes), resized = w.max_frames / rate_.feature_repeat;
-    ssl_encoder_.prepare(w.ssl_encoder, rows);
-    text_encoder_.prepare(w.text_encoder, w.max_phones);
-    output_encoder_.prepare(w.output_encoder, rows);
-    auto plan = [&](const Linear &l, Buffer &input, Buffer &output, int maximum) {
-        l.prepare_range(input.view(1, l.input_channels(), type_),
-                         output.view(1, l.output_channels(), type_), maximum);
-    };
-    plan(content_, w.ssl, w.content, rows);
-    plan(query_, w.content, w.query, rows);
-    plan(text_, w.text, w.projected_text, w.max_phones);
-    plan(key_value_, w.projected_text, w.key_value, w.max_phones);
-    plan(attention_out_, w.attended, w.update, rows);
-    plan(content_out_, w.content, w.ssl, rows);
-    plan(bridge_, w.content, w.update, resized);
-    waveform_features_.prepare(w.waveform_features, w.max_frames);
-}
 Acoustic::Batch Acoustic::describe(int batch, int codes, int phones, double speed) const {
     Batch input;
     input.phones = SequenceLayout::uniform(batch, phones);
@@ -122,122 +59,129 @@ Acoustic::Batch Acoustic::describe(int batch, int codes, int phones, double spee
     input.resized = SequenceLayout::uniform(batch, hidden_frames(codes, speed));
     input.features = SequenceLayout::uniform(batch, feature_frames(codes, speed));
     input.resample = input.hidden.max_length != input.resized.max_length;
-    input.valid_frames = valid_frames(codes, speed);
     return input;
 }
-void Acoustic::prepare_text(Workspace &w, const int *phones, TensorView condition,
-                            const Batch &input) const {
-
-    ForwardBatch text_batch(input.phones);
-    int rows = text_batch.rows();
-    if ((!phones && !input.phone_ids) || !condition.data ||
-        text_batch.batch() > w.max_batch || rows > w.max_phones || condition.rows != rows ||
-        condition.cols != text_condition_channels() || condition.type != type_)
-        throw std::invalid_argument("acoustic text exceeds initialized workspace");
-    auto text = w.text.view(rows, text_.input_channels(), type_);
-    ops::EmbeddingFusion f;
-    f.sequence_length = rows;
-    f.id_rows = input.phone_ids;
-    ops::embedding( phones_, phones, text, f);
-    text_encoder_.forward(w.text_encoder, text, text_batch);
-    auto projected = w.projected_text.view(rows, text_.output_channels(), type_);
-    text_.forward(text, projected);
-    ops::Epilogue e;
-    e.output_rows = input.text_outputs;
-    key_value_.forward(projected, condition, e);
+TensorView Acoustic::encode_text(const int *phones, const Batch &input,
+                                  ForwardContext &context) const {
+    auto text_context = context.with_sequence(input.phones);
+    const int rows = text_context.batch.rows();
+    if (context.mode == ForwardContext::Execute && !phones && !input.phone_ids)
+        throw std::invalid_argument("acoustic text requires phone IDs");
+    auto condition = context.tensor({rows, text_condition_channels()}, type_);
+    Tensor::Scope scratch;
+    auto text = context.tensor({rows, text_.input_channels()}, type_);
+    if (context.mode == ForwardContext::Execute) {
+        ops::EmbeddingFusion embedding;
+        embedding.sequence_length = rows;
+        embedding.id_rows = input.phone_ids;
+        ops::embedding(phones_, phones, text, embedding);
+    }
+    text_encoder_.forward(text, text_context);
+    auto projected = text_.forward(text, text_context);
+    ops::Epilogue routing;
+    routing.output_rows = input.text_outputs;
+    key_value_.forward(projected, condition, text_context, routing);
+    return condition;
 }
-void Acoustic::forward(Workspace &w, const int *codes, const int *phones,
-                       TensorView style, TensorView features, const Batch &input,
-                       TensorView text_condition) const {
-
-    ForwardBatch hidden_batch(input.hidden), feature_batch(input.features);
-    int batch = hidden_batch.batch(), time = hidden_batch.time(), rows = hidden_batch.rows();
-    int phone_count = input.phones.max_length, phone_rows = input.phones.rows;
-    int feature_rows = feature_batch.rows();
-    if ((!codes && !input.code_ids) || batch > w.max_batch ||
-        rows % rate_.semantic_repeat || rows / rate_.semantic_repeat > w.max_codes ||
-        input.phones.sequences != batch || input.resized.sequences != batch ||
+void Acoustic::forward(const int *codes, const int *phones, TensorView style,
+                       TensorView features, const Batch &input, ForwardContext &context,
+                       TensorView condition) const {
+    auto hidden_context = context.with_sequence(input.hidden);
+    const int batch = input.hidden.sequences, time = input.hidden.max_length, rows = input.hidden.rows;
+    const int phone_count = input.phones.max_length, phone_rows = input.phones.rows;
+    const bool execute = context.mode == ForwardContext::Execute;
+    if (input.phones.sequences != batch || input.resized.sequences != batch ||
         input.features.sequences != batch || phone_count < 1 || phone_rows < 1 ||
-        phone_rows > w.max_phones || (!input.styles &&
-        (style.rows != batch || style.cols != content_.output_channels() || style.type != type_)) ||
-        feature_rows > w.max_frames || features.rows != feature_rows ||
-        features.cols != bridge_.output_channels() || features.type != type_ ||
-        (text_condition.data && (text_condition.rows != phone_rows ||
-         text_condition.cols != text_condition_channels() || text_condition.type != type_)) ||
+        (!input.styles && (style.rows != batch || style.cols != content_.output_channels() || style.type != type_)) ||
+        features.rows != input.features.rows || features.cols != bridge_.output_channels() || features.type != type_ ||
+        (execute && !codes && !input.code_ids) ||
         (input.text_keys && (!input.text_values || !input.cross_attention)))
-        throw std::invalid_argument("acoustic input exceeds initialized workspace");
-    auto ssl = w.ssl.view(rows, content_.input_channels(), type_);
-    ops::EmbeddingFusion f;
-    f.sequence_length = rows;
-    f.id_rows = input.code_ids;
-    f.input_repeat = rate_.semantic_repeat;
-    ops::embedding( projected_codebook_.view(), codes, ssl, f);
-    ssl_encoder_.forward(w.ssl_encoder, ssl, hidden_batch);
-    if (!text_condition.data) {
-        text_condition = w.key_value.view(phone_rows, text_condition_channels(), type_);
-        if (!input.text_keys) prepare_text(w, phones, text_condition, input);
+        throw std::invalid_argument("invalid acoustic batch geometry");
+    Tensor::Scope intermediate;
+    auto ssl = context.tensor({rows, content_.input_channels()}, type_);
+    if (execute) {
+        ops::EmbeddingFusion embedding;
+        embedding.sequence_length = rows;
+        embedding.id_rows = input.code_ids;
+        embedding.input_repeat = rate_.semantic_repeat;
+        ops::embedding(projected_codebook_.view(), codes, ssl, embedding);
     }
-    auto content = w.content.view(rows, content_.output_channels(), type_);
-    content_.forward(ssl, content);
-    auto query = w.query.view(rows, query_.output_channels(), type_);
-    query_.forward(content, query);
-    auto attended = w.attended.view(rows, query.cols, type_);
-    DenseAttentionLayout attention{0, 0, input.cross_attention, input.text_keys, input.text_values};
-    if (!input.cross_attention) {
-        attention.cu_seqlens_q = input.hidden.cu_seqlens;
-        attention.cu_seqlens_k = input.phones.cu_seqlens;
+    ssl_encoder_.forward(ssl, hidden_context);
+    {
+        Tensor::Scope attention_scratch;
+        auto text_condition = input.text_keys
+            ? context.tensor({phone_rows, text_condition_channels()}, type_)
+            : encode_text(phones, input, context);
+        auto content = content_.forward(ssl, hidden_context);
+        auto query = query_.forward(content, hidden_context);
+        auto attended = context.tensor({rows, query.cols}, type_);
+        auto lse = context.tensor({rows, heads_}, Type::F32);
+        if (execute) {
+            DenseAttentionLayout attention{0, 0, input.cross_attention, input.text_keys, input.text_values};
+            if (!input.cross_attention) {
+                attention.cu_seqlens_q = input.hidden.cu_seqlens;
+                attention.cu_seqlens_k = input.phones.cu_seqlens;
+            }
+            dense_attention(query, text_condition.columns(0, query.cols),
+                text_condition.columns(query.cols, query.cols), attended, lse.ptr<float>(),
+                batch, time, phone_count, heads_, query.cols / heads_, false, 0, attention);
+        }
+        auto update = context.tensor({rows, attention_out_.output_channels()}, type_);
+        attention_out_.project(attended, update, hidden_context);
+        if (execute) {
+            ops::Epilogue fusion;
+            fusion.bias = attention_out_.bias();
+            fusion.residual = content;
+            fusion.condition = style;
+            fusion.condition_sources = input.styles;
+            fusion.packed = input.hidden.addressing();
+            fusion.rows_per_sequence = time;
+            ops::pointwise(update, content, fusion);
+        }
+        content_out_.forward(content, ssl, hidden_context);
     }
-    dense_attention( query, text_condition.columns(0, query.cols),
-                    text_condition.columns(query.cols, query.cols), attended, w.lse.ptr<float>(),
-                    batch, time, phone_count, heads_, query.cols / heads_, false, 0, attention);
-    auto update = w.update.view(rows, attention_out_.output_channels(), type_);
-    attention_out_.project(attended, update);
-    ops::Epilogue e;
-    e.bias = attention_out_.bias();
-    e.residual = content;
-    e.condition = style;
-    e.condition_sources = input.styles;
-    e.packed = input.hidden.addressing();
-    e.rows_per_sequence = time;
-    ops::pointwise( update, content, e);
-    content_out_.forward(content, ssl);
-    output_encoder_.forward(w.output_encoder, ssl, hidden_batch);
-    int resized_time = input.resized.max_length, resized_rows = input.resized.rows;
+    output_encoder_.forward(ssl, hidden_context);
+    auto resized_context = context.with_sequence(input.resized);
     if (input.resample) {
-        auto resized = w.content.view(resized_rows, ssl.cols, type_);
-        ops::linear_resample( ssl, resized, batch, time, resized_time,
-                             input.hidden.addressing(), input.resized.addressing());
+        auto resized = context.tensor({input.resized.rows, ssl.cols}, type_);
+        if (execute)
+            ops::linear_resample(ssl, resized, batch, time, input.resized.max_length,
+                                 input.hidden.addressing(), input.resized.addressing());
         ssl = resized;
     }
-    update = w.update.view(resized_rows, bridge_.output_channels(), type_);
-    bridge_.project(ssl, update);
-    e = {};
-    e.bias = bridge_.bias();
-    e.activation = ops::Activation::LeakyRelu;
-    e.alpha = .01f;
-    e.input_repeat = rate_.feature_repeat;
-    ops::pointwise( update, features, e);
-    waveform_features_.forward(w.waveform_features, features, style, features, feature_batch,
-                               input.valid_frames, input.conditions, input.feature_outputs);
+    auto update = context.tensor({input.resized.rows, bridge_.output_channels()}, type_);
+    bridge_.project(ssl, update, resized_context);
+    if (execute) {
+        ops::Epilogue activation;
+        activation.bias = bridge_.bias();
+        activation.activation = ops::Activation::LeakyRelu;
+        activation.alpha = .01f;
+        activation.input_repeat = rate_.feature_repeat;
+        ops::pointwise(update, features, activation);
+    }
+    auto feature_context = context.with_sequence(input.features);
+    waveform_features_.forward(features, input.conditions.numel() ? input.conditions : condition,
+        features, feature_context, input.feature_outputs);
 }
-} // namespace tts
-
-namespace tts {
 TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) const {
     TensorBatch result;
     result.rows = context.max_batch;
-    Workspace workspace(*this, Capacity{context.max_batch, context.max_rows, context.max_rows,
-                                        feature_capacity(context.max_rows)});
-    if (context.mode == ForwardContext::Prepare && workspace.ssl.data()) prepare(workspace);
+    const int max_codes = context.max_rows, max_phones = context.max_rows;
+    const int max_frames = feature_capacity(max_codes);
     if (context.mode != ForwardContext::Execute) {
-
-        for (int rows : {workspace.max_phones, hidden_frames(workspace.max_codes),
-                         workspace.max_frames, workspace.max_frames})
+        for (int rows : {max_phones, hidden_frames(max_codes), max_frames, max_frames})
             Tensor::reserve((size_t(rows) * 2 + size_t(context.max_batch) * 2 + 1) * sizeof(int));
         Tensor::reserve(size_t(context.max_batch) * sizeof(AttentionSequence));
-        Tensor::reserve(size_t(workspace.max_codes + workspace.max_phones +
-                                 workspace.max_frames) * sizeof(void *));
+        Tensor::reserve(size_t(max_codes + max_phones + max_frames) * sizeof(void *));
         Tensor::reserve(size_t(context.max_batch) * 4 * sizeof(void *));
+        auto layout = describe(1, max_codes, max_phones);
+        layout.resized = SequenceLayout::uniform(1, max_frames / rate_.feature_repeat);
+        layout.features = SequenceLayout::uniform(1, max_frames);
+        layout.conditions = TensorView::metadata(1, 1, Type::I64);
+        layout.resample = layout.hidden.rows != layout.resized.rows;
+        auto features = context.tensor({max_frames, bridge_.output_channels()}, type_);
+        forward(nullptr, nullptr, TensorView::metadata(1, content_.output_channels(), type_),
+                features, layout, context);
         return result;
     }
     const auto generated = inputs["generated"];
@@ -256,7 +200,7 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
     };
     for (int first = 0; first < batch;) {
         SequenceBuilder phone_layout;
-        phone_layout.reserve(context.max_batch, workspace.max_phones);
+        phone_layout.reserve(context.max_batch, max_phones);
         std::vector<const int *> phone_ids;
         std::vector<void *> destinations;
         std::vector<int> members;
@@ -264,9 +208,9 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
         while (next < batch) {
             if (*text_ready[next].ptr<int>()) { ++next; continue; }
             const int count = phones.ptr<int>()[next];
-            if (count < 1 || count > workspace.max_phones)
+            if (count < 1 || count > max_phones)
                 throw std::invalid_argument("acoustic text exceeds the declared token capacity");
-            if (count > workspace.max_phones - phone_layout.rows() && !members.empty()) break;
+            if (count > max_phones - phone_layout.rows() && !members.empty()) break;
             phone_layout.append(count, count);
             for (int row = 0; row < count; ++row) {
                 phone_ids.push_back(state_phones[next].ptr<int>() + row);
@@ -280,18 +224,17 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
             layout.phones = upload_sequence(context, phone_layout);
             layout.phone_ids = upload(phone_ids.data(), int(phone_ids.size()), 1, Type::I64).ptr<const int *>();
             layout.text_outputs = upload(destinations.data(), int(destinations.size()), 1, Type::I64).ptr<void *>();
-            prepare_text(workspace, nullptr,
-                workspace.key_value.view(phone_layout.rows(), text_condition_channels(), type_), layout);
+            encode_text(nullptr, layout, context);
             for (int member : members) *text_ready[member].ptr<int>() = 1;
         }
         first = next;
     }
     for (int first = 0; first < batch;) {
         SequenceBuilder phone_layout, hidden_layout, resized_layout, feature_layout;
-        phone_layout.reserve(context.max_batch, workspace.max_phones);
-        hidden_layout.reserve(context.max_batch, hidden_frames(workspace.max_codes));
-        resized_layout.reserve(context.max_batch, workspace.max_frames);
-        feature_layout.reserve(context.max_batch, workspace.max_frames);
+        phone_layout.reserve(context.max_batch, max_phones);
+        hidden_layout.reserve(context.max_batch, hidden_frames(max_codes));
+        resized_layout.reserve(context.max_batch, max_frames);
+        feature_layout.reserve(context.max_batch, max_frames);
         std::vector<AttentionSequence> attention;
         std::vector<const int *> code_ids;
         std::vector<const void *> style_rows, condition_rows, keys, values;
@@ -304,9 +247,9 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
             const int phone_count = phones.ptr<int>()[next];
             const double speed = speeds.ptr<double>()[next];
             const int frame_count = feature_frames(count, speed);
-            const bool fits = count <= workspace.max_codes - code_count &&
-                phone_count <= workspace.max_phones - phone_layout.rows() &&
-                frame_count <= workspace.max_frames - feature_layout.rows();
+            const bool fits = count <= max_codes - code_count &&
+                phone_count <= max_phones - phone_layout.rows() &&
+                frame_count <= max_frames - feature_layout.rows();
             if (!fits) {
                 if (members.empty()) throw std::invalid_argument("acoustic sequence exceeds its workspace capacity");
                 break;
@@ -336,13 +279,13 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
             layout.cross_attention = upload(attention.data(), int(attention.size()), sizeof(AttentionSequence), Type::I8).ptr<AttentionSequence>();
             layout.code_ids = upload(code_ids.data(), int(code_ids.size()), 1, Type::I64).ptr<const int *>();
             layout.styles = upload(style_rows.data(), int(style_rows.size()), 1, Type::I64).ptr<const void *>();
-            layout.conditions = upload(condition_rows.data(), int(condition_rows.size()), 1, Type::I64).ptr<const void *>();
+            layout.conditions = upload(condition_rows.data(), int(condition_rows.size()), 1, Type::I64);
             layout.text_keys = upload(keys.data(), int(keys.size()), 1, Type::I64).ptr<const void *>();
             layout.text_values = upload(values.data(), int(values.size()), 1, Type::I64).ptr<const void *>();
-            layout.feature_outputs = upload(destinations.data(), int(destinations.size()), 1, Type::I64).ptr<void *>();
+            layout.feature_outputs = upload(destinations.data(), int(destinations.size()), 1, Type::I64);
             layout.resample = !hidden_layout.same_extents(resized_layout);
-            forward(workspace, nullptr, nullptr, {},
-                workspace.features.view(feature_layout.rows(), features[0].cols, type_), layout);
+            auto output = context.tensor({feature_layout.rows(), features[0].cols}, type_);
+            forward(nullptr, nullptr, {}, output, layout, context);
             for (int member : members) *feature_tokens[member].ptr<int>() = generated.ptr<int>()[member];
         }
         first = next;

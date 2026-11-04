@@ -68,6 +68,14 @@ struct ForwardContext {
     int max_batch, max_time, max_rows;
     ForwardContext(int batches, int time, int rows)
         : max_batch(batches), max_time(time), max_rows(rows) {}
+    ForwardContext with_sequence(SequenceLayout sequence) const {
+        auto result = *this;
+        result.batch = ForwardBatch(sequence);
+        result.max_batch = sequence.sequences;
+        result.max_time = sequence.max_length;
+        result.max_rows = sequence.rows;
+        return result;
+    }
     template <class Function>
     void run(const void *owner, const char *name, std::initializer_list<int> shape,
              std::initializer_list<const void *> buffers, const Function &function) const {

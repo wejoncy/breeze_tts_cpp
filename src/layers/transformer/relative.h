@@ -15,13 +15,17 @@ class RelativeEncoder {
     int hidden_, heads_;
     Type type_;
 
-  public:
     struct Workspace {
         Buffer projected, attended, update, expanded, scratch;
         int max_batch, max_time, max_rows;
-        Workspace(const RelativeEncoder &, int batch, int time);
+        Workspace(const RelativeEncoder &, const ForwardContext &);
     };
+
+  public:
     RelativeEncoder(Weights &, const std::string &, int layers, int heads);
+    TensorView forward(TensorView input, ForwardContext &) const;
+
+  private:
     void prepare(Workspace &, int rows) const;
     void forward(Workspace &, TensorView x, const ForwardBatch &) const;
 };

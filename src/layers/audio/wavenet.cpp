@@ -24,30 +24,43 @@ WaveNet::WaveNet(Weights &w, const std::string &prefix, int layers, int dilation
         dilation *= dilation_rate;
     }
 }
-WaveNet::Workspace::Workspace(const WaveNet &n, int batch, int time, int sequences)
-    : max_batch(sequences ? sequences : batch), max_time(time), max_rows(int64_t(batch) * time) {
-    if (batch < 1 || time < 1 || int64_t(batch) * time > INT32_MAX)
+WaveNet::Workspace::Workspace(const WaveNet &network, const ForwardContext &context)
+    : max_batch(context.max_batch), max_time(context.max_time), max_rows(context.max_rows) {
+    if (max_batch < 1 || max_time < 1 || max_rows < 1)
         throw std::invalid_argument("invalid WaveNet workspace");
-    int width = n.pre_.output_channels();
-    Type type = n.pre_.activation_type();
-    size_t rows = size_t(batch) * time;
-    hidden = Buffer(rows * width * bytes(type));
+    const int width = network.pre_.output_channels();
+    const auto type = network.pre_.activation_type();
+    hidden = Buffer(size_t(max_rows) * width * bytes(type));
     skip = Buffer(hidden.size());
     activated = Buffer(hidden.size());
     gates = Buffer(hidden.size() * 2);
     projected = Buffer(gates.size());
-    condition = Buffer(size_t(max_batch) * n.conditioning_.output_channels() * bytes(type));
-    size_t scratch = 0;
-    for (const auto &c : n.layers_)
-        scratch = std::max(scratch, c.workspace_bytes(batch, time));
-    convolution = Buffer(scratch);
+    size_t scratch_bytes = 0;
+    for (const auto &convolution : network.layers_)
+        scratch_bytes = std::max(scratch_bytes, convolution.workspace_bytes(1, max_rows));
+    convolution = Buffer(scratch_bytes);
+}
+TensorView WaveNet::condition(TensorView style, ForwardContext &context) const {
+    auto parameters = context;
+    parameters.max_rows = context.max_batch;
+    return conditioning_.forward(style, parameters);
+}
+void WaveNet::forward(TensorView input, TensorView condition, TensorView output,
+                       ForwardContext &context, TensorView output_rows) const {
+    if (output_rows.numel() && (output_rows.type != Type::I64 || output_rows.cols != 1 ||
+                                output_rows.rows != input.rows || output_rows.device != input.device))
+        throw std::invalid_argument("WaveNet output row map shape/type mismatch");
+    Tensor::Scope scratch;
+    Workspace workspace(*this, context);
+    if (context.mode == ForwardContext::Prepare && input.data)
+        prepare(workspace, context.max_rows);
+    else if (context.mode == ForwardContext::Execute)
+        forward(workspace, input, condition, output, context.batch, output_rows.ptr<void *>());
 }
 void WaveNet::prepare(Workspace &w, int rows) const {
     int hidden = pre_.output_channels();
     Type type = pre_.activation_type();
     pre_.prepare_range(w.gates.view(1, pre_.input_channels(), type), w.hidden.view(1, hidden, type), rows);
-    conditioning_.prepare_range(w.gates.view(1, conditioning_.input_channels(), type),
-                                 w.condition.view(1, conditioning_.output_channels(), type), w.max_batch);
     for (size_t i = 0; i < layers_.size(); ++i) {
         const auto &c = layers_[i];
         c.prepare(w.hidden.view(1, hidden, type),
@@ -58,34 +71,30 @@ void WaveNet::prepare(Workspace &w, int rows) const {
     post_.prepare_range(w.skip.view(1, hidden, type),
                          w.gates.view(1, post_.output_channels(), type), rows);
 }
-void WaveNet::forward(Workspace &w, TensorView input, TensorView style,
-                      TensorView output, const ForwardBatch &batch_input, int valid_time,
-                      const void *const *condition_sources,
-                      void *const *output_rows) const {
+void WaveNet::forward(Workspace &w, TensorView input, TensorView condition,
+                      TensorView output, const ForwardBatch &batch_input, void *const *output_rows) const {
 
     int batch = batch_input.batch(), time = batch_input.time();
     const auto *packed = batch_input.sequence.addressing();
     Type type = pre_.activation_type();
     int hidden = pre_.output_channels();
+    const bool indirect = condition.type == Type::I64;
+    const auto *condition_sources = indirect ? condition.ptr<const void *>() : nullptr;
     if (batch < 1 || (!packed && batch > w.max_batch) || time < 1 || time > w.max_time ||
         input.rows != (packed ? packed->rows : int64_t(batch) * time) ||
         input.rows > w.max_rows ||
-        (!condition_sources && style.rows != batch) || input.type != type ||
-        output.rows != input.rows || output.cols != post_.output_channels() || output.type != type ||
-        valid_time < 0 || valid_time > time)
+        !condition.data || condition.device != input.device || condition.rows != batch || (indirect ? condition.cols != 1
+            : condition.type != type || condition.cols != condition_channels()) || input.type != type ||
+        output.rows != input.rows || output.cols != post_.output_channels() || output.type != type)
         throw std::invalid_argument("WaveNet input exceeds initialized workspace");
     int rows = input.rows;
     auto x = w.hidden.view(rows, hidden, type), skip = w.skip.view(rows, hidden, type);
     auto gates = w.gates.view(rows, 2 * hidden, type),
          activated = w.activated.view(rows, hidden, type);
-    auto condition = condition_sources ? TensorView{}
-        : w.condition.view(batch, conditioning_.output_channels(), type);
     ops::Epilogue mask;
     mask.rows_per_sequence = packed ? 1 : time;
     mask.packed = packed;
-    mask.valid_rows_per_sequence = valid_time < time ? valid_time : 0;
     pre_.forward(input, x, mask);
-    if (!condition_sources) conditioning_.forward(style, condition);
     for (size_t i = 0; i < layers_.size(); ++i) {
         const auto &c = layers_[i];
         c.forward(x, gates, batch_input,

@@ -48,22 +48,31 @@ RelativeEncoder::RelativeEncoder(Weights &w, const std::string &prefix, int laye
                            (relative.shape[1] - 1) / 2});
     }
 }
-RelativeEncoder::Workspace::Workspace(const RelativeEncoder &e, int batch, int time)
-    : max_batch(batch), max_time(time), max_rows(int64_t(batch) * time) {
-    if (batch < 1 || time < 1 || int64_t(batch) * time > INT32_MAX)
+RelativeEncoder::Workspace::Workspace(const RelativeEncoder &encoder, const ForwardContext &context)
+    : max_batch(context.max_batch), max_time(context.max_time), max_rows(context.max_rows) {
+    if (max_batch < 1 || max_time < 1 || max_rows < 1)
         throw std::invalid_argument("invalid relative encoder workspace");
-    size_t rows = size_t(batch) * time;
-    projected = Buffer(rows * e.hidden_ * 3 * bytes(e.type_));
-    attended = Buffer(rows * e.hidden_ * bytes(e.type_));
+    const size_t rows = max_rows;
+    projected = Buffer(rows * encoder.hidden_ * 3 * bytes(encoder.type_));
+    attended = Buffer(rows * encoder.hidden_ * bytes(encoder.type_));
     update = Buffer(attended.size());
-    expanded = Buffer(rows * e.blocks_.front().first.geometry().output_channels * bytes(e.type_));
-    size_t scratch_bytes =
-        ops::relative_attention_workspace_bytes(batch, time, e.heads_, e.hidden_ / e.heads_, e.type_);
-    for (const auto &b : e.blocks_) {
-        scratch_bytes = std::max(scratch_bytes, b.first.workspace_bytes(batch, time));
-        scratch_bytes = std::max(scratch_bytes, b.second.workspace_bytes(batch, time));
+    expanded = Buffer(rows * encoder.blocks_.front().first.geometry().output_channels * bytes(encoder.type_));
+    size_t scratch_bytes = ops::relative_attention_workspace_bytes(
+        1, max_rows, encoder.heads_, encoder.hidden_ / encoder.heads_, encoder.type_);
+    for (const auto &block : encoder.blocks_) {
+        scratch_bytes = std::max(scratch_bytes, block.first.workspace_bytes(1, max_rows));
+        scratch_bytes = std::max(scratch_bytes, block.second.workspace_bytes(1, max_rows));
     }
     scratch = Buffer(scratch_bytes);
+}
+TensorView RelativeEncoder::forward(TensorView input, ForwardContext &context) const {
+    Tensor::Scope scratch;
+    Workspace workspace(*this, context);
+    if (context.mode == ForwardContext::Prepare && input.data)
+        prepare(workspace, context.max_rows);
+    else if (context.mode == ForwardContext::Execute)
+        forward(workspace, input, context.batch);
+    return input;
 }
 void RelativeEncoder::prepare(Workspace &w, int rows) const {
     auto x = w.update.view(1, hidden_, type_);

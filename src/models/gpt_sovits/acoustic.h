@@ -22,28 +22,14 @@ class Acoustic {
         TensorView features, waveform_condition;
     };
   private:
-    struct Capacity {
-        int sequences, codes, phones, frames;
-    };
-    static Capacity checked_capacity(Capacity, int repeat);
     struct Batch {
         SequenceLayout phones{}, hidden{}, resized{}, features{};
         const AttentionSequence *cross_attention = nullptr;
         const int *const *phone_ids = nullptr, *const *code_ids = nullptr;
-        const void *const *styles = nullptr, *const *conditions = nullptr,
-                         *const *text_keys = nullptr, *const *text_values = nullptr;
-        void *const *text_outputs = nullptr, *const *feature_outputs = nullptr;
+        const void *const *styles = nullptr, *const *text_keys = nullptr, *const *text_values = nullptr;
+        void *const *text_outputs = nullptr;
+        TensorView conditions, feature_outputs;
         bool resample = false;
-        int valid_frames = 0;
-    };
-    struct Workspace {
-        RelativeEncoder::Workspace ssl_encoder, text_encoder, output_encoder;
-        WaveNet::Workspace waveform_features;
-        Buffer ssl, text, content, projected_text, query, key_value, attended, update, lse, features;
-        int max_batch, max_codes, max_phones, max_frames;
-        Workspace(const Acoustic &, int batch, int codes, int phones,
-                  int frames = 0);
-        Workspace(const Acoustic &, Capacity);
     };
   public:
     Acoustic(Weights &, const std::string &prefix, const Json &);
@@ -62,12 +48,11 @@ class Acoustic {
   private:
     int hidden_frames(int codes, double speed = 1.) const { return rate_.hidden_frames(codes, speed); }
     int valid_frames(int codes, double speed = 1.) const { return rate_.valid_frames(codes, speed); }
-    void prepare(Workspace &) const;
     Batch describe(int batch, int codes, int phones, double speed = 1.) const;
     // Text is invariant across streaming windows; callers may retain this K/V
     // projection in request storage instead of re-encoding it for every window.
-    void prepare_text(Workspace &, const int *phones, TensorView condition, const Batch &) const;
-    void forward(Workspace &, const int *codes, const int *phones, TensorView style,
-                 TensorView features, const Batch &, TensorView text_condition = {}) const;
+    TensorView encode_text(const int *phones, const Batch &, ForwardContext &) const;
+    void forward(const int *codes, const int *phones, TensorView style,
+                 TensorView features, const Batch &, ForwardContext &, TensorView condition = {}) const;
 };
 } // namespace tts
