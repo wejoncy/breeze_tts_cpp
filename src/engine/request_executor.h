@@ -53,7 +53,8 @@ class RequestExecutor {
 
   public:
     using PreparationCallback = std::function<void(size_t, PreparedTask)>;
-    RequestExecutor(ModelRunner &, int capacity, uint64_t engine_id, std::function<void(Completion)>);
+    RequestExecutor(ModelRunner &, int capacity, uint64_t engine_id, std::function<void(Completion)>,
+                     std::function<void()> initialize);
     ~RequestExecutor();
     void start();
     void submit(ExecutionBatch);

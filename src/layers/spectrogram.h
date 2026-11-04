@@ -1,7 +1,5 @@
 #pragma once
-#include "ops/backend.h"
-#include "runtime/tensor_storage.h"
-#include <map>
+#include "core/tensor_storage.h"
 
 namespace tts {
 struct SpectrogramConfig {
@@ -16,11 +14,8 @@ struct SpectrogramConfig {
 // scratch uses the same allocator as other operators; serving only selects a
 // retained frame-capacity plan and supplies its initialized workspace.
 class Spectrogram {
-    struct Plan;
     SpectrogramConfig config_;
     Tensor window_, mel_;
-    std::map<int, std::unique_ptr<Plan>> plans_;
-    Buffer fft_workspace_;
     int capacity_;
 
   public:
@@ -28,12 +23,12 @@ class Spectrogram {
         Buffer frames, spectrum, magnitude, mel;
         explicit Workspace(const Spectrogram &, BufferAllocator *);
     };
-    Spectrogram(Backend &, SpectrogramConfig, int max_frames);
-    ~Spectrogram();
+    Spectrogram(BufferAllocator &, SpectrogramConfig, int max_frames);
     int frames(int samples) const;
     int output_channels() const {
         return config_.mel_channels ? config_.mel_channels : config_.fft / 2 + 1;
     }
+    void prepare(Workspace &) const;
     void forward(Workspace &, TensorView waveform, int batch, int samples,
                  TensorView output) const;
 };

@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/spectral.h"
 #include "runtime/device.h"
 #include <cuda_fp16.h>
@@ -20,8 +21,9 @@ __global__ void frame_window(const float *waveform, const float *window, float *
     if (source >= samples) source = period - source;
     out[i] = waveform[size_t(row / time) * samples + source] * window[d];
 }
-void stft_window(cudaStream_t stream, TensorView waveform, TensorView window, TensorView frames,
+void stft_window( TensorView waveform, TensorView window, TensorView frames,
                  int batch, int samples, int time, int hop, int padding) {
+    const auto stream = execution_context(waveform).stream;
     if (batch < 1 || samples < 2 || samples > INT32_MAX / 2 || time < 1 || hop < 1 || padding < 0 ||
         waveform.rows != int64_t(batch) * samples || waveform.cols != 1 || !waveform.dense() ||
         waveform.type != Type::F32 || window.type != Type::F32 || window.rows != 1 ||
@@ -52,7 +54,8 @@ static void check_feature(TensorView y) {
     if (!y.data || (y.type != Type::BF16 && y.type != Type::F16 && y.type != Type::F32))
         throw std::invalid_argument("invalid spectral output dtype");
 }
-void spectrum_magnitude(cudaStream_t stream, const void *spectrum, TensorView out, float epsilon) {
+void spectrum_magnitude( const void *spectrum, TensorView out, float epsilon) {
+    const auto stream = execution_context(out).stream;
     check_feature(out);
     if (!spectrum || epsilon < 0 || !std::isfinite(epsilon))
         throw std::invalid_argument("invalid spectral magnitude");
@@ -65,8 +68,9 @@ void spectrum_magnitude(cudaStream_t stream, const void *spectrum, TensorView ou
     else launch(float{});
     CUDA(cudaGetLastError());
 }
-void spectral_log(cudaStream_t stream, TensorView input, TensorView out, float floor,
+void spectral_log( TensorView input, TensorView out, float floor,
                   float scale, float bias) {
+    const auto stream = execution_context(input).stream;
     check_feature(out);
     if (input.type != Type::F32 || input.rows != out.rows || input.cols != out.cols ||
         !(floor > 0) || !std::isfinite(floor) || !std::isfinite(scale) || !std::isfinite(bias))

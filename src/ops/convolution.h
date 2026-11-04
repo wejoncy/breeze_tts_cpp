@@ -2,7 +2,6 @@
 #include "ops/sequence.h"
 
 namespace tts {
-class Backend;
 namespace ops {
 // Half-open input interval sufficient for a requested convolution output.
 inline std::pair<int64_t, int64_t> convolution_input_span(

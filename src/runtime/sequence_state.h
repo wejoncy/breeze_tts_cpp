@@ -1,19 +1,17 @@
 #pragma once
 #include "runtime/device.h"
+#include "core/sequence_state.h"
 
 namespace tts {
-struct SequenceStateSpec {
-    size_t kv_bytes = 0;
-    std::vector<size_t> history_bytes;
-};
 // Request-persistent attention/convolution history. The model supplies sizes;
 // storage and reset have no knowledge of its operators or checkpoint format.
 struct SequenceState {
     Buffer keys, values, position;
+    const size_t layer_bytes;
     std::vector<Buffer> history;
     SequenceState(const SequenceStateSpec &spec, BufferAllocator *storage)
         : keys(spec.kv_bytes, storage), values(spec.kv_bytes, storage),
-          position(sizeof(int), storage) {
+          position(sizeof(int), storage), layer_bytes(spec.layer_bytes) {
         history.reserve(spec.history_bytes.size());
         for (auto bytes : spec.history_bytes)
             history.emplace_back(bytes, storage);

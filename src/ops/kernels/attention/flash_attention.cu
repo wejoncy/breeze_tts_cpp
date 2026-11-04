@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/attention.h"
 #include "runtime/device.h"
 #include <type_traits>
@@ -199,10 +200,11 @@ static void launch_dimension(cudaStream_t stream, tts_flash::Flash_fwd_params &p
         }
     }
 }
-void prefill_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView v, TensorView out,
+void prefill_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                    float *lse, int batch, int time, int slot, int cap, int heads, int kvheads,
                    int dim, bool causal, int window, const SequenceLayout *packed, CacheLayout cache,
                    int key_time, float softmax_scale, DenseAttentionLayout dense) {
+    const auto stream = execution_context(q).stream;
     if (key_time && (packed || key_time < 1 || (causal && key_time < time) || key_time > cap))
         throw std::invalid_argument("invalid FlashAttention key length");
     tts_flash::Flash_fwd_params p{};
@@ -278,9 +280,10 @@ void prefill_attention(cudaStream_t stream, TensorView q, TensorView k, TensorVi
         else launch<256, false, false>(stream, p, dense);
     } else throw std::invalid_argument("unsupported FlashAttention specialization");
 }
-void dense_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView v, TensorView out,
+void dense_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                  float *lse, int batch, int query_time, int key_time, int heads, int dim,
                  bool causal, float scale, DenseAttentionLayout layout) {
+    const auto stream = execution_context(q).stream;
     int64_t width = int64_t(heads) * dim;
     int64_t query_rows = int64_t(batch - 1) * (layout.query_batch_rows ? layout.query_batch_rows : query_time) + query_time;
     int64_t key_rows = int64_t(batch - 1) * (layout.key_batch_rows ? layout.key_batch_rows : key_time) + key_time;
@@ -294,13 +297,15 @@ void dense_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView
         v.cols != width || out.cols != width || (q.type != Type::BF16 && q.type != Type::F16) || k.type != q.type ||
         v.type != q.type || out.type != q.type || !lse || !std::isfinite(scale) || scale < 0)
         throw std::invalid_argument("invalid dense FlashAttention views");
-    prefill_attention(stream, q, k, v, out, lse, batch, query_time, 0, key_time,
+    prefill_attention( q, k, v, out, lse, batch, query_time, 0, key_time,
                   heads, heads, dim, causal, 0, nullptr, {}, key_time, scale, layout);
     CUDA(cudaGetLastError());
 }
-void decode_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView v, TensorView out,
+void decode_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                   float *lse, const int *positions, int batch, int heads, int kvheads,
                   CacheLayout cache, FlashDecodeWorkspace scratch, int partitions) {
+    if (!scratch.output.data) scratch = execution_context(q).flash_decode_workspace();
+    const auto stream = execution_context(q).stream;
     int dim = heads > 0 ? q.cols / heads : 0;
     if (batch < 1 || heads < 1 || kvheads < 1 || heads % kvheads || q.cols != heads * dim ||
         q.rows != batch || out.rows != batch || out.cols != q.cols ||

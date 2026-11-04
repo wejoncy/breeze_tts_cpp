@@ -1,5 +1,7 @@
 #pragma once
 #include "core/tensor.h"
+#include "core/allocator.h"
+#include "core/buffer.h"
 #include "tts/memory_stats.h"
 #include "runtime/block_pool.h"
 #include "runtime/error.h"
@@ -17,29 +19,6 @@ inline void check(cudaError_t s, const char *expr) {
         throw DeviceError(std::string(expr) + ": " + cudaGetErrorString(s));
 }
 #define CUDA(x) ::tts::check((x), #x)
-// Storage sizing and allocation use the same constructors and alignment rules.
-struct BufferAllocator {
-    virtual ~BufferAllocator() = default;
-    virtual void *allocate(size_t size) = 0;
-    virtual void deallocate(void *) noexcept = 0;
-    virtual int device_ordinal() const { return -1; }
-    static size_t aligned(size_t size) {
-        if (size > SIZE_MAX - 255)
-            throw std::overflow_error("arena allocation size");
-        return (size + 255) & ~size_t(255);
-    }
-};
-struct WorkspacePlan : BufferAllocator {
-    void deallocate(void *) noexcept override {}
-    size_t size = 0;
-    void *allocate(size_t n) override {
-        n = aligned(n);
-        if (n > SIZE_MAX - size)
-            throw std::overflow_error("workspace size");
-        size += n;
-        return nullptr; // metadata-only buffers; never submitted to a backend
-    }
-};
 // One execution stream and its pool. Model, KV, workspaces and tuning buffers
 // share this resource; allocator references never own or extend its lifetime.
 class DeviceContext final : public BufferAllocator {
@@ -137,6 +116,10 @@ class DeviceContext final : public BufferAllocator {
         transfer_bytes_ = aligned(bytes);
     }
     bool has_transfer_backing() const { return transfer_base_ != nullptr; }
+    void zero(const Buffer &buffer) {
+        DeviceScope scope(device);
+        CUDA(cudaMemsetAsync(buffer.data(), 0, buffer.size(), stream));
+    }
     void upload(void *dst, const void *src, size_t n) {
         if (!n) return;
         if (transfer_base_) {
@@ -282,70 +265,9 @@ class DeviceContext final : public BufferAllocator {
         }
     }
 };
-class Buffer {
-    void *data_ = nullptr;
-    size_t size_ = 0;
-    BufferAllocator *allocator_ = nullptr;
-    int device_ = -1;
-
-  public:
-    Buffer() = default;
-    Buffer(size_t n, BufferAllocator *allocator)
-        : size_(n), allocator_(allocator), device_(allocator ? allocator->device_ordinal() : -1) {
-        if (n) {
-            if (!allocator_)
-                throw std::invalid_argument("Buffer requires an explicit allocator");
-            data_ = allocator_->allocate(n);
-        }
-    }
-    ~Buffer() {
-        if (data_)
-            allocator_->deallocate(data_);
-    }
-    Buffer(const Buffer &) = delete;
-    Buffer &operator=(const Buffer &) = delete;
-    Buffer(Buffer &&o) noexcept
-        : data_(o.data_), size_(o.size_), allocator_(o.allocator_), device_(o.device_) {
-        o.data_ = nullptr;
-        o.size_ = 0;
-    }
-    Buffer &operator=(Buffer &&o) noexcept {
-        if (this != &o) {
-            if (data_)
-                allocator_->deallocate(data_);
-            data_ = o.data_;
-            size_ = o.size_;
-            allocator_ = o.allocator_;
-            device_ = o.device_;
-            o.data_ = nullptr;
-            o.size_ = 0;
-        }
-        return *this;
-    }
-    void *data() const {
-        return data_;
-    }
-    size_t size() const {
-        return size_;
-    }
-    int device() const { return device_; }
-    TensorView view(int rows, int cols, Type type = Type::BF16, size_t offset = 0,
-                    int stride = 0) const {
-        if (offset > size_ || offset % bytes(type))
-            throw std::runtime_error("device buffer bounds");
-        TensorView v{data_ ? static_cast<char *>(data_) + offset : nullptr, rows, cols, type,
-                     stride, device_};
-        if (v.span_bytes() > size_ - offset)
-            throw std::runtime_error("device buffer view exceeds storage");
-        return v;
-    }
-    template <typename T> T *ptr() const {
-        return static_cast<T *>(data_);
-    }
-};
 // Bump allocations borrow a stable block from the shared pool.
 // All graph invalidation happens in ExecutionResources before this block grows.
-class DeviceArena : public BufferAllocator {
+class DeviceArena : public ScratchAllocator {
     DeviceContext &memory_;
     Buffer storage_;
     size_t used_ = 0;
@@ -375,25 +297,16 @@ class DeviceArena : public BufferAllocator {
         used_ += n;
         return p;
     }
-    void deallocate(void *) noexcept override {}
     void reset() {
         used_ = 0;
     }
+    size_t position() const noexcept override { return used_; }
+    void rewind(size_t position) noexcept override {
+        if (position > used_) std::terminate();
+        used_ = position;
+    }
     size_t capacity() const {
         return storage_.size();
-    }
-};
-struct ArenaLease {
-    DeviceArena &arena;
-    explicit ArenaLease(DeviceArena &a) : arena(a) {
-        arena.reset();
-    }
-    ArenaLease(const ArenaLease &) = delete;
-    ArenaLease &operator=(const ArenaLease &) = delete;
-    // All uses are ordered on the arena's device stream. Storage growth/destruction
-    // owns the synchronization; rewinding the CPU cursor does not free device bytes.
-    ~ArenaLease() {
-        arena.reset();
     }
 };
 } // namespace tts

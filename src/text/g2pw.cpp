@@ -216,3 +216,45 @@ bool G2PW::Resolver::resolveSentenceTone3(const char32_t *word, size_t count,
     return true;
 }
 } // namespace tts::text
+
+namespace tts::text {
+InputBatch G2PWTask::input() const {
+    if (ids.empty() || positions.empty() || positions.size() != characters.size() ||
+        offsets.size() < 2 || offsets.front() || offsets.back() != int(ids.size()))
+        throw std::invalid_argument("invalid pronunciation task dimensions");
+    InputBatch result;
+    int maximum = 0;
+    for (size_t sequence = 1; sequence < offsets.size(); ++sequence) {
+        const int length = offsets[sequence] - offsets[sequence - 1];
+        if (length < 1) throw std::invalid_argument("invalid pronunciation sequence extent");
+        maximum = std::max(maximum, length);
+    }
+    result.limits = {int(offsets.size() - 1), maximum, int(ids.size())};
+    result.sequence.shape = {1, int(ids.size()), int(ids.size())};
+    auto tensor = [](const std::vector<int> &values) {
+        return TensorView(const_cast<int *>(values.data()), int(values.size()), 1, Type::I32);
+    };
+    auto positions_storage = std::make_shared<HostTensor>(TensorShape{int(ids.size()), 1}, Type::I32);
+    auto characters_storage = std::make_shared<HostTensor>(TensorShape{int(ids.size()), 1}, Type::I32);
+    auto token_storage = std::make_shared<HostTensor>(TensorShape{int(ids.size()), 1}, Type::I32);
+    std::fill_n(positions_storage->view().ptr<int>(), ids.size(), -1);
+    std::fill_n(characters_storage->view().ptr<int>(), ids.size(), -1);
+    std::copy(positions.begin(), positions.end(), positions_storage->view().ptr<int>());
+    std::copy(characters.begin(), characters.end(), characters_storage->view().ptr<int>());
+    for (size_t sequence = 1; sequence < offsets.size(); ++sequence)
+        for (int row = offsets[sequence - 1]; row < offsets[sequence]; ++row)
+            token_storage->view().ptr<int>()[row] = row - offsets[sequence - 1];
+    result.uploads = {{"input_ids", tensor(ids)}, {"positions", positions_storage->view()},
+                      {"characters", characters_storage->view()}, {"cu_seqlens", tensor(offsets)},
+                      {"token_positions", token_storage->view()}};
+    result.owners = {positions_storage, characters_storage, token_storage};
+    result.parameters = {{"queries", double(positions.size())}};
+    return result;
+}
+void G2PWTask::accept(HostResults outputs) {
+    const auto tensor = outputs.at("labels")->view();
+    if (tensor.type != Type::I32 || tensor.numel() != positions.size())
+        throw std::invalid_argument("pronunciation output shape/type mismatch");
+    labels.assign(tensor.ptr<int>(), tensor.ptr<int>() + tensor.numel());
+}
+} // namespace tts::text

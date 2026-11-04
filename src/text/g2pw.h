@@ -9,6 +9,10 @@ namespace tts::text {
 struct G2PWTask final : PreparationTask {
     std::vector<int> ids, positions, characters, labels;
     std::vector<int> offsets{0};
+    std::string_view program() const override { return "pronunciation"; }
+    InputBatch input() const override;
+    std::vector<std::string> outputs() const override { return {"labels"}; }
+    void accept(HostResults) override;
 };
 // Immutable pronunciation assets and CPU tokenization. Network execution is
 // transferred to the same GPU executor as every other conditioning stage.

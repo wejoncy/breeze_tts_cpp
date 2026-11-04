@@ -1,4 +1,4 @@
-#include "ops/quantization.h"
+#include "ops/cuda/quantization.h"
 #include "ops/cuda/lt_plan.h"
 #include "ops/kernels/quant/quant_device.cuh"
 #include "runtime/prepared_cache.h"

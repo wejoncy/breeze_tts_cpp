@@ -1,6 +1,5 @@
 #pragma once
 #include "core/forward_batch.h"
-#include <cuda_runtime_api.h>
 #include <algorithm>
 #include <vector>
 namespace tts {
@@ -73,15 +72,15 @@ void initialize_flash_attention();
 // Initialization only, for the exact compiled split-decode kernel.
 int flash_decode_resident_blocks(int head_dim, Type);
 // Nonzero key_time includes a cached prefix; causal queries align to its end.
-void prefill_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView v, TensorView out,
+void prefill_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                    float *lse, int batch, int time, int slot, int capacity, int heads, int kvheads,
                    int dim, bool causal, int window, const SequenceLayout *packed = nullptr,
                    CacheLayout cache = {}, int key_time = 0, float softmax_scale = 0,
                    DenseAttentionLayout dense = {});
-void dense_attention(cudaStream_t, TensorView q, TensorView k, TensorView v, TensorView out,
+void dense_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                  float *lse, int batch, int query_time, int key_time, int heads, int head_dim,
                  bool causal = false, float softmax_scale = 0, DenseAttentionLayout = {});
-void decode_attention(cudaStream_t stream, TensorView q, TensorView k, TensorView v, TensorView out,
+void decode_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                   float *lse, const int *positions, int batch, int heads, int kvheads,
                   CacheLayout cache, FlashDecodeWorkspace scratch = {}, int partitions = 1);
 } // namespace tts

@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/pronunciation.h"
 #include "runtime/device.h"
 #include <cub/block/block_reduce.cuh>
@@ -76,10 +77,11 @@ __global__ void selection_kernel(View logits, View pos_logits, const Bias *bias,
         output_ids[row] = result.index;
 }
 } // namespace
-void select_pronunciation(cudaStream_t stream, TensorView logits, TensorView pos,
+void select_pronunciation( TensorView logits, TensorView pos,
                           TensorView bias, TensorView pos_bias, TensorView descriptor_bias,
                           TensorView chars, TensorView second, TensorView legal,
                           const int *positions, const int *char_ids, int *output_ids) {
+    const auto stream = execution_context(logits).stream;
     if (!logits.data || !pos.data || !bias.data || !pos_bias.data || !descriptor_bias.data ||
         !chars.data || !second.data || !legal.data || !positions || !char_ids || !output_ids ||
         logits.rows < 1 || logits.cols < 1 || pos.cols < 1 || pos.rows != logits.rows ||

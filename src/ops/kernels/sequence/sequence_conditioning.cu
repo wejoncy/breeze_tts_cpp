@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include <curand_kernel.h>
 
@@ -15,9 +16,10 @@ __global__ void position_kernel(View x, View y, View table, View alpha, int rows
     if (retained && retained[row]) static_cast<T *>(retained[row])[c] = T(value);
     y.set<T>(row, c, value + scale * table.get<T>(row % time + offset, c));
 }
-void positional_add(cudaStream_t s, TensorView x, TensorView y, TensorView table, int time,
+void positional_add( TensorView x, TensorView y, TensorView table, int time,
                     int offset, TensorView alpha, const void *const *sources,
                     void *const *retained) {
+    const auto stream = execution_context(y, {x, table, alpha}).stream;
     check_output(y);
     if (!sources)
         check_same(x, y);
@@ -27,13 +29,13 @@ void positional_add(cudaStream_t s, TensorView x, TensorView y, TensorView table
         throw std::invalid_argument("invalid positional embedding");
     int blocks = (y.numel() + 255) / 256;
     if (y.type == Type::BF16)
-        position_kernel<bf16><<<blocks, 256, 0, s>>>(View(x), View(y), View(table), View(alpha),
+        position_kernel<bf16><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
                                                      y.rows, y.cols, time, offset, sources, retained);
     else if (y.type == Type::F16)
-        position_kernel<__half><<<blocks, 256, 0, s>>>(View(x), View(y), View(table), View(alpha),
+        position_kernel<__half><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
                                                        y.rows, y.cols, time, offset, sources, retained);
     else
-        position_kernel<float><<<blocks, 256, 0, s>>>(View(x), View(y), View(table), View(alpha),
+        position_kernel<float><<<blocks, 256, 0, stream>>>(View(x), View(y), View(table), View(alpha),
                                                       y.rows, y.cols, time, offset, sources, retained);
     CUDA(cudaGetLastError());
 }
@@ -105,8 +107,9 @@ __global__ void rotary_row_kernel(View x, View bias, View rotary, int rows, int 
         }
     }
 }
-void qkv_rotary(cudaStream_t s, TensorView x, TensorView bias, TensorView rotary, int time,
+void qkv_rotary( TensorView x, TensorView bias, TensorView rotary, int time,
                 int heads, int head_dim, int dim, bool per_head, int offset) {
+    const auto stream = execution_context(x).stream;
     check_output(x);
     check_same(bias, x, true);
     int64_t width = int64_t(heads) * head_dim;
@@ -120,12 +123,12 @@ void qkv_rotary(cudaStream_t s, TensorView x, TensorView bias, TensorView rotary
         using T = decltype(type);
         if (tiles.full_rows(x.rows, int(width / 2))) {
             int grid = int(std::min<uint64_t>(tiles.count, INT32_MAX));
-            rotary_row_kernel<T><<<grid, 256, 0, s>>>(
+            rotary_row_kernel<T><<<grid, 256, 0, stream>>>(
                 View(x), View(bias), View(rotary), x.rows, int(width), time, head_dim, dim,
                 per_head, offset, tiles, cutlass::FastDivmod(head_dim), cutlass::FastDivmod(time));
         } else {
             int grid = (x.numel() / 2 + 255) / 256;
-            rotary_flat_kernel<T><<<grid, 256, 0, s>>>(View(x), View(bias), View(rotary), x.rows,
+            rotary_flat_kernel<T><<<grid, 256, 0, stream>>>(View(x), View(bias), View(rotary), x.rows,
                                                        int(width), time, head_dim, dim, per_head,
                                                        offset);
         }
@@ -171,8 +174,9 @@ __global__ void response_apply(View x, View y, View gamma, View beta, View stats
                  v + beta.get<T>(0, c) + gamma.get<T>(0, c) * v * stats.get<float>(b, c) / mean);
     }
 }
-void global_response_norm(cudaStream_t s, TensorView x, TensorView y, TensorView gamma,
+void global_response_norm( TensorView x, TensorView y, TensorView gamma,
                           TensorView beta, int batch, int time, TensorView stats) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     check_same(x, y);
     check_same(gamma, y, true);
@@ -182,16 +186,16 @@ void global_response_norm(cudaStream_t s, TensorView x, TensorView y, TensorView
         throw std::invalid_argument("invalid global response normalization workspace");
     dim3 grid(batch, y.cols);
     if (x.type == Type::BF16) {
-        response_stats<bf16><<<grid, 256, 0, s>>>(View(x), View(stats), time, y.cols);
-        response_apply<bf16><<<batch * time, 256, 0, s>>>(View(x), View(y), View(gamma), View(beta),
+        response_stats<bf16><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
+        response_apply<bf16><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma), View(beta),
                                                           View(stats), time, y.cols);
     } else if (x.type == Type::F16) {
-        response_stats<__half><<<grid, 256, 0, s>>>(View(x), View(stats), time, y.cols);
-        response_apply<__half><<<batch * time, 256, 0, s>>>(View(x), View(y), View(gamma),
+        response_stats<__half><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
+        response_apply<__half><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma),
                                                             View(beta), View(stats), time, y.cols);
     } else {
-        response_stats<float><<<grid, 256, 0, s>>>(View(x), View(stats), time, y.cols);
-        response_apply<float><<<batch * time, 256, 0, s>>>(View(x), View(y), View(gamma),
+        response_stats<float><<<grid, 256, 0, stream>>>(View(x), View(stats), time, y.cols);
+        response_apply<float><<<batch * time, 256, 0, stream>>>(View(x), View(y), View(gamma),
                                                            View(beta), View(stats), time, y.cols);
     }
     CUDA(cudaGetLastError());
@@ -245,26 +249,28 @@ __global__ void euler_kernel(View x, View velocity, View negative, int rows, int
         if (value_rows && value_rows[row]) static_cast<T *>(value_rows[row])[c] = T(converted);
     }
 }
-void gaussian_noise(cudaStream_t s, TensorView out, int time, const int *prefix,
+void gaussian_noise( TensorView out, int time, const int *prefix,
                     const uint64_t *seeds, const uint64_t *subsequences, float temperature) {
+    const auto stream = execution_context(out).stream;
     check_output(out);
     if (time < 1 || out.rows % time || !prefix || !seeds || !subsequences ||
         !std::isfinite(temperature) || temperature < 0)
         throw std::invalid_argument("invalid noise initialization");
     int grid = (size_t(out.rows) * ((out.cols + 3) / 4) + 255) / 256;
     if (out.type == Type::BF16)
-        noise_kernel<bf16><<<grid, 256, 0, s>>>(View(out), out.rows, out.cols, time, prefix, seeds,
+        noise_kernel<bf16><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix, seeds,
                                                 subsequences, temperature);
     else if (out.type == Type::F16)
-        noise_kernel<__half><<<grid, 256, 0, s>>>(View(out), out.rows, out.cols, time, prefix,
+        noise_kernel<__half><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix,
                                                   seeds, subsequences, temperature);
     else
-        noise_kernel<float><<<grid, 256, 0, s>>>(View(out), out.rows, out.cols, time, prefix, seeds,
+        noise_kernel<float><<<grid, 256, 0, stream>>>(View(out), out.rows, out.cols, time, prefix, seeds,
                                                  subsequences, temperature);
     CUDA(cudaGetLastError());
 }
-void euler_step(cudaStream_t s, TensorView x, TensorView v, TensorView negative, int time,
+void euler_step( TensorView x, TensorView v, TensorView negative, int time,
                 const int *prefix, float delta, float cfg, const EulerOutput &out) {
+    const auto stream = execution_context(x).stream;
     check_output(x);
     check_same(v, x);
     check_same(negative, x);
@@ -281,17 +287,17 @@ void euler_step(cudaStream_t s, TensorView x, TensorView v, TensorView negative,
         throw std::invalid_argument("invalid Euler output range");
     int grid = (x.numel() + 255) / 256;
     if (x.type == Type::BF16)
-        euler_kernel<bf16><<<grid, 256, 0, s>>>(View(x), View(v), View(negative), x.rows, x.cols,
+        euler_kernel<bf16><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
                                                 time, prefix, delta, cfg, View(out.values),
                                                 out.offset, out.frames, out.minimum, out.maximum,
                                                 out.prompt_rows, out.history_rows, out.value_rows);
     else if (x.type == Type::F16)
-        euler_kernel<__half><<<grid, 256, 0, s>>>(View(x), View(v), View(negative), x.rows, x.cols,
+        euler_kernel<__half><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
                                                   time, prefix, delta, cfg, View(out.values),
                                                   out.offset, out.frames, out.minimum, out.maximum,
                                                   out.prompt_rows, out.history_rows, out.value_rows);
     else
-        euler_kernel<float><<<grid, 256, 0, s>>>(View(x), View(v), View(negative), x.rows, x.cols,
+        euler_kernel<float><<<grid, 256, 0, stream>>>(View(x), View(v), View(negative), x.rows, x.cols,
                                                  time, prefix, delta, cfg, View(out.values),
                                                  out.offset, out.frames, out.minimum, out.maximum,
                                                  out.prompt_rows, out.history_rows, out.value_rows);
@@ -383,8 +389,9 @@ __global__ void embedding_kernel(const int *ids, View out, int cols, EmbeddingIn
                    (f.get<T>(id, row, c) - mean) * inv * f.norm_weight.get<T>(0, c) +
                        f.norm_bias.get<T>(0, c));
 }
-void embedding(cudaStream_t s, TensorView table, const int *ids, TensorView out,
+void embedding( TensorView table, const int *ids, TensorView out,
                const EmbeddingFusion &f) {
+    const auto stream = execution_context(table).stream;
     check_output(out);
     check_same(f.norm_weight, out, true);
     check_same(f.norm_bias, out, true);
@@ -415,13 +422,13 @@ void embedding(cudaStream_t s, TensorView table, const int *ids, TensorView out,
          (f.position_alpha.numel() != 1 || f.position_alpha.type != out.type)))
         throw std::invalid_argument("invalid fused embedding");
     if (out.type == Type::BF16)
-        embedding_kernel<bf16><<<int(rows), 256, 0, s>>>(ids, View(out), out.cols,
+        embedding_kernel<bf16><<<int(rows), 256, 0, stream>>>(ids, View(out), out.cols,
                                                          EmbeddingInput(table, f), f.input_repeat);
     else if (out.type == Type::F16)
-        embedding_kernel<__half><<<int(rows), 256, 0, s>>>(
+        embedding_kernel<__half><<<int(rows), 256, 0, stream>>>(
             ids, View(out), out.cols, EmbeddingInput(table, f), f.input_repeat);
     else
-        embedding_kernel<float><<<int(rows), 256, 0, s>>>(ids, View(out), out.cols,
+        embedding_kernel<float><<<int(rows), 256, 0, stream>>>(ids, View(out), out.cols,
                                                           EmbeddingInput(table, f), f.input_repeat);
     CUDA(cudaGetLastError());
 }
@@ -460,8 +467,9 @@ __global__ void temporal_apply(View x, View y, View weight, View bias, View stat
     value = float(T(value * weight.get<T>(0, c) + bias.get<T>(0, c)));
     y.set<T>(row, c, activate(value, activation, .1f));
 }
-void temporal_norm(cudaStream_t s, TensorView x, TensorView y, TensorView weight, TensorView bias,
+void temporal_norm( TensorView x, TensorView y, TensorView weight, TensorView bias,
                    int batch, int time, float eps, Activation activation, TensorView stats) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     check_same(x, y);
     check_same(weight, y, true);
@@ -473,8 +481,8 @@ void temporal_norm(cudaStream_t s, TensorView x, TensorView y, TensorView weight
     auto launch = [&](auto type) {
         using T = decltype(type);
         temporal_statistics<T>
-            <<<dim3(batch, y.cols), 256, 0, s>>>(View(x), View(stats), time, y.cols, eps);
-        temporal_apply<T><<<(y.numel() + 255) / 256, 256, 0, s>>>(View(x), View(y), View(weight),
+            <<<dim3(batch, y.cols), 256, 0, stream>>>(View(x), View(stats), time, y.cols, eps);
+        temporal_apply<T><<<(y.numel() + 255) / 256, 256, 0, stream>>>(View(x), View(y), View(weight),
                                                                   View(bias), View(stats), y.rows,
                                                                   y.cols, time, activation);
     };
@@ -501,9 +509,10 @@ __global__ void gated_kernel(View x, View y, View condition, View residual, int 
     gate = float(T(activate(gate, Activation::Sigmoid, .1f)));
     y.set<T>(row, c, float(T(a * gate)) + residual.get<T>(row, c));
 }
-void gated(cudaStream_t s, TensorView x, TensorView y, Activation left, int time,
+void gated( TensorView x, TensorView y, Activation left, int time,
            TensorView condition, TensorView residual, const SequenceLayout *packed,
            const void *const *condition_sources, int condition_offset) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     check_same(residual, y);
     if (x.type != y.type || x.rows != y.rows || x.cols != int64_t(y.cols) * 2 || time < 1 ||
@@ -513,7 +522,7 @@ void gated(cudaStream_t s, TensorView x, TensorView y, Activation left, int time
                             (condition.rows != 1 && condition.rows != y.rows / time))))
         throw std::invalid_argument("invalid conditioned GLU");
     auto launch = [&](auto type) {
-        gated_kernel<decltype(type)><<<(y.numel() + 255) / 256, 256, 0, s>>>(
+        gated_kernel<decltype(type)><<<(y.numel() + 255) / 256, 256, 0, stream>>>(
             View(x), View(y), View(condition), View(residual), y.rows, y.cols, time, left,
             packed ? *packed : SequenceLayout{}, condition_sources, condition_offset);
     };
@@ -538,17 +547,18 @@ template <class T> __global__ void mean_kernel(View x, View y, int time, int cha
     if (!warp && c < channels)
         y.set<T>(b, c, sums[0][lane] + sums[1][lane] + sums[2][lane] + sums[3][lane]);
 }
-void temporal_mean(cudaStream_t s, TensorView x, TensorView y, int time) {
+void temporal_mean( TensorView x, TensorView y, int time) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     if (time < 1 || x.rows != int64_t(y.rows) * time || x.cols != y.cols || x.type != y.type)
         throw std::invalid_argument("invalid temporal mean");
     dim3 grid((y.cols + 31) / 32, y.rows);
     if (y.type == Type::BF16)
-        mean_kernel<bf16><<<grid, 128, 0, s>>>(View(x), View(y), time, y.cols);
+        mean_kernel<bf16><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
     else if (y.type == Type::F16)
-        mean_kernel<__half><<<grid, 128, 0, s>>>(View(x), View(y), time, y.cols);
+        mean_kernel<__half><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
     else
-        mean_kernel<float><<<grid, 128, 0, s>>>(View(x), View(y), time, y.cols);
+        mean_kernel<float><<<grid, 128, 0, stream>>>(View(x), View(y), time, y.cols);
     CUDA(cudaGetLastError());
 }
 template <class T>
@@ -568,8 +578,9 @@ __global__ void residual_split_kernel(View p, View residual, View skip, int rows
     if (!last)
         residual.set<T>(row, c, valid ? residual.get<T>(row, c) + p.get<T>(row, c) : 0.f);
 }
-void residual_split(cudaStream_t s, TensorView p, TensorView residual, TensorView skip, bool first,
+void residual_split( TensorView p, TensorView residual, TensorView skip, bool first,
                     bool last, int time, int valid_time, const SequenceLayout *packed) {
+    const auto stream = execution_context(p).stream;
     check_output(skip);
     check_same(residual, skip);
     if (!residual.data || p.rows != skip.rows || p.cols != skip.cols * (last ? 1 : 2) ||
@@ -578,7 +589,7 @@ void residual_split(cudaStream_t s, TensorView p, TensorView residual, TensorVie
         (!packed && valid_time && (time < 1 || skip.rows % time || valid_time > time)))
         throw std::invalid_argument("invalid residual/skip split");
     auto launch = [&](auto type) {
-        residual_split_kernel<decltype(type)><<<(skip.numel() + 255) / 256, 256, 0, s>>>(
+        residual_split_kernel<decltype(type)><<<(skip.numel() + 255) / 256, 256, 0, stream>>>(
             View(p), View(residual), View(skip), skip.rows, skip.cols, first, last, time, valid_time,
             packed ? *packed : SequenceLayout{});
     };

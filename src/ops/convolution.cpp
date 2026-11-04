@@ -1,5 +1,5 @@
 #include "ops/convolution.h"
-#include "ops/backend.h"
+#include "ops/cuda/backend.h"
 
 namespace tts::ops {
 size_t convolution_workspace_bytes(const ConvGeometry &g, int batch, int time) {
@@ -16,7 +16,7 @@ size_t convolution_workspace_bytes(const ConvGeometry &g, int batch, int time) {
 void convolution(TensorView x, TensorView weight, TensorView bias, TensorView y,
                  int batch, int time, const ConvGeometry &g, TensorView workspace, Epilogue e,
                  const SequenceLayout *input, const SequenceLayout *output) {
-    auto &gpu = backend_for(x, {weight, bias, y, workspace, e.residual, e.condition, e.gate});
+    auto &gpu = execution_context(x, {weight, bias, y, workspace, e.residual, e.condition, e.gate});
     if (bool(input) != bool(output)) throw std::invalid_argument("incomplete packed convolution");
     if (batch < 1 || (input ? input->rows : int64_t(batch) * time) != x.rows || x.cols != g.input_channels ||
         x.type != weight.type || y.type != weight.type ||
@@ -25,13 +25,13 @@ void convolution(TensorView x, TensorView weight, TensorView bias, TensorView y,
         throw std::invalid_argument("convolution input/output mismatch");
     e.bias = bias;
     if (!convolution_workspace_bytes(g, batch, time)) {
-        direct_convolution(gpu.stream, x, weight, y, batch, time, g, e, input, output);
+        direct_convolution( x, weight, y, batch, time, g, e, input, output);
         return;
     }
     if (workspace.type != Type::F32 || workspace.rows != x.rows ||
         workspace.cols != g.kernel * g.output_channels)
         throw std::invalid_argument("convolution projection workspace mismatch");
     gpu.grouped_linear(x, weight, workspace, g.groups);
-    convolution_finish(gpu.stream, workspace, y, batch, time, g, e, input, output);
+    convolution_finish( workspace, y, batch, time, g, e, input, output);
 }
 } // namespace tts::ops

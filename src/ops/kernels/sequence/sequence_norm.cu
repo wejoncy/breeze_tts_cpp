@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include "ops/kernels/sequence/norm_projection.h"
 #include "ops/kernels/attention/qkv_writeback.cuh"
@@ -377,8 +378,9 @@ static void check_norm(TensorView x, TensorView y, TensorView w, TensorView bias
     check_output(y);
     check_norm_shape(x, TensorShape(y), y.type, y.data, w, bias, eps, f);
 }
-void layer_norm(cudaStream_t stream, TensorView x, TensorView y, TensorView w, TensorView bias,
+void layer_norm( TensorView x, TensorView y, TensorView w, TensorView bias,
                 float eps, const NormFusion &f) {
+    const auto stream = execution_context(x).stream;
     check_norm(x, y, w, bias, eps, f);
     bool register_cached = y.cols <= norm_threads * norm_register_values;
     size_t shared_bytes = !register_cached && y.cols <= norm_cache_bytes / int(sizeof(float))
@@ -394,8 +396,9 @@ void layer_norm(cudaStream_t stream, TensorView x, TensorView y, TensorView w, T
             View(x), View(y), View(w), View(bias), NormalizedInput(f), y.cols, eps, register_cached, DenseRowOutput{});
     CUDA(cudaGetLastError());
 }
-void layer_norm_quantize(cudaStream_t stream, TensorView x, RowScaledView q, TensorView w,
+void layer_norm_quantize( TensorView x, RowScaledView q, TensorView w,
                          TensorView bias, float eps, const NormFusion &f, TensorView retained) {
+    const auto stream = execution_context(x).stream;
     auto shape = check_quantized_output(x, q, retained);
     check_norm_shape(x, shape, x.type, retained.data, w, bias, eps, f);
     check_quantized_aliases(q, {x, retained, w, bias, f.residual, f.projection_bias, f.raw,

@@ -3,6 +3,7 @@
 #include "core/sequence_layout.h"
 
 namespace tts {
+enum class ForwardMode { Prefill, Decode };
 struct AttentionSequence {
     int query_offset, key_offset, query_length, key_length;
 };
@@ -18,7 +19,7 @@ struct ForwardBatch {
     const AttentionSequence *bidirectional = nullptr, *causal = nullptr;
     int capacity = 0, prefix = 0;
     int slot = 0, fixed_position = -1;
-    bool decode = false;
+    ForwardMode forward_mode = ForwardMode::Prefill;
     int decode_partitions = 1;
     const int *output_rows = nullptr;
     TensorView output;
@@ -27,6 +28,7 @@ struct ForwardBatch {
     explicit ForwardBatch(SequenceLayout layout) : sequence(layout) {}
     int batch() const { return sequence.sequences; }
     int time() const { return sequence.max_length; }
+    bool is_decode() const { return forward_mode == ForwardMode::Decode; }
 
     int rows() const {
         int count = sequence.rows;

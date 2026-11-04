@@ -1,5 +1,5 @@
 #include "ops/linear.h"
-#include "ops/backend.h"
+#include "ops/cuda/backend.h"
 #include "ops/kernels/sequence/norm_projection.h"
 #include <type_traits>
 
@@ -15,15 +15,15 @@ void check_linear_output(TensorView output, TensorView bias, const Epilogue &e) 
 } // namespace
 void linear(const LinearOperand &input, const LinearOperand &weight, TensorView bias,
             TensorView output, Epilogue e, RowScaledView scratch, RowScaledView quantized_output) {
-    auto &gpu = backend_for(output, {bias, e.residual, e.gate, e.condition, e.raw,
+    auto &gpu = execution_context(output, {bias, e.residual, e.gate, e.condition, e.raw,
                                     scratch.values, scratch.scales,
                                     quantized_output.values, quantized_output.scales});
     auto device = [&](const LinearOperand &operand) {
         std::visit([&](auto matrix) {
             if constexpr (std::is_same_v<decltype(matrix), TensorView>)
-                backend_for(output, {matrix});
+                execution_context(output, {matrix});
             else
-                backend_for(output, {matrix.values, matrix.scales});
+                execution_context(output, {matrix.values, matrix.scales});
         }, operand);
     };
     device(input);
@@ -72,11 +72,11 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
     if (fused)
         return;
     if (quantized_output.values.data) {
-        pointwise_quantize(gpu.stream, output, quantized_output, e, {}, gpu.multiprocessors());
+        pointwise_quantize( output, quantized_output, e, {}, gpu.multiprocessors());
     } else if (bias.data || e.residual.data || e.gate.data || e.condition.data || e.raw.data ||
         e.activation != Activation::Identity || e.value_scale != 1 || e.output_scale != 1 ||
         e.valid_rows_per_sequence || e.packed || e.condition_sources || e.output_rows) {
-        pointwise(gpu.stream, output, output, e);
+        pointwise( output, output, e);
     }
 }
 bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView bias,
@@ -84,7 +84,7 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
                        TensorView norm_bias, float epsilon, const NormFusion &fusion,
                        Epilogue e, const QkvProjectionOutput *writeback,
                        RowScaledView quantized_output) {
-    auto &gpu = backend_for(input, {bias, normalized, output, norm_weight, norm_bias,
+    auto &gpu = execution_context(input, {bias, normalized, output, norm_weight, norm_bias,
                                    fusion.residual, fusion.projection_bias,
                                    quantized_output.values, quantized_output.scales});
     check_linear_output(output, bias, e);
@@ -105,7 +105,7 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
                 gpu.quantized().quantize(output, quantized_output);
             } else {
                 if (!project({})) return false;
-                pointwise_quantize(gpu.stream, output, quantized_output, e, {},
+                pointwise_quantize( output, quantized_output, e, {},
                                    gpu.multiprocessors());
             }
             return true;

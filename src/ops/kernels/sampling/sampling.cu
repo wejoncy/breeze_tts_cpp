@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/sampling.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include <cuda_fp16.h>
@@ -263,10 +264,11 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
             batch_done[blockIdx.x] = *done;
     }
 }
-void sample(cudaStream_t stream, TensorView logits, SamplingLayout layout, int *codes,
+void sample( TensorView logits, SamplingLayout layout, int *codes,
             uint64_t *rng, int batch, int branches, int cb, float cfg, float temp, int topk,
             int *done, float topp, float cfg_ref, float cfg_ins, float penalty, int *seen,
             const SamplingRow *rows) {
+    const auto stream = execution_context(logits).stream;
     if (layout.codebooks < 1 || cb < 0 || cb >= layout.codebooks || layout.entries < 1 ||
         layout.entries > logits.cols ||
         (cb == 0 && (layout.eos < layout.entries || layout.eos >= logits.cols)) ||

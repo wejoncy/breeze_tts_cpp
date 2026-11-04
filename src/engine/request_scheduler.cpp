@@ -125,7 +125,8 @@ struct RequestScheduler::Impl {
     State state = State::Ready;
     RequestExecutor executor;
     std::thread scheduler;
-    Impl(RequestPlanner &p, ModelRunner &r, int batch, double period, uint64_t id)
+    Impl(RequestPlanner &p, ModelRunner &r, int batch, double period, uint64_t id,
+          std::function<void()> initialize_executor)
         : planner(p), capacity(batch), frame_period_ms(period), engine_id(id),
           executor(r, batch, id, [this](Completion result) {
               send(incoming,
@@ -134,7 +135,7 @@ struct RequestScheduler::Impl {
                                if (result.executed)
                                    output_pool.push_back(std::move(result));
                            }});
-          }) {
+          }, std::move(initialize_executor)) {
         const size_t samples = r.max_step_samples();
         if (!samples)
             throw std::logic_error("model defines an empty audio step capacity");
@@ -815,8 +816,10 @@ void RequestScheduler::run_async() {
     impl_->start();
 }
 RequestScheduler::RequestScheduler(RequestPlanner &planner, ModelRunner &runner, int batch,
-                                   double frame_period_ms, uint64_t engine_id)
-    : impl_(std::make_unique<Impl>(planner, runner, batch, frame_period_ms, engine_id)) {}
+                                   double frame_period_ms, uint64_t engine_id,
+                                   std::function<void()> initialize_executor)
+    : impl_(std::make_unique<Impl>(planner, runner, batch, frame_period_ms, engine_id,
+                                   std::move(initialize_executor))) {}
 RequestScheduler::~RequestScheduler() = default;
 void RequestScheduler::configure(size_t request_limit, size_t output_buffer_bytes) {
     if (!request_limit || !output_buffer_bytes)

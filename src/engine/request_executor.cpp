@@ -28,6 +28,7 @@ struct RequestExecutor::Impl {
     };
     std::unordered_map<uint64_t, Request> requests;
     std::function<void(Completion)> completed;
+    std::function<void()> initialize;
     std::thread worker;
     std::vector<const ExecutionRow *> rows;
     std::vector<ModelRunner::RequestState *> prefill, batch_states;
@@ -153,6 +154,7 @@ struct RequestExecutor::Impl {
     void run() {
         log::Scope scope(engine_id);
         std::exception_ptr fatal;
+        try { initialize(); } catch (...) { fatal = std::current_exception(); }
         for (;;) {
             Command command;
             ready.wait_dequeue(command);
@@ -207,8 +209,10 @@ struct RequestExecutor::Impl {
     }
 
   public:
-    Impl(ModelRunner &r, int capacity, uint64_t id, std::function<void(Completion)> complete)
-        : runner(r), engine_id(id), completed(std::move(complete)) {
+    Impl(ModelRunner &runner_value, int capacity, uint64_t id, std::function<void(Completion)> complete,
+          std::function<void()> initialize_value)
+        : runner(runner_value), engine_id(id), completed(std::move(complete)),
+          initialize(std::move(initialize_value)) {
         rows.reserve(capacity);
         prefill.reserve(capacity);
         batch_states.reserve(capacity);
@@ -248,8 +252,10 @@ struct RequestExecutor::Impl {
     }
 };
 RequestExecutor::RequestExecutor(ModelRunner &runner, int capacity, uint64_t engine_id,
-                                 std::function<void(Completion)> completed)
-    : impl_(std::make_unique<Impl>(runner, capacity, engine_id, std::move(completed))) {}
+                                 std::function<void(Completion)> completed,
+                                 std::function<void()> initialize)
+    : impl_(std::make_unique<Impl>(runner, capacity, engine_id, std::move(completed),
+                                   std::move(initialize))) {}
 RequestExecutor::~RequestExecutor() = default;
 void RequestExecutor::start() {
     impl_->start();

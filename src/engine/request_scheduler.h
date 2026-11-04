@@ -13,7 +13,7 @@ class RequestScheduler {
 
   public:
     RequestScheduler(RequestPlanner &, ModelRunner &, int batch, double frame_period_ms,
-                     uint64_t engine_id);
+                     uint64_t engine_id, std::function<void()> initialize_executor);
     ~RequestScheduler();
     void run_async();
     void configure(size_t request_limit, size_t output_buffer_bytes);

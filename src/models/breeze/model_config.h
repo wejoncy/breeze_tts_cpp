@@ -1,5 +1,5 @@
 #pragma once
-#include "models/breeze/audio_config.h"
+#include "layers/audio/config.h"
 #include "io/json.h"
 #include <string>
 

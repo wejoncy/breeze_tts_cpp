@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/audio_encoder.h"
 #include <cmath>
 #include <type_traits>
@@ -18,8 +19,9 @@ __global__ void first_conv(const float *x, const float *w, const float *bias, fl
     }
     out[i] = sum;
 }
-void encoder_first_conv(cudaStream_t stream, TensorView x, TensorView w, TensorView b, TensorView out,
+void encoder_first_conv( TensorView x, TensorView w, TensorView b, TensorView out,
                         int kernel) {
+    const auto stream = execution_context(x).stream;
     if (x.cols != 1 || out.cols < 1 || out.rows != x.rows)
         throw std::invalid_argument("encoder first convolution shape");
     auto launch = [&](auto pow2) {
@@ -65,9 +67,10 @@ __global__ void conv_finish(const float *x, const float *p, const float *w, cons
         sum += residual[i];
     out[i] = elu && sum < 0 ? expm1f(sum) : sum;
 }
-void encoder_conv_finish(cudaStream_t stream, TensorView x, TensorView p, TensorView w,
+void encoder_conv_finish( TensorView x, TensorView p, TensorView w,
                          TensorView b, TensorView out, int kernel, int stride, bool replicate,
                          bool elu, TensorView residual, int dilation) {
+    const auto stream = execution_context(x).stream;
     // Shape specializations preserve unrolled arithmetic; other valid geometries
     // use the same fused accumulation, bias, residual and activation operation.
 #define RUN(K, S, R)                                                                               \

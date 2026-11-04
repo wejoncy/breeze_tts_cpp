@@ -21,11 +21,11 @@ class ExecutionResources {
         graphs_.clear();
         arena_.reserve(bytes);
     }
-    BufferAllocator &workspace() {
+    ScratchAllocator &workspace() {
         return arena_;
     }
-    ArenaLease lease_workspace() {
-        return ArenaLease(arena_);
+    ScratchScope lease_workspace() {
+        return ScratchScope(arena_);
     }
     void seal() {
         graphs_.seal();

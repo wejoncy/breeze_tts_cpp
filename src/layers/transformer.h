@@ -41,8 +41,9 @@ class TransformerEncoder {
         return type_;
     }
     void prepare(int max_rows) const;
+    void prepare(Workspace &, int max_rows = 0) const;
+    TensorView forward(TensorView hidden_states, ForwardContext &) const;
     // A nonzero prefix has bidirectional queries followed by a causal suffix.
-    void forward(Workspace &, TensorView x, const ForwardBatch &,
-                 int begin = 0, int end = -1) const;
+    void forward(Workspace &, TensorView x, const ForwardBatch &) const;
 };
 } // namespace tts

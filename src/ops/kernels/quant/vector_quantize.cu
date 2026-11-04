@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/vector_quantization.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include "runtime/device.h"
@@ -59,8 +60,9 @@ __global__ void quantize(T *x, const T *scores, const T *table, const T *norms,
                                            f(table[size_t(chosen) * ts + d]));
     }
 }
-void vector_quantize(cudaStream_t stream, TensorView x, TensorView scores, TensorView table,
+void vector_quantize( TensorView x, TensorView scores, TensorView table,
                       TensorView norms, int *codes, int cb, int codebooks, bool subtract, bool expanded) {
+    const auto stream = execution_context(x).stream;
     if (cb < 0 || cb >= codebooks || !codes || !x.data || !scores.data || !table.data ||
         !norms.data || scores.cols != table.rows || x.cols != table.cols ||
         x.rows != scores.rows || norms.numel() != size_t(table.rows) || !norms.dense() ||

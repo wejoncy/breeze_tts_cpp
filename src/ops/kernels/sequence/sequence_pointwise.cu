@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include <cstring>
 
@@ -267,7 +268,8 @@ int ConvGeometry::output_length(int input) const {
         throw std::invalid_argument("convolution output length out of range");
     return int(output);
 }
-void pointwise(cudaStream_t stream, TensorView x, TensorView y, const Epilogue &e) {
+void pointwise( TensorView x, TensorView y, const Epilogue &e) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     check_epilogue(e, y);
     if (!x.data || e.input_repeat < 1 || x.type != y.type || x.cols != y.cols ||
@@ -317,8 +319,9 @@ TensorShape validate_pointwise_quantize(TensorView x, RowScaledView q,
     }
     return shape;
 }
-void pointwise_quantize(cudaStream_t stream, TensorView x, RowScaledView q,
+void pointwise_quantize( TensorView x, RowScaledView q,
                         const Epilogue &e, TensorView retained, int multiprocessors) {
+    const auto stream = execution_context(x).stream;
     auto shape = validate_pointwise_quantize(x, q, e, retained);
     bool cached = size_t(shape.cols) * bytes(x.type) <= norm_cache_bytes;
     size_t shared = cached ? size_t(shape.cols) * bytes(x.type) : 0;
@@ -377,9 +380,10 @@ __global__ void linear_resample_kernel(View x, View y, int rows, int cols, int i
         }
     }
 }
-void linear_resample(cudaStream_t stream, TensorView x, TensorView y, int batch,
+void linear_resample( TensorView x, TensorView y, int batch,
                      int input_time, int output_time, const SequenceLayout *input,
                      const SequenceLayout *output) {
+    const auto stream = execution_context(x).stream;
     check_output(y);
     if (batch < 1 || input_time < 1 || output_time < 1 ||
         x.rows != (input ? input->rows : int64_t(batch) * input_time) ||
@@ -457,14 +461,16 @@ static void convolution(cudaStream_t stream, TensorView x, TensorView weight, Te
     if (input || output || e.packed || e.condition_sources || e.output_rows) run(PackedFinish(e));
     else run(Finish(e));
 }
-void convolution_finish(cudaStream_t s, TensorView p, TensorView y, int b, int t,
+void convolution_finish( TensorView p, TensorView y, int b, int t,
                         const ConvGeometry &g, const Epilogue &e,
                         const SequenceLayout *input, const SequenceLayout *output) {
-    convolution<false>(s, p, {}, y, b, t, g, e, input, output);
+    const auto stream = execution_context(p).stream;
+    convolution<false>(stream, p, {}, y, b, t, g, e, input, output);
 }
-void direct_convolution(cudaStream_t s, TensorView x, TensorView w, TensorView y, int b, int t,
+void direct_convolution( TensorView x, TensorView w, TensorView y, int b, int t,
                         const ConvGeometry &g, const Epilogue &e,
                         const SequenceLayout *input, const SequenceLayout *output) {
-    convolution<true>(s, x, w, y, b, t, g, e, input, output);
+    const auto stream = execution_context(x).stream;
+    convolution<true>(stream, x, w, y, b, t, g, e, input, output);
 }
 } // namespace tts::ops

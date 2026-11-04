@@ -1,4 +1,4 @@
-#include "ops/backend.h"
+#include "ops/cuda/backend.h"
 #include "ops/cuda/blas_check.h"
 #include "ops/cuda/lt_linear.h"
 #include "ops/kernels/common/cuda_math.cuh"
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <cufft.h>
 
 namespace tts {
 __device__ inline void dependency_wait() {
@@ -97,6 +98,7 @@ Backend::Backend(int device, Quantization quantization, size_t memory_limit_byte
 Backend::~Backend() {
     if (stream)
         cudaStreamSynchronize(stream);
+    for (const auto &plan : fft_plans_) cufftDestroy(plan.second);
     quant_.reset();
     lt_linear_.reset();
     if (lt_)
@@ -827,14 +829,14 @@ void Backend::attention(TensorView q, TensorView k, TensorView v, TensorView out
         (pos || cache.sequences) && !packed && dim == 128 && causal && !window && !slot) {
         if (size_t(batch) * nh * sizeof(float) > flash_lse_.size())
             throw std::runtime_error("FlashAttention workspace was not prepared");
-        decode_attention(stream, q, k, v, out, flash_lse_.ptr<float>(), pos, batch, nh, nk, cache);
+        decode_attention( q, k, v, out, flash_lse_.ptr<float>(), pos, batch, nh, nk, cache);
         return;
     }
     if (q.type == Type::BF16 && (time >= 64 || packed) && fixed_position == 0 &&
         ((dim == 128 && causal) || (dim == 256 && !causal))) {
         if (size_t(batch) * time * nh * sizeof(float) > flash_lse_.size())
             throw std::runtime_error("FlashAttention workspace bounds");
-        prefill_attention(stream, q, k, v, out, flash_lse_.ptr<float>(), batch, time, slot, cap, nh, nk,
+        prefill_attention( q, k, v, out, flash_lse_.ptr<float>(), batch, time, slot, cap, nh, nk,
                       dim, causal, window, packed, cache);
         return;
     }

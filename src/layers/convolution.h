@@ -1,5 +1,5 @@
 #pragma once
-#include "layers/weights.h"
+#include "io/weights.h"
 #include "ops/convolution.h"
 #include "core/forward_batch.h"
 

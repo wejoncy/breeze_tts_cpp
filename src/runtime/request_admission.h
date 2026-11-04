@@ -44,6 +44,7 @@ class RequestAdmissionPool {
         }
 
       public:
+        bool belongs_to(const RequestAdmissionPool &pool) const { return &pool_ == &pool; }
         // Executor-owned row credits. A state's KV/slot leases must be destroyed
         // before its row credit, and all states must die before this admission.
         class RowLease {

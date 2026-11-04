@@ -1,3 +1,4 @@
+#include "ops/cuda/backend.h"
 #include "ops/audio.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include <cuda_fp16.h>
@@ -22,9 +23,10 @@ __global__ void audio_embed_kernel(const bf16 *w, const int *codes, bf16 *out, i
         sum += f(w[(size_t(k) * vocab + codes[k]) * cols + c]);
     out[size_t(row) * stride + c] = r<bf16>(sum);
 }
-void audio_embedding(cudaStream_t stream, TensorView table, const int *codes, TensorView out,
+void audio_embedding( TensorView table, const int *codes, TensorView out,
                      int batch, int branches, int codebooks, int cb, const int *const *code_rows,
                      const int *row_request) {
+    const auto stream = execution_context(table).stream;
     size_t n = size_t(out.rows) * out.cols;
     audio_embed_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
         table.ptr<bf16>(), codes, out.ptr<bf16>(), batch, branches, out.cols, cb, out.ld(),
@@ -48,8 +50,9 @@ __global__ void rvq_kernel(const float *e, const int *codes, float *out, int bat
         sum += e[(size_t(k - first) * entries + codes[k]) * dim + d];
     out[i] = sum;
 }
-void rvq(cudaStream_t stream, TensorView e, const int *codes, TensorView out, int batch, int first,
+void rvq( TensorView e, const int *codes, TensorView out, int batch, int first,
          int count, int codebooks, const int *const *code_rows) {
+    const auto stream = execution_context(e).stream;
     int n = batch * out.cols;
     rvq_kernel<<<(n + 255) / 256, 256, 0, stream>>>(e.ptr<float>(), codes, out.ptr<float>(), batch,
                                                     first, count, out.cols, codebooks,
@@ -63,7 +66,8 @@ __global__ void snake_kernel(const float *x, const float *a, const float *b, flo
         y[i] = x[i] + s * s / (expf(b[i % cols]) + 1e-9f);
     }
 }
-void snake(cudaStream_t stream, TensorView x, TensorView a, TensorView b, TensorView out) {
+void snake( TensorView x, TensorView a, TensorView b, TensorView out) {
+    const auto stream = execution_context(x).stream;
     int n = x.rows * x.cols;
     snake_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x.ptr<float>(), a.ptr<float>(),
                                                       b.ptr<float>(), out.ptr<float>(), n, x.cols);
@@ -134,9 +138,10 @@ __global__ void conv_accumulate_kernel(const float *projected, float *pending, c
         }
     }
 }
-void conv_accumulate(cudaStream_t stream, TensorView projected, TensorView pending, TensorView bias,
+void conv_accumulate( TensorView projected, TensorView pending, TensorView bias,
                      TensorView out, int batch, int time, int kernel, int dilation, int stride,
                      bool trans, const int *frames, const ConvHistory *states) {
+    const auto stream = execution_context(projected).stream;
     int horizon = trans ? kernel - stride : (kernel - 1) * dilation,
         outtime = time * (trans ? stride : 1), capacity = outtime + horizon;
     int n = batch * out.cols * (outtime >= horizon ? capacity : 1);
@@ -175,9 +180,10 @@ __global__ void depthwise_kernel(const float *x, float *hist, const float *w, co
         hist[((position * time + t) % length) * channels + c] =
             x[(size_t(b) * time + t) * channels + c];
 }
-void depthwise(cudaStream_t stream, TensorView x, TensorView hist, TensorView w, TensorView bias,
+void depthwise( TensorView x, TensorView hist, TensorView w, TensorView bias,
                TensorView out, int batch, int time, int kernel, const int *frame,
                const ConvHistory *states) {
+    const auto stream = execution_context(x).stream;
     int n = batch * x.cols;
     depthwise_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
         x.ptr<float>(), hist.ptr<float>(), w.ptr<float>(), bias.ptr<float>(), out.ptr<float>(),
@@ -189,7 +195,8 @@ __global__ void pcm_kernel(const T *x, int16_t *out, int n, int cols, int stride
     if (i < n)
         out[i] = int16_t(lrintf(fminf(1.f, fmaxf(-1.f, float(x[size_t(i / cols) * stride + i % cols]))) * 32767.f));
 }
-void pcm(cudaStream_t stream, TensorView x, int16_t *out) {
+void pcm( TensorView x, int16_t *out) {
+    const auto stream = execution_context(x).stream;
     int n = x.rows * x.cols;
     auto launch = [&](auto value) {
         pcm_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x.ptr<decltype(value)>(), out, n, x.cols, x.ld());

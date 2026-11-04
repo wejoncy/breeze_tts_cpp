@@ -13,7 +13,8 @@ struct Engine::Impl {
     Impl(const std::string &dir, const ModelOptions &options, uint64_t engine_id)
         : id(engine_id), model(load_model(dir, options)), max_batch(options.max_batch) {
         scheduler = std::make_unique<RequestScheduler>(
-            model->planner(), model->runner(), max_batch, model->scheduling_quantum_ms(), id);
+            model->planner(), model->runner(), max_batch, model->scheduling_quantum_ms(), id,
+            model->executor_initializer());
     }
 };
 void Engine::run_async() {
@@ -130,10 +131,9 @@ std::vector<int> Engine::encode_audio(const std::vector<float> &mono) {
     log::check_not_callback();
     std::vector<int> codes;
     impl_->scheduler->run_sync([&] {
-        auto *codec = impl_->model->audio_codec();
-        if (!codec)
+        if (impl_->model->info().audio.codebooks <= 0)
             throw std::invalid_argument("loaded model does not expose discrete audio encoding");
-        codes = codec->encode_audio(mono);
+        codes = impl_->model->runner().encode_audio(mono);
         TTS_LOG(TTS_LOG_INFO, "reference", "encoded samples={} code_elements={}", mono.size(),
                 codes.size());
     });
@@ -143,10 +143,9 @@ std::vector<float> Engine::decode_codes(const std::vector<int> &codes) {
     log::check_not_callback();
     std::vector<float> pcm;
     impl_->scheduler->run_sync([&] {
-        auto *codec = impl_->model->audio_codec();
-        if (!codec)
+        if (impl_->model->info().audio.codebooks <= 0)
             throw std::invalid_argument("loaded model does not expose discrete audio decoding");
-        pcm = codec->decode_codes(codes);
+        pcm = impl_->model->runner().decode_codes(codes);
     });
     return pcm;
 }

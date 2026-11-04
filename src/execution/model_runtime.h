@@ -3,6 +3,7 @@
 #include "tts/memory_stats.h"
 #include "tts/quantization.h"
 #include "tts/model_info.h"
+#include "core/model.h"
 
 namespace tts {
 struct ModelOptions {
@@ -10,21 +11,36 @@ struct ModelOptions {
     Quantization quantization;
     size_t runtime_memory_bytes, memory_limit_bytes;
 };
-// One loaded model, with distinct CPU planner and executor-owned GPU runner.
-// The concrete model owns resource destruction order and device synchronization.
+class DeviceContext;
+class ModelLoader;
+class Weights;
+struct RunnerResources;
+struct ModelComponents {
+    ModelInfo info;
+    std::unique_ptr<Weights> parameters;
+    std::unique_ptr<Model> network;
+    std::unique_ptr<RequestPlanner> planner;
+    std::unique_ptr<RunnerResources> resources;
+    std::unique_ptr<ModelRunner> runner;
+    GenerationOptions defaults;
+    double quantum_ms = 0;
+};
+using ModelFactory = ModelComponents (*)(DeviceContext &, const ModelLoader &, const ModelOptions &);
+
+// Device and execution lifetime are common to every registered model.
 class ModelRuntime {
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
   public:
-    virtual ~ModelRuntime() = default;
-    virtual const ModelInfo &info() const = 0;
-    virtual GenerationOptions default_options() const = 0;
-    virtual RequestPlanner &planner() = 0;
-    virtual ModelRunner &runner() = 0;
-    virtual AudioCodec *audio_codec() {
-        return nullptr;
-    }
-    virtual MemoryStats memory_stats() const = 0;
-    // Acoustic models may execute several steps before producing a chunk.
-    virtual double scheduling_quantum_ms() const = 0;
+    ModelRuntime(const ModelLoader &, const ModelOptions &, ModelFactory);
+    ~ModelRuntime();
+    const ModelInfo &info() const;
+    GenerationOptions default_options() const;
+    RequestPlanner &planner();
+    ModelRunner &runner();
+    MemoryStats memory_stats() const;
+    double scheduling_quantum_ms() const;
+    std::function<void()> executor_initializer();
 };
 std::unique_ptr<ModelRuntime> load_model(const std::string &directory, const ModelOptions &);
 } // namespace tts

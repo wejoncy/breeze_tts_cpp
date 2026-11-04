@@ -1,35 +1,24 @@
 #include "models/gpt_sovits/model.h"
 #include "io/json.h"
-#include "models/gpt_sovits/model_runner.h"
-#include "models/gpt_sovits/request_planner.h"
-#include "models/gpt_sovits/frontend_assets.h"
 #include <algorithm>
 #include <cmath>
 
 namespace tts::gpt_sovits {
-namespace {
-ModelLoader::Checkpoint checkpoint(const ModelLoader &loader) {
-    auto checkpoint = loader.open({{"", ""}},
-        {"tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.bin", "pinyin.bin",
-         "polyphone.bin", "linguistics.json", "english.json", "english.safetensors"});
-    FrontendAssets assets(loader);
-    checkpoint.files.insert(checkpoint.files.end(), assets.files().begin(), assets.files().end());
-    std::sort(checkpoint.files.begin(), checkpoint.files.end());
-    checkpoint.files.erase(std::unique(checkpoint.files.begin(), checkpoint.files.end()),
-                           checkpoint.files.end());
-    return checkpoint;
-}
-} // namespace
-Model::Model(Backend &gpu, const ModelLoader &loader, int context)
-    : config(loader.config()),
-      weights(gpu, checkpoint(loader)),
+Model::Model(Weights &weights, const Json &configuration,
+              const Json &pronunciation_configuration, int context)
+    : config(configuration),
       bert(weights, config.at("bert"), "bert.bert",
-           config.at("bert").at("num_hidden_layers").get<int>() - 2, gpu.has_quantization()),
-      pronunciation(weights, read_json(loader.path("g2pw.json"))),
-      semantic(weights, config.at("semantic"), context), reference(weights, config),
-      acoustic(weights, config.at("acoustic")),
-      flow(weights, config.at("flow"), config.at("synthesis").at("window_frames")),
-      vocoder(weights, config.at("vocoder")),
+           config.at("bert").at("num_hidden_layers").get<int>() - 2, weights.quantization() != Quantization::None),
+      pronunciation(weights, "g2pw", pronunciation_configuration),
+      semantic(weights, "semantic.model", config.at("semantic"), context),
+      reference(weights, "hubert", "acoustic", config.at("hubert"), config.at("acoustic"),
+                config.at("reference"), config.at("flow").at("mel_channels")),
+      acoustic(weights, "acoustic", config.at("acoustic")),
+      flow(weights, "acoustic.cfm.estimator", config.at("flow"), config.at("synthesis").at("window_frames"),
+            config.at("reference").at("mel_min"), config.at("reference").at("mel_max"),
+            config.at("synthesis").at("rolling_frames")),
+      vocoder(weights, "vocoder", config.at("vocoder")),
+      sampler({1, config.at("semantic").at("EOS"), config.at("semantic").at("EOS")}),
       window_frames(config.at("synthesis").at("window_frames")),
       reference_frames(config.at("synthesis").at("reference_frames")),
       rolling_frames(config.at("synthesis").at("rolling_frames")),
@@ -45,81 +34,55 @@ Model::Model(Backend &gpu, const ModelLoader &loader, int context)
         !std::isfinite(mel_maximum) || vocoder.samples(1) != config.at("samples_per_frame"))
         throw std::invalid_argument("inconsistent GPT-SoVITS synthesis configuration");
 }
-void Model::prepare_flow(Flow::Workspace &w, const DiT::Condition &condition,
-                           const ForwardBatch &input, const int *prefix, const uint64_t *seeds,
-                           const uint64_t *windows, FlowSampling parameters) const {
-    flow.prepare(w, condition, input, parameters);
-    flow.initialize(w, input, prefix, seeds, windows);
+TensorView Model::text_features(TensorInputs inputs, ForwardContext &context) const {
+    if (!inputs["input_ids"].numel()) return TensorView::metadata(0, semantic.hidden(), semantic.type());
+    auto text_context = context;
+    if (context.sequences.contains("text")) {
+        const auto sequence = context.sequences["text"];
+        text_context.batch = ForwardBatch(sequence);
+        text_context.batch.positions = sequence.row_position;
+        text_context.max_batch = std::max(1, sequence.sequences);
+        text_context.max_time = std::max(1, sequence.max_length);
+        text_context.max_rows = context.mode == ForwardContext::Prepare ? context.max_rows : sequence.rows;
+    }
+    auto hidden_states = bert.forward(inputs["input_ids"], text_context);
+    return semantic.encode_features(hidden_states, text_context);
 }
-void Model::flow_step(Flow::Workspace &w, const ForwardBatch &input,
-                      const int *prefix_lengths, int prefix, int step, FlowSampling parameters,
-                      const ops::EulerOutput &output) const {
-    int target = input.time() - prefix;
-    if (prefix < 0 || target < 1 || target > target_frames)
-        throw std::invalid_argument("CFM target exceeds initialized window");
-    flow.step(w, input, prefix_lengths, step, parameters, output);
-}
-
-namespace {
-class Runtime final : public ModelRuntime {
-    Backend gpu_;
-    Model model_;
-    std::unique_ptr<Planner> planner_;
-    std::unique_ptr<Runner> runner_;
-    const ModelInfo info_;
-
-  public:
-    Runtime(const ModelLoader &loader, const ModelOptions &options)
-        : gpu_(options.device, options.quantization, options.memory_limit_bytes),
-          model_(gpu_, loader, options.context),
-          info_{"gpt_sovits_v5",
-                {model_.config.at("sample_rate"), model_.config.at("samples_per_frame"), 0, 0},
-                model_.acoustic.feature_frames(options.context - 1),
-                model_.weights.size(),
-                size_t(model_.config.at("reference").at("max_seconds").get<float>() *
-                       model_.config.at("sample_rate").get<int>()),
-                model_.weights.checkpoint_files()} {
-        model_.weights.load();
-        model_.weights.seal();
-        planner_ = std::make_unique<Planner>(loader.path(""), model_.config, options.context,
-                                            model_.semantic.type());
-        runner_ = std::make_unique<Runner>(model_, gpu_, options.max_batch, options.context,
-                                          options.kv_page_tokens, options.runtime_memory_bytes);
+void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs outputs,
+                     ForwardContext &context) const {
+    if (program == "pronunciation") {
+        outputs["labels"] = pronunciation.forward(inputs, context);
+    } else if (program == "text") {
+        outputs["encoded_features"] = text_features(inputs, context);
+    } else if (program == "tokens") {
+        std::vector<NamedTensor> arguments(inputs.data, inputs.data + inputs.size);
+        if (!context.batch.is_decode()) arguments.push_back({"encoded_features", text_features(inputs, context)});
+        auto logits = semantic.forward({arguments.data(), arguments.size()}, context);
+        outputs["logits"] = logits;
+        outputs["done"] = sampler.forward(logits, inputs["sampling"], inputs["done"], context);
+    } else if (program == "waveform") {
+        TensorBatch features;
+        {
+            ScratchScope acoustic_scope(context.storage);
+            features = acoustic.forward(inputs, context);
+        }
+        auto mel = flow.forward(features, inputs, context);
+        outputs["waveform"] = vocoder.forward(mel, outputs["audio_layout"], context);
+    } else if (program == "reference") {
+        const auto encoded = reference.forward(inputs["waveform"], inputs["speech_waveform"], context);
+        auto acoustic_context = context;
+        acoustic_context.max_time = std::max(context.max_time, encoded.codes.rows);
+        acoustic_context.max_rows = std::max(context.max_rows, inputs["phones"].rows);
+        const auto conditioned = acoustic.forward(encoded.codes, inputs["phones"], encoded.style,
+                                                   acoustic_context);
+        outputs["codes"] = encoded.codes;
+        outputs["style"] = encoded.style;
+        outputs["mel"] = encoded.mel;
+        outputs["features"] = conditioned.features;
+        outputs["waveform_condition"] = conditioned.waveform_condition;
+        outputs["reference_bert"] = text_features(inputs, context);
+    } else {
+        throw std::invalid_argument("unknown model forward program");
     }
-    ~Runtime() override {
-        cudaSetDevice(gpu_.device);
-        cudaStreamSynchronize(gpu_.stream);
-    }
-    const ModelInfo &info() const override {
-        return info_;
-    }
-    GenerationOptions default_options() const override {
-        GenerationOptions options;
-        options.top_k = 15;
-        options.temperature = 1;
-        options.repetition_penalty = 1.35f;
-        options.max_frames = std::min(info_.max_output_frames, 2500);
-        options.sample_steps = model_.flow.sampling().steps;
-        options.cfg_rate = model_.flow.sampling().guidance;
-        return options;
-    }
-    RequestPlanner &planner() override {
-        return *planner_;
-    }
-    ModelRunner &runner() override {
-        return *runner_;
-    }
-    double scheduling_quantum_ms() const override {
-        return 1000. / model_.config.at("semantic_rate").get<int>();
-    }
-    MemoryStats memory_stats() const override {
-        gpu_.memory.sync();
-        return gpu_.memory.stats();
-    }
-};
-} // namespace
-std::unique_ptr<ModelRuntime> load_model(const ModelLoader &loader,
-                                         const ModelOptions &options) {
-    return std::make_unique<Runtime>(loader, options);
 }
 } // namespace tts::gpt_sovits

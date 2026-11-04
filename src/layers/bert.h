@@ -24,5 +24,6 @@ class Bert {
     Type type() const { return encoder_.type(); }
     void prepare(int max_rows) const { encoder_.prepare(max_rows); }
     TensorView forward(Workspace &, const int *ids, const ForwardBatch &) const;
+    TensorView forward(TensorView input_ids, ForwardContext &) const;
 };
 } // namespace tts

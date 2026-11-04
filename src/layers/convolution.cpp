@@ -1,3 +1,4 @@
+#include "ops/basic.h"
 #include "layers/convolution.h"
 #include <cstring>
 
@@ -41,9 +42,9 @@ size_t Convolution::workspace_bytes(int batch, int input_length) const {
 }
 void Convolution::prepare(TensorView input, TensorView projection,
                           int max_rows) const {
-    auto &gpu = backend_for(input);
+
     if (workspace_bytes(1, 1))
-        gpu.prepare_linear(input, weight_, projection, false, 0, 1, geometry_.groups, max_rows);
+        ops::prepare_matmul(input, weight_, projection, false, 0, 1, geometry_.groups, max_rows);
 }
 void Convolution::forward(TensorView x, TensorView y, const ForwardBatch &batch,
                           TensorView workspace, ops::Epilogue e, const SequenceLayout *output) const {

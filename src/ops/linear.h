@@ -4,7 +4,6 @@
 #include <variant>
 
 namespace tts {
-class Backend;
 namespace ops {
 using LinearOperand = std::variant<TensorView, RowScaledView>;
 // With quantized_output, output is disposable projection scratch; the result is in

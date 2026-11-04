@@ -19,8 +19,10 @@ add_library(tts SHARED
   src/ops/cuda/lt_linear.cpp
   src/ops/cuda/grouped_linear.cpp
   src/ops/cuda/relative_attention.cpp
+  src/ops/cuda/fft.cpp
   src/ops/cuda/execution_context.cpp
   src/ops/linear.cpp
+  src/ops/basic.cpp
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
@@ -29,33 +31,35 @@ add_library(tts SHARED
   src/layers/transformer.cpp
   src/layers/bert.cpp
   src/layers/spectrogram.cpp
-  src/models/model_registry.cpp
+  src/execution/model_registry.cpp
   src/models/gpt_sovits/model.cpp
-  src/models/gpt_sovits/frontend.cpp
-  src/models/gpt_sovits/language_router.cpp
-  src/models/gpt_sovits/pronunciation.cpp
-  src/models/gpt_sovits/model_runner.cpp
-  src/models/gpt_sovits/model_runner_init.cpp
-  src/models/gpt_sovits/request_planner.cpp
-  src/models/gpt_sovits/vocoder.cpp
-  src/models/gpt_sovits/dit.cpp
-  src/models/gpt_sovits/speech_encoder.cpp
-  src/models/gpt_sovits/semantic.cpp
-  src/models/gpt_sovits/relative_encoder.cpp
-  src/models/gpt_sovits/style_encoder.cpp
-  src/models/gpt_sovits/wavenet.cpp
-  src/models/gpt_sovits/acoustic.cpp
-  src/models/gpt_sovits/reference_encoder.cpp
+  src/text/frontend.cpp
+  src/text/language_router.cpp
+  src/layers/text/pronunciation.cpp
+  src/layers/audio/vocoder.cpp
+  src/layers/diffusion/dit.cpp
+  src/layers/diffusion/flow.cpp
+  src/layers/transformer/hubert.cpp
+  src/layers/transformer/conditioned_decoder.cpp
+  src/layers/transformer/relative.cpp
+  src/layers/audio/style_encoder.cpp
+  src/layers/audio/wavenet.cpp
+  src/layers/audio/acoustic.cpp
+  src/layers/audio/reference_encoder.cpp
+  src/execution/model_runtime.cpp
+  src/execution/input_staging.cpp
+  src/execution/input_packing.cpp
+  src/execution/model_runner.cpp
+  src/inputs/input_registry.cpp
+  src/inputs/token_inputs.cpp
+  src/inputs/phoneme_inputs.cpp
   src/engine/engine.cpp
   src/engine/request_executor.cpp
   src/engine/request_scheduler.cpp
-  src/models/breeze/model_runner.cpp
-  src/models/breeze/prefill.cpp
-  src/models/breeze/prepared_batch.cpp
-  src/models/breeze/request_planner.cpp
   src/io/audio_io.cpp
   src/io/mapped_file.cpp
   src/io/model_loader.cpp
+  src/io/weights.cpp
   src/io/safetensors.cpp
   src/text/g2pw.cpp
   src/text/english.cpp
@@ -88,8 +92,8 @@ add_library(tts SHARED
   src/ops/kernels/quant/vector_quantize.cu
   src/ops/kernels/sampling/sampling.cu
   src/ops/kernels/text/pronunciation.cu
-  src/models/breeze/audio_encoder.cpp
-  src/models/breeze/codec.cpp
+  src/layers/audio/encoder.cpp
+  src/layers/audio/codec.cpp
   src/models/breeze/model.cpp
   src/models/breeze/model_config.cpp
   src/support/log.cpp
