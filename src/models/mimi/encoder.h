@@ -1,7 +1,7 @@
 #pragma once
 #include "io/weights.h"
 #include "core/forward_context.h"
-#include "layers/audio/config.h"
+#include "models/mimi/config.h"
 namespace tts {
 struct EncoderConv {
     TensorView weight, bias;

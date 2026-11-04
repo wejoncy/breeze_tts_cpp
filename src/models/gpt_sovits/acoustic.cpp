@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/audio/acoustic.h"
+#include "models/gpt_sovits/acoustic.h"
 #include "layers/input_metadata.h"
 #include "ops/attention.h"
 namespace tts {

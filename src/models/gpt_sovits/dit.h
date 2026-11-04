@@ -1,7 +1,7 @@
 #pragma once
 #include "layers/convolution.h"
 #include "layers/linear.h"
-#include "layers/diffusion/sampling.h"
+#include "models/gpt_sovits/sampling.h"
 #include "io/json.h"
 #include <map>
 

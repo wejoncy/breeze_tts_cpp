@@ -1,5 +1,5 @@
 #pragma once
-#include "layers/audio/config.h"
+#include "models/mimi/config.h"
 #include "io/json.h"
 #include <string>
 

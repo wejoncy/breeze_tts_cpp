@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/transformer/hubert.h"
+#include "models/hubert/model.h"
 
 namespace tts {
 namespace {

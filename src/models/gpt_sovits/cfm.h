@@ -1,6 +1,6 @@
 #pragma once
 #include "ops/basic.h"
-#include "layers/diffusion/dit.h"
+#include "models/gpt_sovits/dit.h"
 #include "core/tensor_batch.h"
 #include "core/forward_context.h"
 #include <cmath>

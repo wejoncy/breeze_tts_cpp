@@ -1,6 +1,6 @@
 #pragma once
 #include "layers/transformer/decoder.h"
-#include "layers/audio/config.h"
+#include "models/mimi/config.h"
 #include "ops/audio.h"
 #include "core/sequence_state.h"
 

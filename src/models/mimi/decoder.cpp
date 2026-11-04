@@ -1,6 +1,6 @@
 #include "ops/basic.h"
 #include "ops/audio.h"
-#include "layers/audio/codec.h"
+#include "models/mimi/decoder.h"
 #include <algorithm>
 #include <iterator>
 

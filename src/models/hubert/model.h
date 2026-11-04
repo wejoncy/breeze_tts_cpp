@@ -1,7 +1,6 @@
 #pragma once
 #include "layers/convolution.h"
 #include "layers/transformer.h"
-#include "layers/bert.h"
 #include "io/json.h"
 
 namespace tts {

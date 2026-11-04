@@ -1,6 +1,6 @@
 #pragma once
-#include "layers/audio/codec.h"
-#include "layers/audio/encoder.h"
+#include "models/mimi/decoder.h"
+#include "models/mimi/encoder.h"
 #include "models/breeze/model_config.h"
 #include "core/model.h"
 #include "layers/sampler.h"

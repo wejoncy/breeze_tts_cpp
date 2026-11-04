@@ -1,5 +1,5 @@
 #pragma once
-#include "layers/transformer/hubert.h"
+#include "models/hubert/model.h"
 #include "layers/audio/style_encoder.h"
 #include "layers/spectrogram.h"
 #include "core/forward_context.h"

@@ -1,6 +1,6 @@
 #include "support/profiler.h"
 #include "ops/basic.h"
-#include "layers/audio/encoder.h"
+#include "models/mimi/encoder.h"
 #include "ops/audio_encoder.h"
 #include "ops/vector_quantization.h"
 #include <cmath>

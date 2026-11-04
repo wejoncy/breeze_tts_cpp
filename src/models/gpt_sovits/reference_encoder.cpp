@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include "ops/basic.h"
-#include "layers/audio/reference_encoder.h"
+#include "models/gpt_sovits/reference_encoder.h"
 #include "ops/vector_quantization.h"
 #include <cmath>
 

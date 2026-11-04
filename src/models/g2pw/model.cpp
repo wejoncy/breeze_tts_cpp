@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/text/pronunciation.h"
+#include "models/g2pw/model.h"
 #include "ops/pronunciation.h"
 #include <cstdint>
 

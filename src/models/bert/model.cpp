@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/bert.h"
+#include "models/bert/model.h"
 #include <cmath>
 
 namespace tts {

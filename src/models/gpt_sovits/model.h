@@ -1,10 +1,11 @@
 #pragma once
-#include "layers/audio/acoustic.h"
-#include "layers/diffusion/flow.h"
-#include "layers/audio/reference_encoder.h"
-#include "layers/transformer/conditioned_decoder.h"
-#include "layers/audio/vocoder.h"
-#include "layers/text/pronunciation.h"
+#include "models/bert/model.h"
+#include "models/gpt_sovits/acoustic.h"
+#include "models/gpt_sovits/cfm.h"
+#include "models/gpt_sovits/reference_encoder.h"
+#include "models/gpt_sovits/semantic.h"
+#include "models/gpt_sovits/vocoder.h"
+#include "models/g2pw/model.h"
 #include "core/model.h"
 #include "layers/sampler.h"
 

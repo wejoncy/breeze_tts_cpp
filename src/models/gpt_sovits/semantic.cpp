@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/transformer/conditioned_decoder.h"
+#include "models/gpt_sovits/semantic.h"
 #include <cmath>
 
 namespace tts {

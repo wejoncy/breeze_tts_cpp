@@ -1,5 +1,5 @@
 #pragma once
-#include "layers/bert.h"
+#include "models/bert/model.h"
 
 namespace tts {
 class Pronunciation {

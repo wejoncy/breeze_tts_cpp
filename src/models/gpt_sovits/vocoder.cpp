@@ -1,5 +1,5 @@
 #include "ops/basic.h"
-#include "layers/audio/vocoder.h"
+#include "models/gpt_sovits/vocoder.h"
 #include <numeric>
 #include <tuple>
 

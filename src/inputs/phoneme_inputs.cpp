@@ -5,7 +5,7 @@
 #include "text/segmentation.h"
 #include "io/audio_io.h"
 #include "io/model_loader.h"
-#include "layers/diffusion/sampling.h"
+#include "models/gpt_sovits/sampling.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <numeric>

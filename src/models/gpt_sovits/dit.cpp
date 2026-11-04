@@ -1,6 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "layers/diffusion/dit.h"
+#include "models/gpt_sovits/dit.h"
 #include "ops/attention.h"
 #include "ops/basic.h"
 #include <cmath>
