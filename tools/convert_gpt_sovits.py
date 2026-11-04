@@ -92,13 +92,13 @@ def main():
                    args.english_segmenter, args.english_tagger, output)
     languages = {
         "zh": ["tokenizer.json", "g2pw_tokenizer.json", "g2pw.json", "jieba.dict.utf8", "jieba.hmm.utf8",
-               "pinyin.bin", "polyphone.bin", "linguistics.json"],
+               "pinyin.json", "polyphone.json", "linguistics.json"],
         "en": ["english.json", "english.safetensors", "linguistics.json"],
     }
     mecab_files = ["char.bin", "matrix.bin", "sys.dic", "unk.dic", "dicrc"]
     if args.cantonese_jyutping:
         export_cantonese(args.text_source / "GPT_SoVITS/text", args.cantonese_jyutping, output)
-        languages["yue"] = ["cantonese.bin", "pinyin.bin", "linguistics.json"]
+        languages["yue"] = ["cantonese.json", "pinyin.json", "linguistics.json"]
     if all(korean):
         export_korean(args.text_source / "GPT_SoVITS/text", *korean, output)
         languages["ko"] = ["korean.json", "linguistics.json"] + ["korean_mecab/" + name for name in mecab_files]

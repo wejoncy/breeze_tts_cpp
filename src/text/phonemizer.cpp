@@ -4,7 +4,6 @@
 #include "text/normalization.h"
 #include "text/jieba.h"
 #include "text/tone_sandhi.h"
-#include "text/linguistic_data.h"
 #include "text/utf8.h"
 #include "io/json.h"
 #include <algorithm>
@@ -54,25 +53,14 @@ struct ChinesePhonemizer::Impl {
                 throw std::invalid_argument("duplicate pronunciation symbol");
         }
         unknown = symbol_ids.at("UNK");
-        MappedFile file(directory + "/polyphone.bin");
-        DataReader reader(file.data(), file.size());
-        if (reader.text(8) != "GSVPOLY1") throw std::invalid_argument("unsupported pronunciation correction asset");
-        for (int section = 0; section < 2; ++section) {
-            auto count = reader.read<uint32_t>();
-            if (count > reader.remaining() / 3) throw std::invalid_argument("pronunciation correction count");
-            while (count--) {
-                auto n = reader.read<uint8_t>();
-                std::u32string word;
-                while (n--) word.push_back(reader.read<uint32_t>());
-                n = reader.read<uint8_t>();
-                std::vector<std::string> values;
-                while (n--) values.emplace_back(reader.text(reader.read<uint8_t>()));
-                if (word.empty() || values.empty() || (section == 1 && word.size() != 1))
-                    throw std::invalid_argument("invalid pronunciation correction");
-                corrections.insert_or_assign(std::move(word), std::move(values));
-            }
+        const auto overrides = read_json(directory + "/polyphone.json");
+        for (const auto &[word, values] : overrides.items()) {
+            auto key = decode(word);
+            auto readings = values.get<std::vector<std::string>>();
+            if (key.empty() || readings.empty())
+                throw std::invalid_argument("invalid pronunciation correction");
+            corrections.emplace(std::move(key), std::move(readings));
         }
-        reader.finish();
     }
     bool punct(char32_t cp) const { return punctuation.find(cp) != std::u32string::npos; }
     std::u32string replace(std::u32string_view sentence) const {

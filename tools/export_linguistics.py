@@ -2,12 +2,11 @@
 
 The dictionaries and HMM probabilities come from the checkpoint's official
 jieba_fast/pypinyin versions. GPT-SoVITS and PaddleSpeech rules are extracted as
-literal data, never executed. Containers retain the existing checkpoint format.
+literal data, never executed. Dictionaries use standard JSON and native formats.
 """
 import ast
 import json
 from pathlib import Path
-import struct
 import shutil
 
 
@@ -57,21 +56,6 @@ def module_data(path):
     return values
 
 
-def container(path, magic, sections):
-    offset = 16 + 32 * len(sections)
-    directory, payload = bytearray(), bytearray()
-    for name, data in sections:
-        if len(name) > 8:
-            raise ValueError("language section names are limited to 8 bytes")
-        directory += name.encode("ascii").ljust(8, b"\0") + struct.pack("<QQQ", offset + len(payload), len(data), 0)
-        payload += data
-    Path(path).write_bytes(magic + struct.pack("<II", 1, len(sections)) + directory + payload)
-
-
-def integers(values):
-    return b"".join(struct.pack("<I", value) for value in values)
-
-
 def export_jieba(package, output):
     """Preserve the source dictionary/probabilities in cppjieba's UTF-8 formats."""
     import jieba_fast.finalseg as final
@@ -98,32 +82,8 @@ def export_pinyin(package, text, output):
         raise ValueError("traditional/simplified mapping length mismatch")
     t2s = {ord(t): ord(s) for s, t in zip(simplified, traditional)}
     t2s = sorted((t, s) for t, s in t2s.items() if t != s)
-    pool, codepoints, readings = bytearray(), [], set()
-
-    def add(runs):
-        offset = len(pool)
-        for run in runs:
-            if not run or len(run) >= 256:
-                raise ValueError("invalid pronunciation candidate count")
-            pool.append(len(run))
-            for syllable in run:
-                readings.add(syllable)
-                encoded = syllable.encode("utf-8")
-                if len(encoded) >= 256:
-                    raise ValueError("pronunciation exceeds format limit")
-                pool.extend(bytes([len(encoded)]) + encoded)
-        return offset, len(runs)
-
-    phrase_data = bytearray(struct.pack("<I", len(phrases)))
-    for word, runs in sorted(phrases.items()):
-        offset, count = add(runs)
-        phrase_data += struct.pack("<IHIHH", len(codepoints), len(word), offset, count, 0)
-        codepoints.extend(map(ord, word))
-    char_data = bytearray(struct.pack("<I", len(characters)))
-    for cp, syllables in sorted((int(cp), value) for cp, value in characters.items()):
-        offset, count = add([syllables.split(",")])
-        char_data += struct.pack("<IIHH", cp, offset, count, 0)
-        codepoints.append(cp)
+    readings = {reading for runs in phrases.values() for run in runs for reading in run}
+    readings.update(reading for values in characters.values() for reading in values.split(","))
     ranges, start = [], None
     for cp in range(0x10001):
         if cp < 0x10000 and chr(cp).isnumeric():
@@ -131,12 +91,13 @@ def export_pinyin(package, text, output):
         elif start is not None:
             ranges.append((start, cp - 1))
             start = None
-    container(output / "pinyin.bin", b"GSPPYX01", [
-        ("meta", struct.pack("<II", 1, 0)), ("tags", b""), ("cps", integers(codepoints)),
-        ("phrases", phrase_data), ("sylpool", pool), ("chars", char_data),
-        ("t2s", struct.pack("<I", len(t2s)) + b"".join(struct.pack("<II", *pair) for pair in t2s)),
-        ("numrange", struct.pack("<I", len(ranges)) + b"".join(struct.pack("<II", *pair) for pair in ranges)),
-    ])
+    dictionary = dict(
+        phrases={word: [run[0] for run in runs] for word, runs in phrases.items()},
+        characters={chr(int(codepoint)): values.split(",")[0] for codepoint, values in characters.items()},
+        traditional=t2s, numeric=ranges,
+    )
+    (output / "pinyin.json").write_text(
+        json.dumps(dictionary, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     from pypinyin.contrib.tone_convert import to_initials, to_finals_tone3, to_tone3, to_normal
     from pypinyin.constants import RE_HANS
     # Style conversion is a finite linguistic table, including all dictionary
@@ -314,7 +275,7 @@ def export_cantonese(text, jyutping, output):
         # the resulting character alignment. Preserve that terminal/error.
         return None
 
-    encoded, count = bytearray(), 0
+    dictionary = {}
     pending = [("", root)]
     while pending:
         key, node = pending.pop()
@@ -322,10 +283,10 @@ def export_cantonese(text, jyutping, output):
             readings = [" ".join(node[1])] if len(key) == 1 else node[1][:len(key)]
             mapped = [phones(reading) for reading in readings]
             values = [phone for group in mapped for phone in group] if all(mapped) else []
-            encoded += struct.pack("<HH", len(key), len(values)) + integers(map(ord, key)) + integers(values)
-            count += 1
+            dictionary[key] = values
         pending.extend((key + cp, child) for cp, child in sorted(node[0].items(), reverse=True))
-    container(output / "cantonese.bin", b"GSVYUE01", [("entries", struct.pack("<I", count) + encoded)])
+    (output / "cantonese.json").write_text(
+        json.dumps(dictionary, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     data["cantonese"] = dict(replacements=list(rules["rep_map"].items()))
     (output / "linguistics.json").write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 

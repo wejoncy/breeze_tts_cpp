@@ -1,6 +1,6 @@
 // Pronunciation selection: ToJyutping (BSD-2-Clause). Phone mapping: GPT-SoVITS (MIT).
 #include "text/cantonese.h"
-#include "text/linguistic_data.h"
+#include "text/lexicon.h"
 #include "text/normalization.h"
 #include "text/utf8.h"
 #include "io/json.h"
@@ -9,12 +9,7 @@
 
 namespace tts::text {
 struct CantonesePhonemizer::Impl {
-    struct Node {
-        std::map<char32_t, size_t> children;
-        std::vector<int> phones;
-        bool terminal = false;
-    };
-    std::vector<Node> trie{1};
+    Lexicon<int> pronunciations;
     TextNormalizer normalizer;
     std::vector<std::pair<std::u32string, std::u32string>> replacements;
     std::map<char32_t, int> punctuation;
@@ -37,37 +32,11 @@ struct CantonesePhonemizer::Impl {
                 throw std::invalid_argument("invalid Cantonese punctuation asset");
             punctuation.emplace(cp.front(), int(id - symbols.begin()));
         }
-        LinguisticAsset asset(directory + "/cantonese.bin", "GSVYUE01");
-        auto entries = asset.section("entries");
-        auto count = entries.read<uint32_t>();
-        if (count > entries.remaining() / 4)
-            throw std::invalid_argument("Cantonese dictionary entry count");
-        while (count--) {
-            size_t node = 0;
-            auto length = entries.read<uint16_t>(), phones = entries.read<uint16_t>();
-            if (!length)
-                throw std::invalid_argument("empty Cantonese dictionary key");
-            for (int i = 0; i < length; ++i) {
-                auto cp = entries.read<uint32_t>();
-                auto found = trie[node].children.find(cp);
-                if (found == trie[node].children.end()) {
-                    auto next = trie.size();
-                    trie[node].children.emplace(cp, next);
-                    trie.emplace_back();
-                    node = next;
-                } else node = found->second;
-            }
-            if (trie[node].terminal)
-                throw std::invalid_argument("duplicate Cantonese dictionary entry");
-            trie[node].terminal = true;
-            while (phones--) {
-                auto id = entries.read<uint32_t>();
-                if (id >= symbols.size())
+        pronunciations = load_lexicon<int>(read_json(directory + "/cantonese.json"));
+        for (const auto &[word, phones] : pronunciations)
+            for (int phone : phones)
+                if (phone < 0 || size_t(phone) >= symbols.size())
                     throw std::invalid_argument("Cantonese phone outside vocabulary");
-                trie[node].phones.push_back(int(id));
-            }
-        }
-        entries.finish();
     }
     std::u32string normalize(std::u32string_view text) const {
         std::u32string out;
@@ -97,21 +66,15 @@ struct CantonesePhonemizer::Impl {
                 ++i;
                 continue;
             }
-            size_t node = 0, end = i, selected = 0;
-            for (size_t j = i; j < text.size(); ++j) {
-                auto next = trie[node].children.find(text[j]);
-                if (next == trie[node].children.end()) break;
-                node = next->second;
-                if (trie[node].terminal) { selected = node; end = j + 1; }
-            }
-            if (end == i)
+            const auto selected = longest_match(pronunciations, text.substr(i));
+            if (selected == pronunciations.end())
                 throw std::invalid_argument("Cantonese dictionary has no pronunciation for " +
                                             encode(text.substr(i, 1)));
-            const auto &phones = trie[selected].phones;
+            const auto &phones = selected->second;
             if (phones.empty())
                 throw std::invalid_argument("Cantonese pronunciation/character alignment mismatch");
             out.insert(out.end(), phones.begin(), phones.end());
-            i = end;
+            i += selected->first.size();
         }
         return out;
     }

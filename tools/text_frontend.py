@@ -4,7 +4,6 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
-import struct
 
 
 def export_frontend(source, g2pw, tokenizer, output, dtype):
@@ -73,15 +72,5 @@ def export_frontend(source, g2pw, tokenizer, output, dtype):
             if line.strip():
                 word, value = line.split(":", 1)
                 overrides[word.strip()] = ast.literal_eval(value.strip())
-    encoded = bytearray(b"GSVPOLY1")
-    for subset in ({w: v for w, v in overrides.items() if len(w) > 1},
-                   {w: v for w, v in overrides.items() if len(w) == 1}):
-        encoded += struct.pack("<I", len(subset))
-        for word, readings in sorted(subset.items()):
-            encoded += struct.pack("<B", len(word))
-            encoded += b"".join(struct.pack("<I", ord(char)) for char in word)
-            encoded += struct.pack("<B", len(readings))
-            for value in readings:
-                value = value.encode("utf-8")
-                encoded += struct.pack("<B", len(value)) + value
-    (output / "polyphone.bin").write_bytes(encoded)
+    (output / "polyphone.json").write_text(
+        json.dumps(overrides, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")

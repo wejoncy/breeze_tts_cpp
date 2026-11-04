@@ -30,7 +30,7 @@ FetchContent_Declare(openjtalk
   URL https://codeload.github.com/r9y9/open_jtalk/tar.gz/462fc38e7520aa89e4d32b2611749208528c901e
   URL_HASH SHA256=c2d9c5e83d8ae7c9f8564f73224523a70bab3e10aa808f60609a6ed59d3f9db3
   EXCLUDE_FROM_ALL
-  SOURCE_SUBDIR src)
+  SOURCE_SUBDIR _tts_library_only)
 FetchContent_Declare(mecab
   URL https://codeload.github.com/Pusnow/mecab-ko-msvc/tar.gz/398f5f550045bebcfdef3c756cca302c659967df
   URL_HASH SHA256=5ebde3563b94b7dcd8ffc28a230b0c4c5f8cad1fe3950ea60ce6bcf93855094c
@@ -76,18 +76,18 @@ function(tts_fetch_dependencies)
   set(BUILD_PROGRAMS OFF)
   FetchContent_MakeAvailable(json spdlog concurrentqueue cppjieba fasttext corrosion cutlass flash_attention)
   FetchContent_MakeAvailable(openjtalk mecab)
-  # MeCab-Ko also reads Japanese dictionaries. Use one parser so Korean space
-  # penalties are retained and no duplicate MeCab symbols enter the engine.
-  get_target_property(openjtalk_sources openjtalk SOURCES)
-  list(FILTER openjtalk_sources EXCLUDE REGEX "(^|/)mecab/src/")
-  set_property(TARGET openjtalk PROPERTY SOURCES "${openjtalk_sources}")
-  set_target_properties(openjtalk PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 14)
-  get_target_property(openjtalk_headers openjtalk INCLUDE_DIRECTORIES)
-  list(FILTER openjtalk_headers EXCLUDE REGEX "/mecab/src$")
-  target_include_directories(openjtalk SYSTEM INTERFACE "${openjtalk_headers}")
-  if(HAVE_LIBM)
-    target_link_libraries(openjtalk PRIVATE m)
-  endif()
+  # Only the linguistic C library is needed. Its upstream build configures a
+  # second MeCab and writes generated headers into the fetched source tree.
+  file(GLOB openjtalk_sources CONFIGURE_DEPENDS "${openjtalk_SOURCE_DIR}/src/*/*.c")
+  list(FILTER openjtalk_sources EXCLUDE REGEX "/bin/")
+  add_library(openjtalk STATIC ${openjtalk_sources})
+  set_target_properties(openjtalk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(openjtalk PRIVATE CHARSET_UTF_8)
+  foreach(source IN LISTS openjtalk_sources)
+    cmake_path(GET source PARENT_PATH directory)
+    target_include_directories(openjtalk SYSTEM PUBLIC "${directory}")
+  endforeach()
+  # MeCab-Ko also reads Japanese dictionaries, retaining Korean space penalties.
   include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Mecab.cmake")
 
   if(MSVC)
