@@ -16,18 +16,11 @@ struct TransformerLayer {
 };
 class Transformer {
     struct Workspace {
-        Buffer keys, values, normed, projected, query, attended, update, gateup, gated;
+        Buffer normed, projected, query, attended, update, gateup, gated;
         Buffer quant_values, quant_scales;
         int batch, capacity, max_rows;
-        bool ring;
-        Workspace(const TransformerConfig &c, int b, int cap, int rows,
-                         KVCacheView cache = {}, bool circular = false, bool owns_cache = true)
-            : keys((!owns_cache || cache.layout.block_table || cache.layout.sequences ||
-                    cache.layout.key_pages)
-                       ? 0
-                       : size_t(c.layers) * b * cap * c.kvheads * c.dim * bytes(c.type)),
-              values(keys.size()),
-              normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
+        Workspace(const TransformerConfig &c, int b, int cap, int rows)
+            : normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
               projected(size_t(rows) * (c.heads + 2 * c.kvheads) * c.dim * bytes(c.type)),
               query(size_t(rows) * c.heads * c.dim * bytes(c.type)),
               attended(query.size()), update(size_t(rows) * c.hidden * bytes(c.type)),
@@ -37,9 +30,8 @@ class Transformer {
                                ? size_t(rows) * std::max(c.hidden, c.intermediate)
                                : 0),
               quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0),
-              batch(b), capacity(cap), max_rows(rows), ring(circular) {}
+              batch(b), capacity(cap), max_rows(rows) {}
     };
-    friend class ResidualCodebooks;
 
   public:
     TransformerConfig config;
@@ -152,10 +144,21 @@ class Transformer {
             }
             return context.batch.output.numel() ? context.batch.output : hidden_states;
         }
-        Workspace workspace(config, context.max_batch, context.max_time, context.max_rows, context.batch.cache,
-                             context.batch.cache.layout.ring, !context.batch.is_decode());
+        auto attention = context.batch;
+        auto &cache = attention.cache;
+        if (!cache.layout.block_table && !cache.layout.sequences && !cache.layout.key_pages &&
+            !cache.keys.numel() && !cache.values.numel()) {
+            if (attention.is_decode()) throw std::invalid_argument("decode requires a cache");
+            const int64_t layer_rows = int64_t(context.max_batch) * context.max_time;
+            if (config.layers < 1 || layer_rows < 1 || layer_rows > INT32_MAX / config.layers)
+                throw std::invalid_argument("transformer cache exceeds tensor dimensions");
+            cache.rows_per_layer = int(layer_rows);
+            cache.keys = context.tensor({int(layer_rows) * config.layers, config.kvheads * config.dim}, config.type);
+            cache.values = context.tensor(cache.keys, config.type);
+        }
+        Workspace workspace(config, context.max_batch, context.max_time, context.max_rows);
         if (context.mode == ForwardContext::Execute)
-            forward(workspace, hidden_states, context.batch);
+            forward(workspace, hidden_states, attention);
         return context.batch.output.numel() ? context.batch.output : hidden_states;
     }
   private:
@@ -203,15 +206,23 @@ class Transformer {
         const auto *positions = input.positions;
         const auto *packed = input.sequence.addressing();
         const auto *sequences = input.cache.layout.sequences;
+        const bool ring = input.cache.layout.ring;
+        const auto &cache_view = input.cache;
+        if (!sequences && !cache_view.layout.key_pages &&
+            (cache_view.rows_per_layer < 1 || cache_view.keys.cols != c.kvheads * c.dim ||
+             cache_view.values.cols != c.kvheads * c.dim || cache_view.keys.type != c.type ||
+             cache_view.values.type != c.type || int64_t(cache_view.rows_per_layer) * c.layers > cache_view.keys.rows ||
+             int64_t(cache_view.rows_per_layer) * c.layers > cache_view.values.rows))
+            throw std::invalid_argument("transformer cache shape/type mismatch");
         auto final_last = input.output;
         int n = input.rows();
         if (batch < 1 || time < 1 || slot < 0 || n > s.max_rows || x.cols != c.hidden ||
             x.rows != n || slot + batch > s.batch ||
-            (s.ring && (!c.causal || c.window <= 0 || s.capacity < c.window || time != 1)) ||
-            (!s.ring && time > s.capacity) ||
+            (ring && (!c.causal || c.window <= 0 || s.capacity < c.window || time != 1)) ||
+            (!ring && time > s.capacity) ||
             (!positions && !packed && !sequences &&
              (fixed_position < 0 || fixed_position + time > rope[0].rows ||
-              (!s.ring && fixed_position + time > s.capacity))))
+              (!ring && fixed_position + time > s.capacity))))
             throw std::runtime_error("transformer workspace bounds");
         bool quantized = c.quantization != Quantization::None;
         auto norm = quantized ? TensorView{} : s.normed.view(n, c.hidden, c.type),
@@ -225,7 +236,6 @@ class Transformer {
             return {s.quant_values.view(n, cols, quantized_type(c.quantization)),
                     s.quant_scales.view(n, 1, Type::F32)};
         };
-        size_t cache_stride = size_t(s.batch) * s.capacity * c.kvheads * c.dim * bytes(c.type);
         if (quantized)
             ops::quantized_norm(x, {}, layers[0].pre, quant_view(c.hidden), c.eps, c.gemma);
         else
@@ -238,20 +248,13 @@ class Transformer {
                 ops::matmul(norm, l.qkv, proj);
             const auto &external = input.cache;
             auto k = sequences && !external.layout.key_pages ? TensorView{}
-                     : external.layout.key_pages             ? external.keys
-                     : external.layout.block_table
-                         ? external.keys.slice(i * external.rows_per_layer, external.rows_per_layer)
-                         : s.keys.view(s.batch * s.capacity, c.kvheads * c.dim, c.type,
-                                       i * cache_stride);
-            auto v =
-                sequences && !external.layout.key_pages ? TensorView{}
-                : external.layout.key_pages             ? external.values
-                : external.layout.block_table
-                    ? external.values.slice(i * external.rows_per_layer, external.rows_per_layer)
-                    : s.values.view(s.batch * s.capacity, c.kvheads * c.dim, c.type,
-                                    i * cache_stride);
+                     : external.layout.key_pages ? external.keys
+                     : external.keys.slice(i * external.rows_per_layer, external.rows_per_layer);
+            auto v = sequences && !external.layout.key_pages ? TensorView{}
+                     : external.layout.key_pages ? external.values
+                     : external.values.slice(i * external.rows_per_layer, external.rows_per_layer);
             CacheLayout cache = external.layout;
-            cache.ring = s.ring;
+            cache.ring = ring;
             cache.layer = i;
             bool full = c.gemma && c.full_attention[i];
             ops::write_qkv(proj, q, k, v, positions, batch, time, slot, s.capacity, c.heads, c.kvheads,
