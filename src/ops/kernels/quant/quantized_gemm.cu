@@ -350,11 +350,19 @@ struct QuantizedGemm::Impl {
         auto sw = scratch.view(extent, 1, Type::F32, 4 * elements + extent * sizeof(float));
         CUDA(cudaMemsetAsync(scratch.data(), 0, scratch.size(), stream));
         for (auto type : {Type::BF16, Type::F16}) {
-            auto p = make_plan(extent, extent, extent, type);
-            if (p->lt_compatible) {
-                auto y = scratch.view(extent, extent, type, 2 * elements);
-                run(*p, x.data, sx.ptr<float>(), w.data, sw.ptr<float>(), y.data);
-            }
+            auto y = scratch.view(extent, extent, type, 2 * elements);
+            for (auto activation : {ops::Activation::Identity, ops::Activation::Relu, ops::Activation::GeluTanh})
+                for (bool bias : {false, true}) {
+                    if (activation == ops::Activation::Identity && bias) continue;
+                    ops::Epilogue finish;
+                    finish.activation = activation;
+                    // Read-only zero backing; bias never aliases the output.
+                    if (bias) finish.bias = scratch.view(1, extent, type);
+                    const auto *epilogue = activation == ops::Activation::Identity ? nullptr : &finish;
+                    auto plan = make_plan(extent, extent, extent, type, epilogue);
+                    if (plan->lt_compatible)
+                        run(*plan, x.data, sx.ptr<float>(), w.data, sw.ptr<float>(), y.data, 0, epilogue);
+                }
         }
         CUDA(cudaStreamSynchronize(stream));
     }
