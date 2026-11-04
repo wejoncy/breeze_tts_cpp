@@ -46,6 +46,8 @@ add_library(tts SHARED
   src/ops/linear.cpp
   src/ops/basic.cpp
   src/ops/tensor.cpp
+  src/ops/kernels/cpu/recurrent.cpp
+  src/models/g2p_en/model.cpp
   src/runtime/cuda_context.cpp
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu

@@ -2,7 +2,7 @@
 #include "text/english.h"
 #include "text/utf8.h"
 #include "io/json.h"
-#include "io/safetensors.h"
+#include "models/g2p_en/model.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -44,43 +44,10 @@ void replace_all(std::string &s, const std::string &from, const std::string &to)
         p += to.size();
     }
 }
-struct Matrix {
-    const float *data;
-    int rows, cols;
-    const float *operator[](int row) const { return data + size_t(row) * cols; }
-};
-float dot(const float *a, const float *b, int count) {
-    float result = 0;
-    for (int i = 0; i < count; ++i) result += a[i] * b[i];
-    return result;
-}
-struct Gru {
-    Matrix embedding, input, recurrent, input_bias, recurrent_bias;
-    int hidden() const { return recurrent.cols; }
-    void step(int id, std::vector<float> &state, std::vector<float> &scratch) const {
-        const int h = hidden();
-        if (id < 0 || id >= embedding.rows || state.size() != size_t(h))
-            throw std::invalid_argument("English GRU input bounds");
-        const auto *x = embedding[id];
-        auto *a = scratch.data(), *b = a + 3 * h, *next = b + 3 * h;
-        for (int i = 0; i < 3 * h; ++i) {
-            a[i] = dot(x, input[i], input.cols) + input_bias.data[i];
-            b[i] = dot(state.data(), recurrent[i], h) + recurrent_bias.data[i];
-        }
-        for (int i = 0; i < h; ++i) {
-            float r = 1.f / (1.f + std::exp(-(a[i] + b[i])));
-            float z = 1.f / (1.f + std::exp(-(a[h + i] + b[h + i])));
-            float n = std::tanh(a[2 * h + i] + r * b[2 * h + i]);
-            next[i] = (1.f - z) * n + z * state[i];
-        }
-        std::copy(next, next + h, state.begin());
-    }
-};
 } // namespace
 struct EnglishPhonemizer::Impl {
-    SafeTensors weights;
-    Gru encoder, decoder;
-    Matrix output, output_bias;
+    std::unique_ptr<Weights> weights;
+    std::unique_ptr<GraphemeToPhoneme> network;
     std::unordered_map<std::string, Strings> dictionary, names;
     struct Homograph { Strings first, second; std::string pos; };
     std::unordered_map<std::string, Homograph> homographs;
@@ -94,7 +61,7 @@ struct EnglishPhonemizer::Impl {
     std::set<char32_t> combining;
     std::unordered_map<std::string, double> unigrams, bigrams;
     double word_total;
-    int word_limit, decoder_steps;
+    int word_limit;
     Strings classes;
     std::unordered_map<std::string, std::string> tags;
     std::unordered_map<std::string, std::vector<std::pair<size_t, double>>> pos_weights;
@@ -149,7 +116,6 @@ struct EnglishPhonemizer::Impl {
         unigrams = data.at("unigrams").get<decltype(unigrams)>();
         bigrams = data.at("bigrams").get<decltype(bigrams)>();
         word_total = data.at("word_total"); word_limit = data.at("word_limit");
-        decoder_steps = data.at("decoder_steps");
         const auto &pos = data.at("pos");
         classes = pos.at("classes").get<Strings>();
         std::sort(classes.begin(), classes.end());
@@ -164,32 +130,13 @@ struct EnglishPhonemizer::Impl {
             }
         }
         if (cardinal.size() != 1000 || cardinal_and.size() != cardinal.size() ||
-            classes.empty() || !(word_total > 0) || word_limit < 1 || decoder_steps < 1)
+            classes.empty() || !(word_total > 0) || word_limit < 1)
             throw std::invalid_argument("invalid English linguistic data");
-        weights.open_file(directory + "/english.safetensors");
-        auto matrix = [&](const std::string &name) {
-            const auto &e = weights.get("english." + name);
-            if (e.type != Type::F32 || e.shape.empty() || e.shape.size() > 2)
-                throw std::invalid_argument("invalid English GRU weight dtype/rank");
-            return Matrix{static_cast<const float *>(e.data), e.shape[0],
-                          e.shape.size() == 1 ? 1 : e.shape[1]};
-        };
-        auto gru = [&](const std::string &name) {
-            Gru g{matrix(name + "_emb"), matrix(name + "_w_ih"), matrix(name + "_w_hh"),
-                  matrix(name + "_b_ih"), matrix(name + "_b_hh")};
-            if (g.hidden() < 1 || g.input.rows != 3 * g.hidden() ||
-                g.recurrent.rows != g.input.rows || g.input_bias.rows != g.input.rows ||
-                g.recurrent_bias.rows != g.input.rows || g.input_bias.cols != 1 ||
-                g.recurrent_bias.cols != 1 || g.input.cols != g.embedding.cols)
-                throw std::invalid_argument("disconnected English GRU weights");
-            return g;
-        };
-        encoder = gru("enc"); decoder = gru("dec");
-        output = matrix("fc_w"); output_bias = matrix("fc_b");
-        if (encoder.hidden() != decoder.hidden() || output.cols != decoder.hidden() ||
-            output.rows != int(phonemes.size()) || output_bias.rows != output.rows || output_bias.cols != 1 ||
-            encoder.embedding.rows != int(graphemes.size()) || decoder.embedding.rows != output.rows)
-            throw std::invalid_argument("English GRU alphabet/output mismatch");
+        ModelLoader::Checkpoint checkpoint;
+        checkpoint.tensors.open_file(directory + "/english.safetensors");
+        weights = std::make_unique<Weights>(Device::cpu(), Quantization::None, std::move(checkpoint));
+        network = std::make_unique<GraphemeToPhoneme>(*weights, data);
+        weights->load(); weights->seal();
     }
     std::string number(std::string s, bool conjunction = false) const {
         size_t first = s.find_first_not_of('0');
@@ -258,27 +205,17 @@ struct EnglishPhonemizer::Impl {
         return result;
     }
     Strings predict(const std::string &word) const {
-        std::vector<float> state(encoder.hidden(), 0.f);
-        std::vector<float> scratch(7 * encoder.hidden());
-        for (char c : word) {
-            auto it = graphemes.find(std::string(1, c));
-            encoder.step(it == graphemes.end() ? graphemes.at("<unk>") : it->second, state, scratch);
+        std::vector<int> ids;
+        ids.reserve(word.size());
+        for (char character : word) {
+            auto found = graphemes.find(std::string(1, character));
+            ids.push_back(found == graphemes.end() ? graphemes.at("<unk>") : found->second);
         }
-        encoder.step(graphemes.at("</s>"), state, scratch);
-        auto start = std::find(phonemes.begin(), phonemes.end(), "<s>");
-        int input = int(start - phonemes.begin());
+        int offsets[] = {0, int(ids.size())}, count = 0;
+        auto output = network->forward(
+            {ids.data(), int(ids.size()), 1, Type::I32}, {offsets, 2, 1, Type::I32}, {&count, 1, 1, Type::I32});
         Strings result;
-        for (int step = 0; step < decoder_steps; ++step) {
-            decoder.step(input, state, scratch);
-            float maximum = -INFINITY;
-            input = 0;
-            for (int i = 0; i < output.rows; ++i) {
-                float value = dot(state.data(), output[i], output.cols) + output_bias.data[i];
-                if (value > maximum) { input = i; maximum = value; }
-            }
-            if (phonemes[input] == "</s>") break;
-            result.push_back(phonemes[input]);
-        }
+        for (int index = 0; index < count; ++index) result.push_back(phonemes.at(output.data_ptr<int>()[index]));
         return result;
     }
     Strings segment(std::string word) const {

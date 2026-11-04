@@ -1,4 +1,5 @@
 #include "ops/basic.h"
+#include <cstring>
 #include "ops/storage.h"
 #include "ops/sequence.h"
 #include "ops/sampling.h"
@@ -58,9 +59,10 @@ void matmul(RowScaledView input, RowScaledView weight, TensorView output) {
     execution_context(output).quantization->linear(input, weight, output);
 }
 void upload_bytes(int device, void *destination, const void *source, size_t bytes) {
-    execution_context(device).memory.upload(destination, source, bytes);
+    if (device < 0) { if (bytes) std::memcpy(destination, source, bytes); }
+    else execution_context(device).memory.upload(destination, source, bytes);
 }
-void synchronize(int device) { execution_context(device).memory.sync(); }
+void synchronize(int device) { if (device >= 0) execution_context(device).memory.sync(); }
 void download_bytes(TensorView source, void *destination, size_t bytes) {
     execution_context(source).memory.download(destination, source.data, bytes);
 }
