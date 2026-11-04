@@ -154,33 +154,28 @@ std::vector<std::u32string> ChinesePhonemizer::segments(std::u32string_view norm
     if (first < normalized.size()) result.emplace_back(normalized.substr(first));
     return result;
 }
-Phonemes ChinesePhonemizer::pronounce(std::u32string_view normalized, const PinyinResolver &resolver) const {
+Phonemes ChinesePhonemizer::pronounce(std::u32string_view normalized, const SentenceReadings &sentences) const {
     Phonemes result;
     for (const auto &sentence : segments(normalized)) {
-        std::vector<std::string> readings;
-        bool contextual = resolver.resolveSentenceTone3(sentence.data(), sentence.size(), &readings);
-        if (contextual && readings.size() != sentence.size()) throw std::invalid_argument("contextual pronunciation alignment mismatch");
+        const auto found = std::find_if(sentences.begin(), sentences.end(), [&](const auto &reading) {
+            return std::u32string_view(reading.first) == sentence;
+        });
+        if (found == sentences.end())
+            throw std::logic_error("sentence is absent from pronunciation preparation");
+        const auto &readings = found->second;
+        if (readings.size() != sentence.size()) throw std::invalid_argument("contextual pronunciation alignment mismatch");
         auto tokens = impl_->sandhi.premerge(impl_->segmenter.segment(sentence));
         size_t cursor = 0;
         for (const auto &token : tokens) {
             std::vector<std::string> initials, finals;
-            if (contextual) {
-                if (cursor > sentence.size() || token.word.size() > sentence.size() - cursor ||
-                    sentence.substr(cursor, token.word.size()) != token.word) throw std::invalid_argument("contextual word alignment mismatch");
-                std::vector<std::string> word_readings(readings.begin() + cursor, readings.begin() + cursor + token.word.size());
-                impl_->correct(token.word, word_readings);
-                for (const auto &reading : word_readings) {
-                    bool pinyin = !reading.empty() && ((reading.front() >= 'a' && reading.front() <= 'z') || (reading.front() >= 'A' && reading.front() <= 'Z'));
-                    auto value = pinyin ? impl_->dictionary.split(reading) : std::pair{reading, reading};
-                    initials.push_back(std::move(value.first)); finals.push_back(std::move(value.second));
-                }
-            } else {
-                std::vector<PinyinSyl> syllables;
-                resolver.resolve(token.word.data(), token.word.size(), &syllables);
-                for (const auto &syllable : syllables) {
-                    auto value = syllable.raw ? std::pair{syllable.text, syllable.text} : impl_->dictionary.split(syllable.text);
-                    initials.push_back(std::move(value.first)); finals.push_back(std::move(value.second));
-                }
+            if (cursor > sentence.size() || token.word.size() > sentence.size() - cursor ||
+                sentence.substr(cursor, token.word.size()) != token.word) throw std::invalid_argument("contextual word alignment mismatch");
+            std::vector<std::string> word_readings(readings.begin() + cursor, readings.begin() + cursor + token.word.size());
+            impl_->correct(token.word, word_readings);
+            for (const auto &reading : word_readings) {
+                bool pinyin = !reading.empty() && ((reading.front() >= 'a' && reading.front() <= 'z') || (reading.front() >= 'A' && reading.front() <= 'Z'));
+                auto value = pinyin ? impl_->dictionary.split(reading) : std::pair{reading, reading};
+                initials.push_back(std::move(value.first)); finals.push_back(std::move(value.second));
             }
             cursor += token.word.size();
             impl_->sandhi.modify(token.word, token.flag, finals);

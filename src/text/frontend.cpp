@@ -172,7 +172,7 @@ TextInput TextFrontend::Preparation::collect() {
             result.phone_bert_rows.insert(result.phone_bert_rows.end(), phones.size(), -1);
             continue;
         }
-        auto phones = owner_.chinese_.pronounce(span.normalized, *resolver_);
+        auto phones = owner_.chinese_.pronounce(span.normalized, resolver_->readings());
         std::vector<size_t> offsets;
         auto normalized = text::decode(normalized_text, &offsets);
         if (phones.word2ph.size() != normalized.size() ||

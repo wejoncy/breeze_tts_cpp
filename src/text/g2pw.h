@@ -22,13 +22,13 @@ class G2PW {
     std::unique_ptr<Impl> impl_;
     const PypinyinResolver &fallback_;
   public:
-    class Resolver final : public PinyinResolver {
+    class Resolver {
         const G2PW &owner_;
         struct Batch {
             std::unique_ptr<G2PWTask> task = std::make_unique<G2PWTask>();
             std::vector<std::pair<size_t, size_t>> targets;
         };
-        std::vector<std::pair<std::u32string, std::vector<std::string>>> readings_;
+        SentenceReadings readings_;
         std::vector<Batch> batches_;
         size_t current_ = 0;
         bool pending_ = false;
@@ -36,13 +36,7 @@ class G2PW {
         Resolver(const G2PW &, const std::vector<std::u32string> &segments);
         std::unique_ptr<PreparationTask> next();
         void accept(std::unique_ptr<PreparationTask>);
-        void resolve(const char32_t *word, size_t count,
-                     std::vector<PinyinSyl> *out) const override {
-            owner_.fallback_.resolve(word, count, out);
-        }
-        bool resolveSentenceTone3(const char32_t *word, size_t count,
-                                  std::vector<std::string> *out) const override;
-        bool isNumeric(uint32_t cp) const override { return owner_.fallback_.isNumeric(cp); }
+        const SentenceReadings &readings() const;
     };
     G2PW(const std::string &directory, const Tokenizer &,
           const PypinyinResolver &);

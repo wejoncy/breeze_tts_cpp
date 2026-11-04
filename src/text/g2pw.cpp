@@ -203,18 +203,10 @@ void G2PW::Resolver::accept(std::unique_ptr<PreparationTask> completed) {
     ++current_;
     pending_ = false;
 }
-bool G2PW::Resolver::resolveSentenceTone3(const char32_t *word, size_t count,
-                                        std::vector<std::string> *out) const {
-    std::u32string_view sentence(word, count);
+const SentenceReadings &G2PW::Resolver::readings() const {
     if (pending_ || current_ != batches_.size())
         throw std::logic_error("pronunciation preparation is incomplete");
-    auto found = std::find_if(readings_.begin(), readings_.end(), [&](const auto &reading) {
-        return std::u32string_view(reading.first) == sentence;
-    });
-    if (found == readings_.end())
-        throw std::logic_error("sentence is absent from pronunciation preparation");
-    *out = found->second;
-    return true;
+    return readings_;
 }
 } // namespace tts::text
 

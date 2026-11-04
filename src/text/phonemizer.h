@@ -12,6 +12,6 @@ class ChinesePhonemizer {
     const PypinyinResolver &dictionary() const;
     std::u32string normalize(std::u32string_view input) const;
     std::vector<std::u32string> segments(std::u32string_view normalized) const;
-    Phonemes pronounce(std::u32string_view normalized, const PinyinResolver &resolver) const;
+    Phonemes pronounce(std::u32string_view normalized, const SentenceReadings &) const;
 };
 } // namespace tts::text
