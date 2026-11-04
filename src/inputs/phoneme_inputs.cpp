@@ -1,4 +1,4 @@
-#include "inputs/input_registry.h"
+#include "inputs/phoneme_inputs.h"
 #include "core/input_fields.h"
 #include "core/row_capacity.h"
 #include "text/frontend.h"
@@ -6,8 +6,7 @@
 #include "io/audio_io.h"
 #include "io/model_loader.h"
 #include "models/gpt_sovits/sampling.h"
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include "ops/storage.h"
 #include <numeric>
 
 namespace tts {
@@ -289,13 +288,7 @@ std::unique_ptr<ReferencePlan> PhonemeInputs::prepare_reference(const std::vecto
     auto waveform = own_tensor(input, {int(wave.size()), 1}, Type::F32);
     std::copy(wave.begin(), wave.end(), waveform.ptr<float>());
     auto samples = own_tensor(input, {int(speech.size()), 1}, type_);
-    for (size_t sample = 0; sample < speech.size(); ++sample) {
-        if (type_ == Type::F16) {
-            auto value = __float2half_rn(speech[sample]); std::memcpy(samples.ptr<uint16_t>() + sample, &value, sizeof(value));
-        } else {
-            auto value = __float2bfloat16_rn(speech[sample]); std::memcpy(samples.ptr<uint16_t>() + sample, &value, sizeof(value));
-        }
-    }
+    ops::convert_host({speech.data(), int(speech.size()), 1, Type::F32}, samples);
     input.uploads = {{"waveform", waveform}, {"speech_waveform", samples},
                       {"phones", own_integers(input, result->text.phones)},
                       {"input_ids", own_integers(input, result->text.bert_ids)}};

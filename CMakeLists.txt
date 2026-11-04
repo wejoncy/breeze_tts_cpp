@@ -72,7 +72,6 @@ add_library(tts SHARED
   src/execution/input_staging.cpp
   src/execution/input_packing.cpp
   src/execution/model_runner.cpp
-  src/inputs/input_registry.cpp
   src/inputs/token_inputs.cpp
   src/inputs/phoneme_inputs.cpp
   src/engine/engine.cpp

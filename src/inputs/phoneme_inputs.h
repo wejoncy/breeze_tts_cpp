@@ -4,5 +4,5 @@
 
 namespace tts {
 class ModelLoader;
-std::unique_ptr<RequestPlanner> load_inputs(const ModelLoader &, int batch, int context, Type);
+std::unique_ptr<RequestPlanner> load_phoneme_inputs(const ModelLoader &, int batch, int context, Type);
 } // namespace tts

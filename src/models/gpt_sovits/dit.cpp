@@ -1,5 +1,3 @@
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include "models/gpt_sovits/dit.h"
 #include "ops/attention.h"
 #include "ops/basic.h"
@@ -104,10 +102,7 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
     for (int p = 0; p < max_time; ++p)
         for (int i = 0; i < head_dim_ / 2; ++i) {
             float angle = p * frequencies[i];
-            if (type_ == Type::F16)
-                angle = float(__float2half_rn(angle));
-            if (type_ == Type::BF16)
-                angle = float(__float2bfloat16_rn(angle));
+            angle = ops::rounded(angle, type_);
             rotary[size_t(p) * head_dim_ + i] = std::cos(angle);
             rotary[size_t(p) * head_dim_ + head_dim_ / 2 + i] = std::sin(angle);
         }

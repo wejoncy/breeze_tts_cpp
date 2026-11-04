@@ -1,5 +1,6 @@
 #include "execution/model_runtime.h"
-#include "inputs/input_registry.h"
+#include "inputs/token_inputs.h"
+#include "inputs/phoneme_inputs.h"
 #include "execution/runner_resources.h"
 #include "models/breeze/model.h"
 #include "models/gpt_sovits/model.h"
@@ -26,8 +27,8 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader, c
                   parts.parameters->size(), size_t(model_instance.config.max_reference_frames) * model_instance.config.samples_per_frame,
                   parts.parameters->checkpoint_files()};
     parts.quantum_ms = 1000. * parts.info.audio.samples_per_frame / parts.info.audio.sample_rate;
-    parts.planner = load_inputs(loader, options.max_batch, options.context,
-                                model_instance.backbone.config.type);
+    parts.planner = std::make_unique<TokenInputs>(loader.path(""), model_instance.config,
+                                                 options.max_batch, options.context);
     parts.resources = std::make_unique<RunnerResources>(memory,
         RunnerResources::Cache{model_instance.backbone.config.layers,
             model_instance.backbone.config.kvheads * model_instance.backbone.config.dim,
@@ -72,7 +73,7 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
     parts.defaults.sample_steps = model_instance.flow.sampling().steps;
     parts.defaults.cfg_rate = model_instance.flow.sampling().guidance;
     parts.quantum_ms = 1000. / model_instance.config.at("semantic_rate").get<int>();
-    parts.planner = load_inputs(loader, options.max_batch, options.context, model_instance.semantic.type());
+    parts.planner = load_phoneme_inputs(loader, options.max_batch, options.context, model_instance.semantic.type());
     parts.resources = std::make_unique<RunnerResources>(memory,
         RunnerResources::Cache{model_instance.semantic.layers(), model_instance.semantic.hidden(),
                                1, model_instance.semantic.type()},

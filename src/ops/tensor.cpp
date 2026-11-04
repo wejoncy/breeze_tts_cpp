@@ -1,4 +1,7 @@
 #include "core/tensor_storage.h"
+#include "ops/storage.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include "core/allocator.h"
 #include <utility>
 #include "runtime/cuda_context.h"
@@ -184,3 +187,33 @@ void Tensor::synchronize() const {
     else if (device().is_cuda()) execution_context(device().index()).memory.sync();
 }
 } // namespace tts
+
+namespace tts::ops {
+float rounded(float value, Type type) {
+    if (type == Type::F16) return float(__float2half_rn(value));
+    if (type == Type::BF16) return float(__float2bfloat16_rn(value));
+    if (type == Type::F32) return value;
+    throw std::invalid_argument("host conversion requires floating point");
+}
+void convert_host(TensorView source, TensorView destination) {
+    auto floating = [](Type type) { return type == Type::F32 || type == Type::F16 || type == Type::BF16; };
+    if (source.device >= 0 || destination.device >= 0 || !source.dense() || !destination.dense() ||
+        source.rows != destination.rows || source.cols != destination.cols ||
+        !floating(source.type) || !floating(destination.type) ||
+        (source.numel() && (!source.data || !destination.data)) ||
+        (source.overlaps(destination) && source.type != destination.type))
+        throw std::invalid_argument("host conversion requires matching dense CPU floating tensors");
+    if (source.type == destination.type) {
+        if (source.size()) std::memmove(destination.data, source.data, source.size());
+        return;
+    }
+    for (size_t element = 0; element < source.numel(); ++element) {
+        const float value = source.type == Type::F32 ? source.ptr<float>()[element]
+            : source.type == Type::F16 ? float(source.ptr<__half>()[element])
+                                      : float(source.ptr<__nv_bfloat16>()[element]);
+        if (destination.type == Type::F32) destination.ptr<float>()[element] = value;
+        else if (destination.type == Type::F16) destination.ptr<__half>()[element] = __float2half_rn(value);
+        else destination.ptr<__nv_bfloat16>()[element] = __float2bfloat16_rn(value);
+    }
+}
+} // namespace tts::ops

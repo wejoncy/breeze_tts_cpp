@@ -1,5 +1,3 @@
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include "ops/basic.h"
 #include "models/gpt_sovits/reference_encoder.h"
 #include "ops/vector_quantization.h"
@@ -80,21 +78,14 @@ TensorView codebook_norms(Weights &weights, const std::string &prefix) {
     const std::string name = prefix + ".quantizer.vq.layers.0._codebook.embed";
     auto table = weights.get(name);
     auto values = weights.host_values(name);
-    auto round = [&](float value) {
-        if (table.type == Type::F16)
-            return float(__float2half_rn(value));
-        if (table.type == Type::BF16)
-            return float(__float2bfloat16_rn(value));
-        return value;
-    };
     std::vector<float> norms(table.rows, 0);
     for (int row_index = 0; row_index < table.rows; ++row_index) {
         double sum = 0;
         for (int channel_index = 0; channel_index < table.cols; ++channel_index) {
             float value = values[size_t(row_index) * table.cols + channel_index];
-            sum += round(value * value);
+            sum += ops::rounded(value * value, table.type);
         }
-        norms[row_index] = round(float(sum));
+        norms[row_index] = ops::rounded(float(sum), table.type);
     }
     return weights.generated(name + ".norms", norms, 1, table.rows, table.type);
 }
