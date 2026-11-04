@@ -13,33 +13,27 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
         throw std::invalid_argument("flow row capacity exceeds tensor dimensions");
     auto output = context.tensor({context.max_batch * context.max_time, mel_channels_}, estimator_.type());
     TensorBatch result;
-    if (context.mode != ForwardContext::Execute) {
-        auto evaluate = [&](ForwardShape shape, const ForwardContext &base) {
-            Tensor::Scope scratch;
-            auto invocation = base.with_sequence(SequenceLayout::uniform(shape.batch, shape.time));
+    if (context.initialize("flow", {context.max_batch, maximum_time, context.max_batch * maximum_time},
+        [&](ForwardContext &region) {
+            const bool preparing = region.mode == ForwardContext::Prepare;
+            const int batch = preparing ? 1 : region.max_batch, time = preparing ? 1 : region.max_time;
+            auto invocation = region.with_sequence(SequenceLayout::uniform(batch, time));
             invocation.max_rows = int(maximum_rows);
-            auto noise = invocation.tensor({shape.rows, mel_channels_}, estimator_.type());
-            auto prefixes = invocation.tensor({shape.batch, 1}, Type::I32);
+            auto noise = invocation.tensor({batch * time, mel_channels_}, estimator_.type());
+            auto prefixes = invocation.tensor({batch, 1}, Type::I32);
             auto parameters = sampling();
-            if (base.mode == ForwardContext::Plan || base.mode == ForwardContext::Prepare)
+            if (region.mode == ForwardContext::Plan || region.mode == ForwardContext::Prepare)
                 parameters.guidance = std::max(parameters.guidance, 1.f);
             auto condition = estimator_.forward({}, invocation, parameters.guidance > 1.e-5f);
             {
                 Tensor::Scope noise_inputs;
                 for (int field = 0; field < 2; ++field)
-                    Tensor::reserve(size_t(shape.batch) * sizeof(uint64_t));
+                    Tensor::reserve(size_t(batch) * sizeof(uint64_t));
             }
             advance(noise, condition, prefixes, invocation, parameters);
             for (int field = 0; field < 3; ++field)
-                Tensor::reserve(size_t(shape.rows) * sizeof(void *));
-        };
-        context.for_each_shape("flow", [&](ForwardShape shape) { evaluate(shape, context); });
-        const bool preparing = context.mode == ForwardContext::Prepare;
-        const int batch = preparing ? 1 : context.max_batch, time = preparing ? 1 : maximum_time;
-        auto sizing = context;
-        sizing.mode = preparing ? ForwardContext::Prepare : ForwardContext::Plan;
-        evaluate({batch, time, batch * time}, sizing);
-
+                Tensor::reserve(size_t(batch * time) * sizeof(void *));
+        })) {
         std::vector<int> members(context.max_batch);
         std::iota(members.begin(), members.end(), 0);
         result.chunks.push_back({output, std::move(members), context.max_time});

@@ -225,7 +225,8 @@ struct ModelRunner::Impl {
         return result;
     }
     void invoke(const ProgramSpec &description, int rows, int lanes, int partitions = 1,
-                ForwardContext::Mode mode = ForwardContext::Execute, bool replay = true) {
+                ForwardContext::Mode mode = ForwardContext::Execute, bool replay = true,
+                const NamedValue<ForwardShape> *example = nullptr) {
         auto lease = runtime.execution.lease_workspace();
         auto input = description.input;
         const int time = input.sequence.shape.time;
@@ -237,30 +238,8 @@ struct ModelRunner::Impl {
         ForwardContext context(input.limits.batch,
                                 input.limits.time, input.limits.rows);
         context.mode = mode;
-        std::vector<std::vector<ForwardShape>> shapes;
-        std::vector<NamedValue<ArrayView<const ForwardShape>>> examples;
+        context.example = example;
         if (description.replay == ProgramSpec::Replay::Regions) {
-            if (mode == ForwardContext::Capture) {
-                shapes.reserve(description.regions.size());
-                examples.reserve(description.regions.size());
-                for (const auto &region : description.regions) {
-                    auto lengths = region.lengths;
-                    lengths.erase(std::remove_if(lengths.begin(), lengths.end(),
-                        [&](int length) { return length < 1 || length > region.maximum_time; }), lengths.end());
-                    std::sort(lengths.begin(), lengths.end(), std::greater<int>());
-                    lengths.erase(std::unique(lengths.begin(), lengths.end()), lengths.end());
-                    auto &samples = shapes.emplace_back();
-                    const auto &batches = runtime.shapes.rows();
-                    for (auto batch = batches.rbegin(); batch != batches.rend(); ++batch)
-                        for (int length : lengths) {
-                            if (*batch > INT32_MAX / length)
-                                throw std::invalid_argument("graph shape exceeds tensor dimensions");
-                            samples.push_back({*batch, length, *batch * length});
-                        }
-                    examples.push_back({region.name, {samples.data(), samples.size()}});
-                }
-                context.examples = {examples.data(), examples.size()};
-            }
             context.allow_replay = replay;
             context.executor = &runtime.execution.graphs();
             context.dispatch = [](void *executor, const ForwardCall &call, bool capture) {
@@ -475,7 +454,26 @@ struct ModelRunner::Impl {
                 for (int rows : runtime.shapes.rows()) graphs.register_shape(description.name.c_str(), {rows});
                 graphs.capture(description.name.c_str(), [&](const auto &shape) { invoke(description, shape[0], shape[0]); });
             } else if (description.replay == ProgramSpec::Replay::Regions) {
-                invoke(description, capacity, capacity, 1, ForwardContext::Capture);
+                std::vector<NamedValue<ForwardShape>> examples;
+                for (const auto &region : description.regions) {
+                    auto lengths = region.lengths;
+                    lengths.erase(std::remove_if(lengths.begin(), lengths.end(),
+                        [&](int length) { return length < 1 || length > region.maximum_time; }), lengths.end());
+                    std::sort(lengths.begin(), lengths.end(), std::greater<int>());
+                    lengths.erase(std::unique(lengths.begin(), lengths.end()), lengths.end());
+                    const auto &batches = runtime.shapes.rows();
+                    for (auto batch = batches.rbegin(); batch != batches.rend(); ++batch)
+                        for (int length : lengths) {
+                            if (*batch > INT32_MAX / length)
+                                throw std::invalid_argument("graph shape exceeds tensor dimensions");
+                            examples.push_back({region.name, {*batch, length, *batch * length}});
+                        }
+                }
+                GraphCaptureProgress progress(description.name.c_str(), examples.size());
+                for (const auto &example : examples) {
+                    invoke(description, capacity, capacity, 1, ForwardContext::Capture, true, &example);
+                    progress.advance();
+                }
             }
         }
         runtime.execution.seal();

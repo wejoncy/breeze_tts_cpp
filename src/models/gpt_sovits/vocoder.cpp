@@ -11,16 +11,12 @@ TensorView Vocoder::forward(const TensorBatch &input, TensorView layout, Forward
     if (context.mode == ForwardContext::Execute &&
         (layout.device != -1 || layout.type != Type::I32 || layout.cols != 2 || layout.rows < input.rows))
         throw std::invalid_argument("audio output layout must contain host offset/count pairs");
-    if (context.for_each_shape("vocoder", [&](ForwardShape shape) {
-        Tensor::Scope scratch;
-        auto invocation = context;
-        invocation.max_batch = shape.batch;
-        invocation.max_time = shape.time;
-        invocation.max_rows = shape.rows;
-        invocation.batch = ForwardBatch(shape.batch, shape.time);
-        forward(input.chunks.front().values.slice(0, shape.rows),
-            output.slice(0, shape.batch * samples(shape.time)), invocation);
-    })) return output;
+    if (input.chunks.empty()) return output.slice(0, 0);
+    if (context.initialize("vocoder", {context.max_batch, context.max_time, context.max_batch * context.max_time},
+        [&](ForwardContext &invocation) {
+            forward(input.chunks.front().values.slice(0, invocation.batch.rows()),
+                output.slice(0, invocation.max_batch * samples(invocation.max_time)), invocation);
+        })) return output;
     int written = 0;
     for (const auto &chunk : input.chunks) {
         Tensor::Scope scratch;

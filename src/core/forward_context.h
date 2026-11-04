@@ -61,7 +61,7 @@ struct ForwardContext {
     NamedView<const NamedValue<double>> parameters;
     NamedView<const NamedValue<ArrayView<const TensorView>>> state;
     ArrayView<const TensorRegion> regions;
-    NamedView<const NamedValue<ArrayView<const ForwardShape>>> examples;
+    const NamedValue<ForwardShape> *example = nullptr;
     bool allow_replay = true;
     void *executor = nullptr;
     bool (*dispatch)(void *, const ForwardCall &, bool) = nullptr;
@@ -76,11 +76,21 @@ struct ForwardContext {
         result.max_rows = sequence.rows;
         return result;
     }
+    // The executor selects one initialization example. Models provide only the
+    // computation; scoped planning/preparation and region selection are common.
     template <class Function>
-    bool for_each_shape(std::string_view name, const Function &function) const {
-        if (!examples.contains(name)) return false;
-        const auto shapes = examples[name];
-        for (size_t index = 0; index < shapes.size; ++index) function(shapes[index]);
+    bool initialize(std::string_view name, ForwardShape extent, const Function &function) const {
+        if (mode == Execute) return false;
+        auto visit = [&](ForwardShape shape, Mode phase) {
+            Tensor::Scope scratch;
+            auto invocation = with_sequence(SequenceLayout::uniform(shape.batch, shape.time));
+            invocation.mode = phase;
+            invocation.max_rows = shape.rows;
+            function(invocation);
+        };
+        if (mode == Capture && example && example->name == name)
+            visit(example->value, Capture);
+        visit(extent, mode == Prepare ? Prepare : Plan);
         return true;
     }
     template <class Function>
