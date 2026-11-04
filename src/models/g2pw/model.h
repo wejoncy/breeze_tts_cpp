@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "models/bert/model.h"
 
 namespace tts {
@@ -13,7 +14,7 @@ class Pronunciation {
         Bert::Workspace bert;
         Buffer selected, logits, pos_logits;
         int max_time;
-        Workspace(const Pronunciation &, int max_time, BufferAllocator *);
+        Workspace(const Pronunciation &, int max_time);
     };
     Pronunciation(Weights &, const std::string &prefix, const Json &metadata);
     int max_tokens() const { return max_tokens_; }

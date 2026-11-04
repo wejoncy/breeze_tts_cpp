@@ -6,13 +6,13 @@
 #include "text/frontend_assets.h"
 #include "io/model_loader.h"
 #include "runtime/device.h"
-#include <cmath>
+#include <algorithm>
 
 namespace tts {
 namespace {
 ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader, const ModelOptions &options) {
     ModelComponents parts;
-    parts.parameters = std::make_unique<Weights>(memory, options.quantization,
+    parts.parameters = std::make_unique<Weights>(Device::cuda(memory.device), options.quantization,
         loader.open({{"", ""}, {"audio_tokenizer", "codec."}},
                       {"tokenizer.json", "audio_tokenizer/config.json"}));
     auto model = std::make_unique<breeze::Model>(*parts.parameters,
@@ -36,12 +36,12 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader, c
     const auto &configuration = model_instance.config;
     StatePool::Layout state;
     state.tensors = {
-        {"codes", size_t(configuration.codebooks) * sizeof(int)},
-        {"done", sizeof(int)},
-        {"positions", size_t(breeze::max_guidance_branches) * sizeof(int)},
-        {"rng", sizeof(uint64_t)},
-        {"seen", size_t(configuration.codec.codebook_size) * sizeof(int)},
-        {"table", size_t(breeze::max_guidance_branches) * parts.resources->kv.block_stride() * sizeof(int)}};
+        {"codes", {1, configuration.codebooks}, Type::I32},
+        {"done", {1, 1}, Type::I32},
+        {"positions", {breeze::max_guidance_branches, 1}, Type::I32},
+        {"rng", {1, 1}, Type::I64},
+        {"seen", {configuration.codec.codebook_size, 1}, Type::I32},
+        {"table", {breeze::max_guidance_branches, parts.resources->kv.block_stride()}, Type::I32}};
     state.histories.emplace_back("audio", model_instance.codec.history_spec());
     parts.resources->states.prepare(state, options.max_batch);
     parts.network = std::move(model);
@@ -56,7 +56,7 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
     std::sort(checkpoint.files.begin(), checkpoint.files.end());
     checkpoint.files.erase(std::unique(checkpoint.files.begin(), checkpoint.files.end()), checkpoint.files.end());
     ModelComponents parts;
-    parts.parameters = std::make_unique<Weights>(memory, options.quantization, std::move(checkpoint));
+    parts.parameters = std::make_unique<Weights>(Device::cuda(memory.device), options.quantization, std::move(checkpoint));
     auto model = std::make_unique<gpt_sovits::Model>(*parts.parameters, loader.config(),
         read_json(loader.path("g2pw.json")), options.context);
     auto &model_instance = *model;
@@ -77,42 +77,28 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
         RunnerResources::Cache{model_instance.semantic.layers(), model_instance.semantic.hidden(),
                                1, model_instance.semantic.type()},
         options.max_batch, options.context, options.kv_page_tokens);
-    const size_t element_bytes = bytes(model_instance.semantic.type());
-    const size_t frames = model_instance.acoustic.feature_capacity(options.context);
+    const Type state_type = model_instance.semantic.type();
+    const int frames = model_instance.acoustic.feature_capacity(options.context);
     StatePool::Layout state;
     state.tensors = {
-        {"table", size_t(parts.resources->kv.block_stride()) * sizeof(int)},
-        {"codes", size_t(options.context) * sizeof(int)},
-        {"positions", sizeof(int)},
-        {"phones", size_t(options.context) * sizeof(int)},
-        {"seen", size_t(model_instance.config.at("semantic").at("EOS").get<int>()) * sizeof(int)},
-        {"rng", sizeof(uint64_t)}, {"done", sizeof(int)},
-        {"waveform_condition", size_t(model_instance.acoustic.waveform_condition_channels()) * element_bytes},
-        {"style", size_t(model_instance.config.at("acoustic").at("gin_channels").get<int>()) * element_bytes},
-        {"reference_mel", size_t(model_instance.reference_frames) * model_instance.mel_channels * element_bytes},
-        {"reference_features", size_t(model_instance.reference_frames) * model_instance.feature_channels * element_bytes},
-        {"features", frames * model_instance.feature_channels * element_bytes},
-        {"text_condition", size_t(options.context) * model_instance.acoustic.text_condition_channels() * element_bytes},
-        {"reference_bert", size_t(options.context) * model_instance.semantic.hidden() * element_bytes},
-        {"history", frames * model_instance.mel_channels * element_bytes},
-        {"offline_mel", frames * model_instance.mel_channels * element_bytes},
-        {"feature_history", frames * model_instance.feature_channels * element_bytes}};
-    for (auto &field : state.tensors) {
-        field.type = model_instance.semantic.type();
-        if (field.name == "table" || field.name == "codes" || field.name == "positions" ||
-            field.name == "phones" || field.name == "seen" || field.name == "done") field.type = Type::I32;
-        else if (field.name == "rng") field.type = Type::I64;
-        else if (field.name == "reference_mel" || field.name == "history" || field.name == "offline_mel")
-            field.columns = model_instance.mel_channels;
-        else if (field.name == "features" || field.name == "reference_features" || field.name == "feature_history")
-            field.columns = model_instance.feature_channels;
-        else if (field.name == "reference_bert") field.columns = model_instance.semantic.hidden();
-        else if (field.name == "text_condition") field.columns = model_instance.acoustic.text_condition_channels();
-        else if (field.name == "style") field.columns = model_instance.config.at("acoustic").at("gin_channels");
-        else if (field.name == "waveform_condition") field.columns = model_instance.acoustic.waveform_condition_channels();
-    }
-    state.tensors.push_back({"text_ready", sizeof(int), Type::I32, 1, true});
-    state.tensors.push_back({"feature_tokens", sizeof(int), Type::I32, 1, true});
+        {"table", {parts.resources->kv.block_stride(), 1}, Type::I32},
+        {"codes", {options.context, 1}, Type::I32},
+        {"positions", {1, 1}, Type::I32},
+        {"phones", {options.context, 1}, Type::I32},
+        {"seen", {model_instance.config.at("semantic").at("EOS"), 1}, Type::I32},
+        {"rng", {1, 1}, Type::I64}, {"done", {1, 1}, Type::I32},
+        {"waveform_condition", {1, model_instance.acoustic.waveform_condition_channels()}, state_type},
+        {"style", {1, model_instance.config.at("acoustic").at("gin_channels")}, state_type},
+        {"reference_mel", {model_instance.reference_frames, model_instance.mel_channels}, state_type},
+        {"reference_features", {model_instance.reference_frames, model_instance.feature_channels}, state_type},
+        {"features", {frames, model_instance.feature_channels}, state_type},
+        {"text_condition", {options.context, model_instance.acoustic.text_condition_channels()}, state_type},
+        {"reference_bert", {options.context, model_instance.semantic.hidden()}, state_type},
+        {"history", {frames, model_instance.mel_channels}, state_type},
+        {"offline_mel", {frames, model_instance.mel_channels}, state_type},
+        {"feature_history", {frames, model_instance.feature_channels}, state_type},
+        {"text_ready", {1, 1}, Type::I32, true},
+        {"feature_tokens", {1, 1}, Type::I32, true}};
     parts.resources->states.prepare(state, options.max_batch);
     parts.network = std::move(model);
     return parts;
@@ -131,18 +117,9 @@ std::unique_ptr<ModelRuntime> load_model(const std::string &directory,
         throw std::invalid_argument("invalid model runtime limits");
     const ModelLoader loader(directory);
     const auto type = loader.config().at("model_type").get<std::string>();
-    for (const auto &factory : models) {
-        if (type != factory.type)
-            continue;
-        auto runtime = std::make_unique<ModelRuntime>(loader, options, factory.build);
-        const auto &info = runtime->info();
-        const double quantum = runtime->scheduling_quantum_ms();
-        if (info.model_type != type || info.audio.sample_rate < 1 ||
-            info.audio.samples_per_frame < 1 || info.max_output_frames < 1 ||
-            !std::isfinite(quantum) || quantum <= 0)
-            throw std::invalid_argument("invalid runtime metadata for model_type: " + type);
-        return runtime;
-    }
+    for (const auto &factory : models)
+        if (type == factory.type)
+            return std::make_unique<ModelRuntime>(loader, options, factory.build);
     throw std::invalid_argument("unsupported model_type: " + type);
 }
 } // namespace tts

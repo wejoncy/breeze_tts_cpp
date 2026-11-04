@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/transformer.h"
 #include "io/json.h"
 
@@ -12,11 +13,10 @@ class Bert {
     struct Workspace {
         TransformerEncoder::Workspace encoder;
         Buffer features;
-        Workspace(const Bert &b, int batch, int time, BufferAllocator *allocator,
+        Workspace(const Bert &b, int batch, int time,
                   int rows_capacity = 0)
-            : encoder(b.encoder_, batch, time, allocator, rows_capacity),
-              features(size_t(encoder.max_rows) * b.encoder_.hidden() * bytes(b.encoder_.type()),
-                       allocator) {}
+            : encoder(b.encoder_, batch, time, rows_capacity),
+              features(size_t(encoder.max_rows) * b.encoder_.hidden() * bytes(b.encoder_.type())) {}
     };
     Bert(Weights &, const Json &, const std::string &prefix, int output_layers,
          bool quantize = false);

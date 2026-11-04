@@ -30,21 +30,20 @@ TransformerEncoder::TransformerEncoder(std::vector<EncoderBlock> blocks, int hea
                 throw std::invalid_argument("dense transformer norm mismatch");
     }
 }
-TransformerEncoder::Workspace::Workspace(const TransformerEncoder &encoder, int batch, int time,
-                                         BufferAllocator *allocator, int rows_capacity)
+TransformerEncoder::Workspace::Workspace(const TransformerEncoder &encoder, int batch, int time, int rows_capacity)
     : max_batch(batch), max_time(time), max_rows(rows_capacity) {
     if (batch < 1 || time < 1 || rows_capacity < 0 ||
         int64_t(batch) * time > INT32_MAX)
         throw std::invalid_argument("invalid encoder workspace capacity");
     if (!max_rows) max_rows = batch * time;
     size_t rows = size_t(max_rows);
-    auto storage = [&](int width) { return Buffer(rows * width * bytes(encoder.type_), allocator); };
+    auto storage = [&](int width) { return Buffer(rows * width * bytes(encoder.type_)); };
     projected = storage(3 * encoder.hidden_);
     attended = storage(encoder.hidden_);
     update = storage(encoder.hidden_);
     expanded = storage(encoder.blocks_.front().up.output_channels());
-    lse = Buffer(rows * encoder.heads_ * sizeof(float), allocator);
-    linear = Linear::Workspace(max_rows, encoder.quant_input_channels_, allocator);
+    lse = Buffer(rows * encoder.heads_ * sizeof(float));
+    linear = Linear::Workspace(max_rows, encoder.quant_input_channels_);
 }
 void TransformerEncoder::prepare(int max_rows) const {
     for (const auto &block : blocks_) {
@@ -67,7 +66,7 @@ void TransformerEncoder::prepare(Workspace &workspace, int max_rows) const {
     }
 }
 TensorView TransformerEncoder::forward(TensorView hidden_states, ForwardContext &context) const {
-    Workspace workspace(*this, context.max_batch, context.max_time, &context.storage,
+    Workspace workspace(*this, context.max_batch, context.max_time,
                         context.max_rows);
     if (context.mode == ForwardContext::Prepare)
         prepare(workspace);

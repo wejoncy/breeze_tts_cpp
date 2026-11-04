@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include <curand_kernel.h>
 

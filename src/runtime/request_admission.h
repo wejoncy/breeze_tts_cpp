@@ -73,7 +73,7 @@ class RequestAdmissionPool {
         credits.resize(std::min(credits.size(), capacity_));
         const size_t retained = kv_.runtime_storage_bytes();
         const size_t capacity = memory_.runtime_capacity_bytes();
-        const size_t alone_workspace = BufferAllocator::aligned(workspace);
+        const size_t alone_workspace = Tensor::aligned(workspace);
         const size_t alone_kv = kv_.additional_bytes(std::max(0, credits.front() - kv_.committed()));
         // Only permanent KV backing and a single largest input determine
         // impossibility. Current prefill workspace pressure can only defer.
@@ -98,7 +98,7 @@ class RequestAdmissionPool {
         }
         const size_t protected_workspace = workspace_.empty()
             ? workspace : std::max(workspace, *workspace_.rbegin());
-        const size_t aligned = BufferAllocator::aligned(protected_workspace);
+        const size_t aligned = Tensor::aligned(protected_workspace);
         const size_t available = memory_.available_bytes();
         for (size_t k = credits.size(); k; --k) {
             if (peaks[k] > size_t(INT_MAX)) continue;

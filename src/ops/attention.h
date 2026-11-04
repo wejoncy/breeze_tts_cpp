@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <vector>
 namespace tts {
-// Borrowed FP32 scratch, reserved from the shared backend pool at initialization.
+// Borrowed FP32 scratch, reserved from the shared tensor pool at initialization.
 struct FlashDecodeWorkspace {
     TensorView output, lse;
 };

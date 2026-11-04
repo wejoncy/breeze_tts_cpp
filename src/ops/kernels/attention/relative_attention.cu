@@ -243,7 +243,7 @@ void flash_relative(cudaStream_t stream, TensorView qkv, TensorView rk, TensorVi
     p.oaccum_ptr = scratch;
     auto *lse = reinterpret_cast<float *>(
         static_cast<char *>(scratch) +
-        BufferAllocator::aligned(size_t(rows) * heads * dim * sizeof(float)));
+        Tensor::aligned(size_t(rows) * heads * dim * sizeof(float)));
     p.softmax_lse_ptr = p.softmax_lseaccum_ptr = lse;
     p.q_batch_stride = p.k_batch_stride = p.v_batch_stride = int64_t(time) * qkv.ld();
     p.q_row_stride = p.k_row_stride = p.v_row_stride = qkv.ld();
@@ -316,7 +316,7 @@ size_t ops::relative_attention_workspace_bytes(int batch, int time, int heads, i
     if (use_flash(type, dim)) {
         if (rows > (SIZE_MAX - 255) / sizeof(float) / (size_t(dim) + 1))
             throw std::overflow_error("relative attention workspace size");
-        return BufferAllocator::aligned(rows * dim * sizeof(float)) + rows * sizeof(float);
+        return Tensor::aligned(rows * dim * sizeof(float)) + rows * sizeof(float);
     }
     size_t stride = relative_attention_score_stride(time, type);
     if (rows > SIZE_MAX / stride / bytes(type))
@@ -386,7 +386,7 @@ void cuda_relative_attention(cublasHandle_t blas, cudaStream_t stream, TensorVie
             compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     auto launch_softmax = [&](auto type) {
         using T = decltype(type);
-        const size_t static_shared = BufferAllocator::aligned(
+        const size_t static_shared = Tensor::aligned(
             sizeof(typename cub::BlockReduce<float, 256>::TempStorage) + 2 * sizeof(float));
         if (size_t(time) * sizeof(float) + static_shared <= shared_memory_limit)
             relative_softmax<T, true><<<rows * heads, 256, size_t(time) * sizeof(float), stream>>>(

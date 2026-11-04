@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/convolution.h"
 #include "layers/transformer.h"
 #include "io/json.h"
@@ -17,7 +18,7 @@ class Hubert {
         TransformerEncoder::Workspace encoder;
         Buffer convolution, activations[2], projected, statistics;
         int max_batch, max_samples;
-        Workspace(const Hubert &, int batch, int samples, BufferAllocator *);
+        Workspace(const Hubert &, int batch, int samples);
     };
     Hubert(Weights &, const std::string &prefix, const Json &);
     int frames(int samples) const;

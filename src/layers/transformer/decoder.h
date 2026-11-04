@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include <algorithm>
 #include "io/weights.h"
 #include "ops/basic.h"
@@ -19,27 +20,23 @@ struct TransformerState {
     int batch, capacity, max_rows;
     KVCacheView external_kv;
     bool ring;
-    TransformerState(const TransformerConfig &c, int b, int cap, int rows, BufferAllocator *arena,
+    TransformerState(const TransformerConfig &c, int b, int cap, int rows,
                      KVCacheView cache = {}, bool circular = false, bool owns_cache = true)
         : keys((!owns_cache || cache.layout.block_table || cache.layout.sequences ||
                 cache.layout.key_pages)
                    ? 0
-                   : size_t(c.layers) * b * cap * c.kvheads * c.dim * bytes(c.type),
-               arena),
-          values(keys.size(), arena),
-          normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type),
-                 arena),
-          projected(size_t(rows) * (c.heads + 2 * c.kvheads) * c.dim * bytes(c.type), arena),
-          query(size_t(rows) * c.heads * c.dim * bytes(c.type), arena),
-          attended(query.size(), arena), update(size_t(rows) * c.hidden * bytes(c.type), arena),
-          gateup(size_t(rows) * c.intermediate * 2 * bytes(c.type), arena),
-          gated(c.quantization != Quantization::None ? 0 : gateup.size() / 2, arena),
+                   : size_t(c.layers) * b * cap * c.kvheads * c.dim * bytes(c.type)),
+          values(keys.size()),
+          normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
+          projected(size_t(rows) * (c.heads + 2 * c.kvheads) * c.dim * bytes(c.type)),
+          query(size_t(rows) * c.heads * c.dim * bytes(c.type)),
+          attended(query.size()), update(size_t(rows) * c.hidden * bytes(c.type)),
+          gateup(size_t(rows) * c.intermediate * 2 * bytes(c.type)),
+          gated(c.quantization != Quantization::None ? 0 : gateup.size() / 2),
           quant_values(c.quantization != Quantization::None
                            ? size_t(rows) * std::max(c.hidden, c.intermediate)
-                           : 0,
-                       arena),
-          quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0,
-                       arena),
+                           : 0),
+          quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0),
           batch(b), capacity(cap), max_rows(rows), external_kv(cache), ring(circular) {}
 };
 class Transformer {
@@ -136,7 +133,7 @@ class Transformer {
             throw std::invalid_argument("invalid transformer position or layer configuration");
         for (int i = 0; i < (cfg.gemma ? 2 : 1); i++) {
             rope_storage[i] =
-                Tensor({cfg.max_positions, cfg.dim}, cfg.type, &weights.allocator());
+                Tensor({cfg.max_positions, cfg.dim}, cfg.type, weights.device());
             rope[i] = rope_storage[i].view();
             ops::rotary_table(rope[i], cfg.dim, i ? cfg.full_theta : cfg.theta,
                                         i ? cfg.full_factor : cfg.factor, i ? 1 : cfg.rope_type,
@@ -164,7 +161,7 @@ class Transformer {
     }
     TensorView forward(TensorView hidden_states, ForwardContext &context) const {
         if (context.mode == ForwardContext::Prepare) {
-            TransformerState workspace(config, 1, 1, 1, &context.storage);
+            TransformerState workspace(config, 1, 1, 1);
             if (workspace.update.data()) {
                 ops::reserve_attention(hidden_states.device,
                     size_t(context.max_batch) * context.max_time * config.heads);
@@ -172,8 +169,7 @@ class Transformer {
             }
             return context.batch.output.numel() ? context.batch.output : hidden_states;
         }
-        TransformerState workspace(config, context.max_batch, context.max_time, context.max_rows,
-                                    &context.storage, context.batch.cache, false,
+        TransformerState workspace(config, context.max_batch, context.max_time, context.max_rows, context.batch.cache, false,
                                     !context.batch.is_decode());
         if (context.mode == ForwardContext::Execute)
             forward(workspace, hidden_states, context.batch);

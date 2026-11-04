@@ -1,5 +1,6 @@
 #include "ops/cuda/lt_linear.h"
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
+#include "ops/basic.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -249,16 +250,18 @@ bool LtLinear::prepare(TensorView x, TensorView w, TensorView y, bool full_preci
     return matmul(x, w, bias, y, epilogue, full_precision, product_scale,
                   accumulation, workspace, workspace_bytes, stream, groups, false, max_rows);
 }
-void Backend::prepare_linear(TensorView x, TensorView w, TensorView y, bool full_precision,
+void ops::prepare_matmul(TensorView x, TensorView w, TensorView y, bool full_precision,
                              float accumulation, float product_scale, int groups, int max_rows) {
-    if (!lt_linear_->prepare(x, w, y, full_precision, accumulation, product_scale,
-                             blas_workspace_.data(), blas_workspace_.size(), stream, groups, max_rows))
+    auto &gpu = execution_context(x);
+    if (!gpu.matmul->prepare(x, w, y, full_precision, accumulation, product_scale,
+                             gpu.gemm_workspace.data(), gpu.gemm_workspace.size(), gpu.stream, groups, max_rows))
         throw std::invalid_argument("invalid linear planning views");
 }
-bool Backend::prepare_linear_gelu(TensorView x, TensorView w, TensorView bias, TensorView y,
+bool ops::prepare_matmul_gelu(TensorView x, TensorView w, TensorView bias, TensorView y,
                                   int max_rows) {
-    return lt_linear_->prepare(x, w, y, false, 0, 1, blas_workspace_.data(),
-                                blas_workspace_.size(), stream, 1, max_rows, bias,
+    auto &gpu = execution_context(x);
+    return gpu.matmul->prepare(x, w, y, false, 0, 1, gpu.gemm_workspace.data(),
+                                gpu.gemm_workspace.size(), gpu.stream, 1, max_rows, bias,
                                 CUBLASLT_EPILOGUE_GELU_BIAS);
 }
 bool LtLinear::gelu(TensorView x, TensorView w, TensorView bias, TensorView y, void *workspace,
@@ -266,13 +269,14 @@ bool LtLinear::gelu(TensorView x, TensorView w, TensorView bias, TensorView y, v
     return matmul(x, w, bias, y, CUBLASLT_EPILOGUE_GELU_BIAS, false, 1, 0,
                     workspace, workspace_bytes, stream, 1, true);
 }
-bool Backend::linear_gelu(TensorView x, TensorView w, TensorView bias, TensorView y) {
-    return lt_linear_->gelu(x, w, bias, y, blas_workspace_.data(), blas_workspace_.size(), stream);
+bool ops::matmul_gelu(TensorView x, TensorView w, TensorView bias, TensorView y) {
+    auto &gpu = execution_context(x);
+    return gpu.matmul->gelu(x, w, bias, y, gpu.gemm_workspace.data(), gpu.gemm_workspace.size(), gpu.stream);
 }
-void Backend::seal_plans() {
-    lt_linear_->seal(blas_workspace_.data(), blas_workspace_.size(), stream);
-    if (quant_)
-        quant_->seal();
-    plans_sealed_ = true;
+void ops::seal(int device) {
+    auto &gpu = execution_context(device);
+    gpu.matmul->seal(gpu.gemm_workspace.data(), gpu.gemm_workspace.size(), gpu.stream);
+    if (gpu.quantization) gpu.quantization->seal();
+    gpu.plans_sealed = true;
 }
 } // namespace tts

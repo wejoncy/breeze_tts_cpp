@@ -1,5 +1,6 @@
 #include "ops/convolution.h"
-#include "ops/cuda/backend.h"
+#include "ops/basic.h"
+#include "runtime/cuda_context.h"
 
 namespace tts::ops {
 size_t convolution_workspace_bytes(const ConvGeometry &g, int batch, int time) {
@@ -31,7 +32,7 @@ void convolution(TensorView x, TensorView weight, TensorView bias, TensorView y,
     if (workspace.type != Type::F32 || workspace.rows != x.rows ||
         workspace.cols != g.kernel * g.output_channels)
         throw std::invalid_argument("convolution projection workspace mismatch");
-    gpu.grouped_linear(x, weight, workspace, g.groups);
+    tts::ops::grouped_matmul(x, weight, workspace, g.groups);
     convolution_finish( workspace, y, batch, time, g, e, input, output);
 }
 } // namespace tts::ops

@@ -63,7 +63,7 @@ void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs
     } else if (program == "waveform") {
         TensorBatch features;
         {
-            ScratchScope acoustic_scope(context.storage);
+            Tensor::Scope acoustic_scope;
             features = acoustic.forward(inputs, context);
         }
         auto mel = flow.forward(features, inputs, context);

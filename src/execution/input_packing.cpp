@@ -2,7 +2,6 @@
 #include "core/sequence_builder.h"
 #include <cstring>
 #include <map>
-#include <set>
 
 namespace tts {
 namespace {
@@ -18,11 +17,13 @@ InputSequence pack_sequences(ArrayView<const InputBatch *> inputs, std::string_v
     int64_t total_rows = 0, total_sequences = 0;
     for (size_t input_index = 0; input_index < inputs.size; ++input_index) {
         const auto shape = find_sequence(*inputs[input_index], name).shape;
+        if (shape.rows < 0 || shape.batch < 0 || shape.time < 0)
+            throw std::invalid_argument("invalid input sequence dimensions");
         total_rows += shape.rows;
         total_sequences += shape.batch;
+        if (2 * total_rows + 2 * total_sequences + 1 > INT32_MAX)
+            throw std::overflow_error("packed sequence metadata capacity");
     }
-    if (total_rows > INT32_MAX || total_sequences > INT32_MAX)
-        throw std::overflow_error("packed sequence metadata capacity");
     builder.reserve(int(total_sequences), int(total_rows));
     for (size_t input_index = 0; input_index < inputs.size; ++input_index) {
         const auto &source = find_sequence(*inputs[input_index], name);
@@ -46,15 +47,7 @@ InputSequence pack_sequences(ArrayView<const InputBatch *> inputs, std::string_v
         }
     }
     const auto layout = builder.view();
-    auto storage = std::make_shared<std::vector<int>>(size_t(layout.rows) * 2 + size_t(layout.sequences) * 2 + 1);
-    auto *destination = storage->data();
-    for (auto span : {std::pair{layout.row_batch, size_t(layout.rows)},
-                      std::pair{layout.row_position, size_t(layout.rows)},
-                      std::pair{layout.cu_seqlens, size_t(layout.sequences) + 1},
-                      std::pair{layout.lengths, size_t(layout.sequences)}}) {
-        std::copy_n(span.first, span.second, destination);
-        destination += span.second;
-    }
+    auto storage = std::make_shared<std::vector<int>>(std::move(builder).release());
     TensorView metadata(storage->data(), int(storage->size()), 1, Type::I32);
     owner.owners.push_back(storage);
     return {metadata, {layout.sequences, layout.max_length, layout.rows}};
@@ -75,6 +68,7 @@ InputBatch merge_inputs(ArrayView<const InputBatch *> inputs) {
         const auto &prototype = upload ? inputs[0]->uploads : inputs[0]->bindings;
         for (const auto &field : prototype) {
             std::vector<const TensorView *> sources;
+            sources.reserve(inputs.size);
             int64_t rows = 0;
             for (size_t input_index = 0; input_index < inputs.size; ++input_index) {
                 const auto &source = upload ? inputs[input_index]->uploads : inputs[input_index]->bindings;
@@ -91,6 +85,8 @@ InputBatch merge_inputs(ArrayView<const InputBatch *> inputs) {
             auto storage = std::make_shared<std::vector<char>>(size_t(rows) * field.value.cols * bytes(field.value.type));
             size_t byte_offset = 0;
             std::map<std::string_view, int64_t> bases;
+            for (const auto &offset : result.offsets)
+                if (offset.tensor == field.name) bases.try_emplace(offset.sequence, 0);
             for (size_t input_index = 0; input_index < inputs.size; ++input_index) {
                 const auto &source = *sources[input_index];
                 if (source.size()) std::memcpy(storage->data() + byte_offset, source.data, source.size());
@@ -108,11 +104,8 @@ InputBatch merge_inputs(ArrayView<const InputBatch *> inputs) {
                         }
                     }
                 }
-                std::set<std::string_view> axes;
-                for (const auto &offset : result.offsets)
-                    if (offset.tensor == field.name) axes.insert(offset.sequence);
-                for (auto axis : axes)
-                    bases[axis] += find_sequence(*inputs[input_index], axis).shape.rows;
+                for (auto &[axis, base] : bases)
+                    base += find_sequence(*inputs[input_index], axis).shape.rows;
                 byte_offset += source.size();
             }
             destination.push_back({field.name, TensorView(storage->data(), int(rows), field.value.cols, field.value.type)});

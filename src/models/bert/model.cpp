@@ -92,11 +92,11 @@ TensorView Bert::forward(Workspace &workspace, const int *ids,
 }
 TensorView Bert::forward(TensorView input_ids, ForwardContext &context) const {
     if (context.mode == ForwardContext::Prepare) {
-        Workspace workspace(*this, 1, 1, &context.storage, 1);
+        Workspace workspace(*this, 1, 1, 1);
         if (workspace.features.data()) encoder_.prepare(workspace.encoder, context.max_rows);
         return workspace.features.view(1, encoder_.hidden(), encoder_.type());
     }
-    Workspace workspace(*this, context.max_batch, context.max_time, &context.storage,
+    Workspace workspace(*this, context.max_batch, context.max_time,
                         context.max_rows);
     if (context.mode == ForwardContext::Execute)
         forward(workspace, input_ids.ptr<int>(), context.batch);

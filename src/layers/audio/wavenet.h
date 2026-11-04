@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/convolution.h"
 #include "layers/linear.h"
 namespace tts {
@@ -11,7 +12,7 @@ class WaveNet {
     struct Workspace {
         Buffer hidden, skip, gates, activated, projected, condition, convolution;
         int max_batch, max_time, max_rows;
-        Workspace(const WaveNet &, int batch, int time, BufferAllocator *, int sequences = 0);
+        Workspace(const WaveNet &, int batch, int time, int sequences = 0);
     };
     WaveNet(Weights &, const std::string &, int layers, int dilation_rate);
     int condition_channels() const { return conditioning_.output_channels(); }

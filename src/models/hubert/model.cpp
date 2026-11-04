@@ -81,8 +81,8 @@ int Hubert::frames(int samples) const {
         samples = c.geometry().output_length(samples);
     return samples;
 }
-Hubert::Workspace::Workspace(const Hubert &h, int batch, int samples, BufferAllocator *allocator)
-    : encoder(h.encoder_, batch, h.frames(samples), allocator), max_batch(batch),
+Hubert::Workspace::Workspace(const Hubert &h, int batch, int samples)
+    : encoder(h.encoder_, batch, h.frames(samples)), max_batch(batch),
       max_samples(samples) {
     int time = samples;
     size_t activation_bytes = 0, projection_bytes = 0;
@@ -97,13 +97,12 @@ Hubert::Workspace::Workspace(const Hubert &h, int batch, int samples, BufferAllo
     activation_bytes = std::max(activation_bytes, size_t(batch) * time * h.encoder_.hidden() *
                                                       bytes(h.encoder_.type()));
     for (auto &a : activations)
-        a = Buffer(activation_bytes, allocator);
+        a = Buffer(activation_bytes);
     projected =
-        Buffer(size_t(batch) * time * h.encoder_.hidden() * bytes(h.encoder_.type()), allocator);
-    convolution = Buffer(projection_bytes, allocator);
+        Buffer(size_t(batch) * time * h.encoder_.hidden() * bytes(h.encoder_.type()));
+    convolution = Buffer(projection_bytes);
     statistics =
-        Buffer(size_t(batch) * h.features_.front().geometry().output_channels * 2 * sizeof(float),
-               allocator);
+        Buffer(size_t(batch) * h.features_.front().geometry().output_channels * 2 * sizeof(float));
 }
 void Hubert::prepare(Workspace &workspace, int max_samples) const {
     int time = max_samples;

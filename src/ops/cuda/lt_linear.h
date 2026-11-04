@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace tts {
-// Host plans borrow the backend's handle/workspace. Initialization selects and
+// Host plans borrow the CUDA handle/workspace. Initialization selects and
 // warms each matrix family; serving changes only its exact row count.
 class LtLinear {
     using Key = std::tuple<int, int, int, int, int, Type, Type, cublasComputeType_t,

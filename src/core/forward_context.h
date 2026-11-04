@@ -1,8 +1,9 @@
 #pragma once
 #include "core/forward_batch.h"
-#include "core/allocator.h"
+#include "core/buffer.h"
 #include <cstddef>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 
 namespace tts {
@@ -30,7 +31,7 @@ template <class Item> struct NamedView : ArrayView<Item> {
         for (size_t argument_index = 0; argument_index < this->size; ++argument_index)
             if (this->data[argument_index].name == name)
                 return this->data[argument_index].value;
-        throw std::out_of_range("missing forward argument");
+        throw std::out_of_range("missing forward argument: " + std::string(name));
     }
 };
 using NamedTensor = NamedValue<TensorView>;
@@ -55,7 +56,6 @@ struct ForwardCall {
 // Borrowed computation data. Resource ownership and request state stay in the runner.
 struct ForwardContext {
     enum Mode { Plan, Prepare, Capture, Execute } mode = Execute;
-    ScratchAllocator &storage;
     ForwardBatch batch;
     NamedView<const NamedValue<SequenceLayout>> sequences;
     NamedView<const NamedValue<double>> parameters;
@@ -66,8 +66,8 @@ struct ForwardContext {
     void *executor = nullptr;
     bool (*dispatch)(void *, const ForwardCall &, bool) = nullptr;
     int max_batch, max_time, max_rows;
-    ForwardContext(ScratchAllocator &allocator, int batches, int time, int rows)
-        : storage(allocator), max_batch(batches), max_time(time), max_rows(rows) {}
+    ForwardContext(int batches, int time, int rows)
+        : max_batch(batches), max_time(time), max_rows(rows) {}
     template <class Function>
     void run(const void *owner, const char *name, std::initializer_list<int> shape,
              std::initializer_list<const void *> buffers, const Function &function) const {
@@ -79,10 +79,7 @@ struct ForwardContext {
         else if (mode == Capture) throw std::logic_error("forward capture has no executor");
     }
     TensorView tensor(TensorShape shape, Type type) const {
-        auto result = TensorView::metadata(shape.rows, shape.cols, type, 0,
-                                           storage.device_ordinal());
-        result.data = storage.allocate(result.size());
-        return result;
+        return Tensor::scratch(shape, type);
     }
 };
 } // namespace tts

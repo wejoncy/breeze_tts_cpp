@@ -77,6 +77,12 @@ class SequenceBuilder {
                std::equal(view().cu_seqlens, view().cu_seqlens + sequences_ + 1,
                           other.view().cu_seqlens);
     }
+    std::vector<int> release() && {
+        if (rows_ != row_capacity_ || sequences_ != sequence_capacity_)
+            throw std::logic_error("only exact-size sequence metadata can be released");
+        if (data_.empty()) return {0};
+        return std::move(data_);
+    }
     static std::vector<int> pack(const std::vector<int> &lengths) {
         int64_t rows = 0;
         for (int n : lengths) {
@@ -88,8 +94,7 @@ class SequenceBuilder {
         SequenceBuilder builder;
         builder.reserve(int(lengths.size()), int(rows));
         for (int n : lengths) builder.append(n, n);
-        if (builder.data_.empty()) return {0};
-        return std::move(builder.data_);
+        return std::move(builder).release();
     }
 };
 } // namespace tts

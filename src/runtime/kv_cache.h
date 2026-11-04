@@ -33,8 +33,8 @@ class PagedKVCache {
           page_size_(page_tokens), type_(type),
           layer_bytes_(size_t(page_tokens) * width * bytes(type)),
           page_bytes_(size_t(layers) * layer_bytes_),
-          key_table_(size_t(lanes) * max_blocks_ * sizeof(void *), &memory),
-          value_table_(key_table_.size(), &memory) {
+          key_table_(size_t(lanes) * max_blocks_ * sizeof(void *)),
+          value_table_(key_table_.size()) {
         keys_.reserve(size_t(lanes) * max_blocks_);
         values_.reserve(keys_.capacity());
         free_.reserve(keys_.capacity());
@@ -66,7 +66,7 @@ class PagedKVCache {
         size_t size = 0;
         for (const auto &chunk : chunks_)
             if (memory_.owns_runtime(chunk.data()))
-                size += BufferAllocator::aligned(chunk.size());
+                size += Tensor::aligned(chunk.size());
         return size;
     }
     size_t max_storage_bytes() const {
@@ -91,7 +91,7 @@ class PagedKVCache {
         int old = capacity(), added = n - old;
         if (page_bytes_ > SIZE_MAX / 2 / size_t(added))
             throw std::overflow_error("KV storage byte count");
-        Buffer chunk(2 * page_bytes_ * added, &memory_);
+        Buffer chunk(2 * page_bytes_ * added);
         chunks_.push_back(std::move(chunk));
         auto *base = static_cast<char *>(chunks_.back().data());
         for (int i = 0; i < added; ++i) {

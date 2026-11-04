@@ -8,7 +8,7 @@
 namespace tts {
 ReferenceEncoder::Output ReferenceEncoder::forward(TensorView waveform, TensorView speech_waveform,
                                                      ForwardContext &context) const {
-    Workspace workspace(*this, &context.storage);
+    Workspace workspace(*this);
     if (context.mode == ForwardContext::Execute)
         return forward(workspace, waveform, speech_waveform);
     if (context.mode == ForwardContext::Prepare && workspace.projected.data()) {
@@ -90,11 +90,10 @@ ReferenceEncoder::ReferenceEncoder(Weights &weights, const std::string &speech_p
       codebook_(weights.get(acoustic_prefix + ".quantizer.vq.layers.0._codebook.embed")), norms_(codebook_norms(weights, acoustic_prefix)),
       style_(weights, acoustic_prefix + ".ref_enc", acoustic_config.at("style_heads"),
              acoustic_config.at("style_temporal_layers")),
-      spectrum_(weights.allocator(), spectral_config(reference_config, 0),
-                spectral_capacity(reference_config, 0)),
-      mel_(weights.allocator(),
-           spectral_config(reference_config, mel_channels),
-           spectral_capacity(reference_config, mel_channels)),
+      spectrum_(spectral_config(reference_config, 0),
+                spectral_capacity(reference_config, 0), weights.device()),
+      mel_(spectral_config(reference_config, mel_channels),
+           spectral_capacity(reference_config, mel_channels), weights.device()),
       max_wave_samples_(int(reference_config.at("max_seconds").get<float>() *
                             reference_config.at("sampling_rate").get<int>())),
       max_hubert_samples_(int(reference_config.at("max_seconds").get<float>() *
@@ -109,23 +108,21 @@ ReferenceEncoder::ReferenceEncoder(Weights &weights, const std::string &speech_p
         style_bins_ < 1 || style_bins_ > spectrum_.output_channels())
         throw std::invalid_argument("inconsistent reference feature configuration");
 }
-ReferenceEncoder::Workspace::Workspace(const ReferenceEncoder &encoder, BufferAllocator *storage)
-    : hubert(encoder.hubert_, 1, encoder.max_hubert_samples_, storage),
-      style_encoder(encoder.style_, 1, encoder.spectrum_.frames(encoder.max_wave_samples_), storage),
-      spectrum(encoder.spectrum_, storage), mel_spectrum(encoder.mel_, storage) {
+ReferenceEncoder::Workspace::Workspace(const ReferenceEncoder &encoder)
+    : hubert(encoder.hubert_, 1, encoder.max_hubert_samples_),
+      style_encoder(encoder.style_, 1, encoder.spectrum_.frames(encoder.max_wave_samples_)),
+      spectrum(encoder.spectrum_), mel_spectrum(encoder.mel_) {
     int frames = encoder.hubert_.frames(encoder.max_hubert_samples_);
     int projected_frames = encoder.projection_.geometry().output_length(frames);
-    projected = Buffer(size_t(projected_frames) * encoder.codebook_.cols * bytes(encoder.type_), storage);
-    convolution = Buffer(encoder.projection_.workspace_bytes(1, frames), storage);
-    scores = Buffer(size_t(projected_frames) * encoder.codebook_.rows * bytes(encoder.type_), storage);
-    codes = Buffer(size_t(projected_frames) * sizeof(int), storage);
+    projected = Buffer(size_t(projected_frames) * encoder.codebook_.cols * bytes(encoder.type_));
+    convolution = Buffer(encoder.projection_.workspace_bytes(1, frames));
+    scores = Buffer(size_t(projected_frames) * encoder.codebook_.rows * bytes(encoder.type_));
+    codes = Buffer(size_t(projected_frames) * sizeof(int));
     magnitude = Buffer(size_t(encoder.spectrum_.frames(encoder.max_wave_samples_)) *
-                           encoder.spectrum_.output_channels() * bytes(encoder.type_),
-                       storage);
-    style = Buffer(size_t(encoder.style_channels_) * bytes(encoder.type_), storage);
+                           encoder.spectrum_.output_channels() * bytes(encoder.type_));
+    style = Buffer(size_t(encoder.style_channels_) * bytes(encoder.type_));
     mel = Buffer(size_t(encoder.mel_.frames(encoder.max_wave_samples_)) * encoder.mel_.output_channels() *
-                     bytes(encoder.type_),
-                 storage);
+                     bytes(encoder.type_));
 }
 ReferenceEncoder::Output ReferenceEncoder::forward(Workspace &workspace, TensorView waveform,
                                                    TensorView speech_waveform) const {

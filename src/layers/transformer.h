@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/linear.h"
 #include "ops/attention.h"
 
@@ -24,7 +25,7 @@ class TransformerEncoder {
         Linear::Workspace linear;
         Buffer projected, attended, update, expanded, lse;
         int max_batch, max_time, max_rows;
-        Workspace(const TransformerEncoder &, int batch, int time, BufferAllocator *,
+        Workspace(const TransformerEncoder &, int batch, int time,
                   int rows_capacity = 0);
     };
     TransformerEncoder(std::vector<EncoderBlock>, int heads);

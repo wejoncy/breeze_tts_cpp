@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
 #include "ops/kernels/sequence/norm_projection.h"
 #include "ops/kernels/attention/qkv_writeback.cuh"

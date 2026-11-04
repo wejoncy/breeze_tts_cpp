@@ -81,7 +81,7 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
         blocks_.push_back({Linear(w, p + ".attn_norm.linear"), std::move(qkv),
                            Linear(w, p + ".attn.to_out.0"), Linear(w, p + ".ff.ff.0.0", quantize),
                            Linear(w, p + ".ff.ff.2", quantize),
-                           Tensor({time_rows, 6 * hidden_}, type_, &w.allocator())});
+                           Tensor({time_rows, 6 * hidden_}, type_, w.device())});
     }
     if (blocks_.empty())
         throw std::invalid_argument("empty DiT");
@@ -116,7 +116,7 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
                     std::cos(angle);
             }
     auto encoded = w.generated(root + ".times", time_table, time_rows, frequency_dim, type_);
-    final_time_modulation_ = Tensor({time_rows, 2 * hidden_}, type_, &w.allocator());
+    final_time_modulation_ = Tensor({time_rows, 2 * hidden_}, type_, w.device());
     std::vector<std::pair<Linear, TensorView>> modulations;
     for (const auto &block : blocks_)
         modulations.emplace_back(block.modulation, block.time_modulation.view());
@@ -125,9 +125,9 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
     // on whether its owner later moves it while constructing the network.
     w.after_loading([encoded, first = time_in_, second = time_out_, time_rows,
                      ranges = sampling_offsets_, hidden = hidden_, type = type_,
-                     modulations = std::move(modulations), &allocator = w.allocator()] {
-        Tensor time_states({time_rows, hidden}, type, &allocator);
-        Tensor projected_states({time_rows, hidden}, type, &allocator);
+                     modulations = std::move(modulations), device = w.device()] {
+        Tensor time_states({time_rows, hidden}, type, device);
+        Tensor projected_states({time_rows, hidden}, type, device);
         ops::Epilogue activation;
         activation.activation = ops::Activation::Silu;
         // These are derived parameters. Materialize them with matrix GEMM,
@@ -148,13 +148,13 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
         }
     });
 }
-DiT::Workspace::Workspace(const DiT &d, int batch, int time, BufferAllocator *allocator)
+DiT::Workspace::Workspace(const DiT &d, int batch, int time)
     : max_batch(batch), max_time(time) {
     if (batch < 1 || time < 1)
         throw std::invalid_argument("invalid DiT workspace");
     size_t rows = size_t(batch) * time;
     auto tensor = [&](int width, Type type) {
-        return Buffer(rows * width * bytes(type), allocator);
+        return Buffer(rows * width * bytes(type));
     };
     condition = tensor(d.hidden_, d.type_);
     negative_condition = tensor(d.hidden_, d.type_);
@@ -170,12 +170,12 @@ DiT::Workspace::Workspace(const DiT &d, int batch, int time, BufferAllocator *al
     int text_width =
         d.text_blocks_.empty() ? d.text_channels_ : d.text_blocks_.front().up.output_channels();
     text_expanded = tensor(text_width, d.type_);
-    statistics = Buffer(size_t(batch) * text_width * sizeof(float), allocator);
-    lse = Buffer(rows * d.heads_ * sizeof(float), allocator);
+    statistics = Buffer(size_t(batch) * text_width * sizeof(float));
+    lse = Buffer(rows * d.heads_ * sizeof(float));
     size_t projection = 0;
     for (const auto &c : d.position_convs_)
         projection = std::max(projection, c.workspace_bytes(batch, time));
-    convolution = Buffer(projection, allocator);
+    convolution = Buffer(projection);
     int quant_input = 0;
     auto consider = [&](const Linear &layer) {
         if (layer.is_quantized()) quant_input = std::max(quant_input, layer.input_channels());
@@ -185,7 +185,7 @@ DiT::Workspace::Workspace(const DiT &d, int batch, int time, BufferAllocator *al
     for (const auto &block : d.text_blocks_)
         for (const auto *layer : {&block.up, &block.down}) consider(*layer);
     if (rows > INT32_MAX) throw std::invalid_argument("DiT row capacity exceeds tensor dimensions");
-    linear = Linear::Workspace(int(rows), quant_input, allocator);
+    linear = Linear::Workspace(int(rows), quant_input);
 }
 void DiT::prepare(Workspace &w, TensorView mel_input, TensorView mel_output,
                   int max_rows) const {

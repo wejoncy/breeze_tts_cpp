@@ -32,7 +32,7 @@ Model::Model(Weights &weights, ModelConfig configuration)
         throw std::invalid_argument("text replacement embedding shape");
     // Frozen embedding -> projection is input-independent: evaluate once at load.
     depth_embedding_storage = Tensor({audio_embedding.rows, depth.config.hidden}, depth.config.type,
-                                      &weights.allocator());
+                                      weights.device());
     depth_embedding = depth_embedding_storage.view();
     const auto &checkpoint_head = weights.entry("depth_decoder.codebooks_head.weight");
     int head_count = config.codebooks - 1, hidden = depth.config.hidden;
@@ -64,12 +64,12 @@ void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs
         auto hidden_states = context.tensor({context.max_batch, backbone.config.hidden},
                                              backbone.config.type).slice(0, context.batch.batch());
         if (!context.batch.is_decode()) {
-            ScratchScope prompt_scope(context.storage);
+            Tensor::Scope prompt_scope;
             const int prompt_rows = context.mode == ForwardContext::Prepare ? 1 : context.batch.rows();
             auto projected = context.tensor({prompt_rows, backbone.config.hidden},
                                             backbone.config.type);
             {
-                ScratchScope text_scope(context.storage);
+                Tensor::Scope text_scope;
                 auto text_context = context;
                 const auto text_layout = context.sequences["text"];
                 text_context.batch = ForwardBatch(text_layout);

@@ -15,7 +15,7 @@ double to_hz(double mel) {
     return mel < 15 ? mel * (200. / 3.) : 1000. * std::exp((mel - 15.) * (std::log(6.4) / 27.));
 }
 } // namespace
-Spectrogram::Spectrogram(BufferAllocator &allocator, SpectrogramConfig configuration, int max_frames)
+Spectrogram::Spectrogram(SpectrogramConfig configuration, int max_frames, Device device)
     : config_(configuration), capacity_(max_frames) {
     if (configuration.fft < 2 || configuration.hop < 1 || configuration.window < 1 || configuration.window > configuration.fft || configuration.padding < 0 ||
         configuration.sample_rate < 1 || configuration.mel_channels < 0 || max_frames < 1 || configuration.min_frequency < 0 ||
@@ -27,8 +27,8 @@ Spectrogram::Spectrogram(BufferAllocator &allocator, SpectrogramConfig configura
     std::vector<float> window(configuration.fft, 0);
     for (int coefficient_index = 0; coefficient_index < configuration.window; ++coefficient_index)
         window[(configuration.fft - configuration.window) / 2 + coefficient_index] = .5 - .5 * std::cos(2. * std::acos(-1.) * coefficient_index / configuration.window);
-    window_ = Tensor({1, configuration.fft}, Type::F32, &allocator);
-    ops::upload_bytes(allocator.device_ordinal(), window_.view().data, window.data(), window_.view().size());
+    window_ = Tensor({1, configuration.fft}, Type::F32, device);
+    ops::upload_bytes(device.index(), window_.view().data, window.data(), window_.view().size());
     if (configuration.mel_channels) {
         double low = to_mel(configuration.min_frequency),
                high = to_mel(configuration.max_frequency ? configuration.max_frequency : configuration.sample_rate / 2.);
@@ -49,16 +49,16 @@ Spectrogram::Spectrogram(BufferAllocator &allocator, SpectrogramConfig configura
                 coefficients[size_t(mel_index) * bins + bin_index] =
                     weight * (2. / (frequencies[mel_index + 2] - frequencies[mel_index]));
             }
-        mel_ = Tensor({configuration.mel_channels, bins}, Type::F32, &allocator);
-        ops::upload_bytes(allocator.device_ordinal(), mel_.view().data, coefficients.data(), mel_.view().size());
-        ops::synchronize(allocator.device_ordinal());
+        mel_ = Tensor({configuration.mel_channels, bins}, Type::F32, device);
+        ops::upload_bytes(device.index(), mel_.view().data, coefficients.data(), mel_.view().size());
+        ops::synchronize(device.index());
     }
     for (int64_t rows = 1; rows <= max_frames;) {
         int frame_capacity = std::min(max_frames, row_capacity(int(rows), 1));
-        ops::prepare_fft(allocator.device_ordinal(), configuration.fft, frame_capacity);
+        ops::prepare_fft(device.index(), configuration.fft, frame_capacity);
         rows = int64_t(frame_capacity) + 1;
     }
-    ops::synchronize(allocator.device_ordinal());
+    ops::synchronize(device.index());
 }
 int Spectrogram::frames(int samples) const {
     return config_.frames(samples);
@@ -69,11 +69,11 @@ int SpectrogramConfig::frames(int samples) const {
         throw std::invalid_argument("waveform is too short/long for the STFT");
     return int(padded_samples / hop + 1);
 }
-Spectrogram::Workspace::Workspace(const Spectrogram &spectrogram, BufferAllocator *storage)
-    : frames(size_t(spectrogram.capacity_) * spectrogram.config_.fft * sizeof(float), storage),
-      spectrum(size_t(spectrogram.capacity_) * (spectrogram.config_.fft / 2 + 1) * 2 * sizeof(float), storage),
-      magnitude(spectrogram.config_.mel_channels ? spectrum.size() / 2 : 0, storage),
-      mel(size_t(spectrogram.capacity_) * spectrogram.config_.mel_channels * sizeof(float), storage) {}
+Spectrogram::Workspace::Workspace(const Spectrogram &spectrogram)
+    : frames(size_t(spectrogram.capacity_) * spectrogram.config_.fft * sizeof(float)),
+      spectrum(size_t(spectrogram.capacity_) * (spectrogram.config_.fft / 2 + 1) * 2 * sizeof(float)),
+      magnitude(spectrogram.config_.mel_channels ? spectrum.size() / 2 : 0),
+      mel(size_t(spectrogram.capacity_) * spectrogram.config_.mel_channels * sizeof(float)) {}
 void Spectrogram::prepare(Workspace &workspace) const {
     if (!config_.mel_channels) return;
     const int bins = config_.fft / 2 + 1;

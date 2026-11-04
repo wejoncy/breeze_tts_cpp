@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/spectral.h"
 #include "runtime/device.h"
 #include <cuda_fp16.h>

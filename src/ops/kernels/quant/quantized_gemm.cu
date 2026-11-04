@@ -158,7 +158,7 @@ LinearFinishWork finish_work(const ops::Epilogue &finish) {
             1 + (finish.bias.data ? 4 : 0)};
 }
 } // namespace
-struct QuantBackend::Impl {
+struct QuantizedGemm::Impl {
     DeviceContext &memory;
     cudaStream_t stream;
     int device_id;
@@ -343,7 +343,7 @@ struct QuantBackend::Impl {
         // geometry, with no model shapes or timing search.
         constexpr int extent = 128;
         constexpr size_t elements = size_t(extent) * extent;
-        Buffer scratch(4 * elements + 2 * extent * sizeof(float), &memory);
+        Buffer scratch(4 * elements + 2 * extent * sizeof(float));
         auto x = scratch.view(extent, extent, format);
         auto w = scratch.view(extent, extent, format, elements);
         auto sx = scratch.view(extent, 1, Type::F32, 4 * elements);
@@ -359,21 +359,21 @@ struct QuantBackend::Impl {
         CUDA(cudaStreamSynchronize(stream));
     }
 };
-QuantBackend::QuantBackend(DeviceContext &memory, cublasLtHandle_t handle, Buffer &workspace,
+QuantizedGemm::QuantizedGemm(DeviceContext &memory, cublasLtHandle_t handle, Buffer &workspace,
                            Type format)
     : impl(std::make_unique<Impl>(memory, handle, workspace, format)) {
     impl->initialize_library();
 }
-QuantBackend::~QuantBackend() = default;
-Type QuantBackend::type() const {
+QuantizedGemm::~QuantizedGemm() = default;
+Type QuantizedGemm::type() const {
     return impl->format;
 }
-void QuantBackend::seal() {
+void QuantizedGemm::seal() {
     impl->plans.seal();
     impl->finishes.seal();
     impl->finish_resources.seal();
 }
-QuantCacheStats QuantBackend::cache_stats() const {
+QuantCacheStats QuantizedGemm::cache_stats() const {
     QuantCacheStats result{};
     result.prepared_plans = impl->plans.size() + impl->finishes.size();
     for (const auto &selector : impl->selectors) {
@@ -384,7 +384,7 @@ QuantCacheStats QuantBackend::cache_stats() const {
     }
     return result;
 }
-void QuantBackend::prepare(int rows, int n, int k, Type output_type) {
+void QuantizedGemm::prepare(int rows, int n, int k, Type output_type) {
     auto &selector = impl->selectors[Impl::output_index(output_type)];
     rows = row_capacity(rows);
     impl->plans.prepare(std::make_tuple(rows, n, k, output_type), [&] {
@@ -401,7 +401,7 @@ void QuantBackend::prepare(int rows, int n, int k, Type output_type) {
         return p;
     });
 }
-void QuantBackend::prepare_finish(int rows, int n, int k, Type output_type,
+void QuantizedGemm::prepare_finish(int rows, int n, int k, Type output_type,
                                   const ops::Epilogue &finish) {
     if (!simple_finish(finish) || (impl->format == Type::I8 && !impl->hopper)) return;
     check_finish_bias(finish, n, output_type);
@@ -450,7 +450,7 @@ void QuantBackend::prepare_finish(int rows, int n, int k, Type output_type,
         return p;
     });
 }
-void QuantBackend::quantize(TensorView source, RowScaledView destination) {
+void QuantizedGemm::quantize(TensorView source, RowScaledView destination) {
     destination.validate();
     if (destination.values.type != impl->format ||
         (source.type != Type::BF16 && source.type != Type::F16) ||
@@ -465,7 +465,7 @@ void QuantBackend::quantize(TensorView source, RowScaledView destination) {
                       destination.scales.ptr<float>(), source.rows, source.cols, source.ld(),
                       impl->stream);
 }
-void QuantBackend::linear(RowScaledView x, RowScaledView w, TensorView y) {
+void QuantizedGemm::linear(RowScaledView x, RowScaledView w, TensorView y) {
     check_linear(impl->format, x, w, y);
     auto *plan =
         impl->plans.find(std::make_tuple(row_capacity(y.rows), y.cols, x.values.cols, y.type));
@@ -474,7 +474,7 @@ void QuantBackend::linear(RowScaledView x, RowScaledView w, TensorView y) {
     impl->run(*plan, x.values.data, x.scales.ptr<float>(), w.values.data, w.scales.ptr<float>(),
               y.data, y.rows);
 }
-bool QuantBackend::linear_finish(RowScaledView x, RowScaledView w, TensorView y,
+bool QuantizedGemm::linear_finish(RowScaledView x, RowScaledView w, TensorView y,
                                  const ops::Epilogue &finish) {
     if (!simple_finish(finish)) return false;
     check_linear(impl->format, x, w, y);
@@ -485,7 +485,7 @@ bool QuantBackend::linear_finish(RowScaledView x, RowScaledView w, TensorView y,
                y.data, y.rows, &finish);
     return true;
 }
-bool QuantBackend::normalized_linear(TensorView input, TensorView normalized,
+bool QuantizedGemm::normalized_linear(TensorView input, TensorView normalized,
                                       TensorView norm_weight, TensorView norm_bias, float epsilon,
                                       const ops::NormFusion &fusion, RowScaledView weight,
                                       TensorView output, const ops::Epilogue &epilogue,
@@ -500,11 +500,11 @@ bool QuantBackend::normalized_linear(TensorView input, TensorView normalized,
         norm_bias, epsilon, fusion, weight, output, epilogue,
         impl->normalized_capacity, encoded, writeback);
 }
-void QuantBackend::norm(TensorView x, TensorView update, TensorView w, RowScaledView out, float eps,
+void QuantizedGemm::norm(TensorView x, TensorView update, TensorView w, RowScaledView out, float eps,
                         bool gemma, TensorView update_scale) {
     impl->norm.run(x, update, w, out, eps, gemma, update_scale);
 }
-void QuantBackend::gated(TensorView input, RowScaledView out, int kind) {
+void QuantizedGemm::gated(TensorView input, RowScaledView out, int kind) {
     impl->gated.run(input, out, kind);
 }
 } // namespace tts

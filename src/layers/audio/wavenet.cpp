@@ -24,23 +24,23 @@ WaveNet::WaveNet(Weights &w, const std::string &prefix, int layers, int dilation
         dilation *= dilation_rate;
     }
 }
-WaveNet::Workspace::Workspace(const WaveNet &n, int batch, int time, BufferAllocator *allocator, int sequences)
+WaveNet::Workspace::Workspace(const WaveNet &n, int batch, int time, int sequences)
     : max_batch(sequences ? sequences : batch), max_time(time), max_rows(int64_t(batch) * time) {
     if (batch < 1 || time < 1 || int64_t(batch) * time > INT32_MAX)
         throw std::invalid_argument("invalid WaveNet workspace");
     int width = n.pre_.output_channels();
     Type type = n.pre_.activation_type();
     size_t rows = size_t(batch) * time;
-    hidden = Buffer(rows * width * bytes(type), allocator);
-    skip = Buffer(hidden.size(), allocator);
-    activated = Buffer(hidden.size(), allocator);
-    gates = Buffer(hidden.size() * 2, allocator);
-    projected = Buffer(gates.size(), allocator);
-    condition = Buffer(size_t(max_batch) * n.conditioning_.output_channels() * bytes(type), allocator);
+    hidden = Buffer(rows * width * bytes(type));
+    skip = Buffer(hidden.size());
+    activated = Buffer(hidden.size());
+    gates = Buffer(hidden.size() * 2);
+    projected = Buffer(gates.size());
+    condition = Buffer(size_t(max_batch) * n.conditioning_.output_channels() * bytes(type));
     size_t scratch = 0;
     for (const auto &c : n.layers_)
         scratch = std::max(scratch, c.workspace_bytes(batch, time));
-    convolution = Buffer(scratch, allocator);
+    convolution = Buffer(scratch);
 }
 void WaveNet::prepare(Workspace &w, int rows) const {
     int hidden = pre_.output_channels();

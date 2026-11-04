@@ -10,8 +10,7 @@ Acoustic::Output Acoustic::forward(TensorView codes, TensorView phones, TensorVi
         codes.cols != 1 || phones.cols != 1 || codes.rows < 1 || phones.rows < 1 ||
         codes.rows % batch || phones.rows % batch)
         throw std::invalid_argument("acoustic token tensor shape/type mismatch");
-    Workspace workspace(*this, context.max_batch, context.max_time, context.max_rows,
-                         &context.storage);
+    Workspace workspace(*this, context.max_batch, context.max_time, context.max_rows);
     const auto layout = describe(batch, codes.rows / batch, phones.rows / batch);
     auto features = workspace.features.view(layout.features.rows, bridge_.output_channels(), type_);
     if (context.mode == ForwardContext::Prepare && workspace.ssl.data())
@@ -51,7 +50,7 @@ Acoustic::Acoustic(Weights &w, const std::string &prefix, const Json &cfg)
     auto codebook = w.get(prefix + ".quantizer.vq.layers.0._codebook.embed");
     Linear project(w, prefix + ".enc_p.ssl_proj");
     projected_codebook_ =
-        Tensor({codebook.rows, project.output_channels()}, type_, &w.allocator());
+        Tensor({codebook.rows, project.output_channels()}, type_, w.device());
     w.after_loading([project, codebook, output = projected_codebook_.view()] {
         project.forward(codebook, output);
     });
@@ -69,26 +68,25 @@ Acoustic::Capacity Acoustic::checked_capacity(Capacity capacity, int repeat) {
         throw std::invalid_argument("invalid acoustic capacity");
     return capacity;
 }
-Acoustic::Workspace::Workspace(const Acoustic &a, int batch, int codes, int phones,
-                               BufferAllocator *allocator, int frames)
+Acoustic::Workspace::Workspace(const Acoustic &a, int batch, int codes, int phones, int frames)
     : Workspace(a, Capacity{batch, acoustic_rows(batch, codes), acoustic_rows(batch, phones),
-                            acoustic_rows(batch, frames ? frames : a.feature_frames(codes))}, allocator) {}
-Acoustic::Workspace::Workspace(const Acoustic &a, Capacity cap, BufferAllocator *allocator)
-    : ssl_encoder(a.ssl_encoder_, 1, a.hidden_frames(checked_capacity(cap, a.rate_.feature_repeat).codes), allocator),
-      text_encoder(a.text_encoder_, 1, cap.phones, allocator),
-      output_encoder(a.output_encoder_, 1, a.hidden_frames(cap.codes), allocator),
-      waveform_features(a.waveform_features_, 1, cap.frames, allocator, cap.sequences),
+                            acoustic_rows(batch, frames ? frames : a.feature_frames(codes))}) {}
+Acoustic::Workspace::Workspace(const Acoustic &a, Capacity cap)
+    : ssl_encoder(a.ssl_encoder_, 1, a.hidden_frames(checked_capacity(cap, a.rate_.feature_repeat).codes)),
+      text_encoder(a.text_encoder_, 1, cap.phones),
+      output_encoder(a.output_encoder_, 1, a.hidden_frames(cap.codes)),
+      waveform_features(a.waveform_features_, 1, cap.frames, cap.sequences),
       max_batch(cap.sequences), max_codes(cap.codes), max_phones(cap.phones), max_frames(cap.frames) {
     ssl_encoder.max_batch = text_encoder.max_batch = output_encoder.max_batch = cap.sequences;
     size_t rows = a.hidden_frames(cap.codes), phone_rows = cap.phones;
     size_t resized_rows = cap.frames / a.rate_.feature_repeat;
     auto tensor = [&](size_t n, int width) {
-        return Buffer(n * width * bytes(a.type_), allocator);
+        return Buffer(n * width * bytes(a.type_));
     };
     ssl = tensor(rows, a.content_.input_channels());
     text = tensor(phone_rows, a.text_.input_channels());
     content = Buffer(std::max(rows * a.content_.output_channels(),
-                              resized_rows * a.content_out_.output_channels()) * bytes(a.type_), allocator);
+                              resized_rows * a.content_out_.output_channels()) * bytes(a.type_));
     projected_text = tensor(phone_rows, a.text_.output_channels());
     query = tensor(rows, a.query_.output_channels());
     key_value = tensor(phone_rows, a.key_value_.output_channels());
@@ -97,7 +95,7 @@ Acoustic::Workspace::Workspace(const Acoustic &a, Capacity cap, BufferAllocator 
     if (a.bridge_.output_channels() != a.attention_out_.output_channels())
         throw std::invalid_argument("acoustic bridge scratch width mismatch");
     features = tensor(cap.frames, a.bridge_.output_channels());
-    lse = Buffer(rows * a.heads_ * sizeof(float), allocator);
+    lse = Buffer(rows * a.heads_ * sizeof(float));
 }
 void Acoustic::prepare(Workspace &w) const {
     int rows = hidden_frames(w.max_codes), resized = w.max_frames / rate_.feature_repeat;
@@ -229,18 +227,17 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
     TensorBatch result;
     result.rows = context.max_batch;
     Workspace workspace(*this, Capacity{context.max_batch, context.max_rows, context.max_rows,
-                                        feature_capacity(context.max_rows)}, &context.storage);
+                                        feature_capacity(context.max_rows)});
     if (context.mode == ForwardContext::Prepare && workspace.ssl.data()) prepare(workspace);
     if (context.mode != ForwardContext::Execute) {
-        WorkspacePlan metadata;
+
         for (int rows : {workspace.max_phones, hidden_frames(workspace.max_codes),
                          workspace.max_frames, workspace.max_frames})
-            metadata.allocate((size_t(rows) * 2 + size_t(context.max_batch) * 2 + 1) * sizeof(int));
-        metadata.allocate(size_t(context.max_batch) * sizeof(AttentionSequence));
-        metadata.allocate(size_t(workspace.max_codes + workspace.max_phones +
+            Tensor::reserve((size_t(rows) * 2 + size_t(context.max_batch) * 2 + 1) * sizeof(int));
+        Tensor::reserve(size_t(context.max_batch) * sizeof(AttentionSequence));
+        Tensor::reserve(size_t(workspace.max_codes + workspace.max_phones +
                                  workspace.max_frames) * sizeof(void *));
-        metadata.allocate(size_t(context.max_batch) * 4 * sizeof(void *));
-        context.storage.allocate(metadata.size);
+        Tensor::reserve(size_t(context.max_batch) * 4 * sizeof(void *));
         return result;
     }
     const auto generated = inputs["generated"];
@@ -278,7 +275,7 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
             members.push_back(next++);
         }
         if (!members.empty()) {
-            ScratchScope descriptors(context.storage);
+            Tensor::Scope descriptors;
             Batch layout;
             layout.phones = upload_sequence(context, phone_layout);
             layout.phone_ids = upload(phone_ids.data(), int(phone_ids.size()), 1, Type::I64).ptr<const int *>();
@@ -330,7 +327,7 @@ TensorBatch Acoustic::forward(TensorInputs inputs, ForwardContext &context) cons
             code_count += count;
         }
         if (!members.empty()) {
-            ScratchScope descriptors(context.storage);
+            Tensor::Scope descriptors;
             Batch layout;
             layout.phones = upload_sequence(context, phone_layout);
             layout.hidden = upload_sequence(context, hidden_layout);

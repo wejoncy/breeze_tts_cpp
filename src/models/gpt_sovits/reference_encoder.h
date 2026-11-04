@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "models/hubert/model.h"
 #include "layers/audio/style_encoder.h"
 #include "layers/spectrogram.h"
@@ -19,7 +20,7 @@ class ReferenceEncoder {
         StyleEncoder::Workspace style_encoder;
         Spectrogram::Workspace spectrum, mel_spectrum;
         Buffer projected, convolution, scores, codes, magnitude, style, mel;
-        explicit Workspace(const ReferenceEncoder &, BufferAllocator *);
+        explicit Workspace(const ReferenceEncoder &);
     };
 
   public:

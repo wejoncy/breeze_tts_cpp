@@ -9,12 +9,12 @@ struct SequenceState {
     Buffer keys, values, position;
     const size_t layer_bytes;
     std::vector<Buffer> history;
-    SequenceState(const SequenceStateSpec &spec, BufferAllocator *storage)
-        : keys(spec.kv_bytes, storage), values(spec.kv_bytes, storage),
-          position(sizeof(int), storage), layer_bytes(spec.layer_bytes) {
+    SequenceState(const SequenceStateSpec &spec)
+        : keys(spec.kv_bytes), values(spec.kv_bytes),
+          position(sizeof(int)), layer_bytes(spec.layer_bytes) {
         history.reserve(spec.history_bytes.size());
         for (auto bytes : spec.history_bytes)
-            history.emplace_back(bytes, storage);
+            history.emplace_back(bytes);
     }
     void reset(cudaStream_t stream) {
         CUDA(cudaMemsetAsync(position.data(), 0, position.size(), stream));

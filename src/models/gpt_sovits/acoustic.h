@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/transformer/relative.h"
 #include "layers/audio/wavenet.h"
 #include "core/sequence_rate.h"
@@ -40,9 +41,9 @@ class Acoustic {
         WaveNet::Workspace waveform_features;
         Buffer ssl, text, content, projected_text, query, key_value, attended, update, lse, features;
         int max_batch, max_codes, max_phones, max_frames;
-        Workspace(const Acoustic &, int batch, int codes, int phones, BufferAllocator *,
+        Workspace(const Acoustic &, int batch, int codes, int phones,
                   int frames = 0);
-        Workspace(const Acoustic &, Capacity, BufferAllocator *);
+        Workspace(const Acoustic &, Capacity);
     };
   public:
     Acoustic(Weights &, const std::string &prefix, const Json &);

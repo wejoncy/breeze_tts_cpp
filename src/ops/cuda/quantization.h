@@ -12,15 +12,15 @@ struct QuantCacheStats {
     SelectionStats selection;
     size_t prepared_plans = 0;
 };
-class QuantBackend {
+class QuantizedGemm {
     struct Impl;
     std::unique_ptr<Impl> impl;
 
   public:
-    QuantBackend(DeviceContext &memory, cublasLtHandle_t handle, Buffer &workspace,
+    QuantizedGemm(DeviceContext &memory, cublasLtHandle_t handle, Buffer &workspace,
                  Type format = Type::FP8);
-    ~QuantBackend();
-    QuantBackend(const QuantBackend &) = delete;
+    ~QuantizedGemm();
+    QuantizedGemm(const QuantizedGemm &) = delete;
     Type type() const;
     void seal();
     QuantCacheStats cache_stats() const;

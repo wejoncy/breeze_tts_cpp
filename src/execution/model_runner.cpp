@@ -22,6 +22,7 @@ std::vector<NamedTensor> output_views(const std::vector<std::string> &names) {
     for (const auto &name : names) result.push_back({name, {}});
     return result;
 }
+std::vector<NamedTensor> output_views(const std::vector<std::string> &&) = delete;
 }
 struct ModelRunner::Impl {
     const Model &network;
@@ -165,21 +166,37 @@ struct ModelRunner::Impl {
                  {"destination", TensorView{}}}};
     }
     size_t workspace(const ProgramSpec &description, ForwardContext::Mode mode) {
-        WorkspacePlan planning;
-        ForwardContext context(planning, description.input.limits.batch,
-            description.input.limits.time, description.input.limits.rows);
-        context.mode = mode;
-        context.batch.forward_mode = description.mode;
-        context.batch.capacity = runtime.context;
-        context.batch.cache = runtime.kv.view(runtime.states.rows().front()->operator[]("table").ptr<int>());
-        context.batch.cache.layout.sequences = caches.ptr<CacheSequence>();
-        auto state = state_bindings({}, capacity);
-        state.bind(context);
-        auto arguments = bindings(capacity, lane_capacity);
+        return Tensor::plan([&] {
+            ForwardContext context(description.input.limits.batch,
+                description.input.limits.time, description.input.limits.rows);
+            context.mode = mode;
+            context.batch.forward_mode = description.mode;
+            context.batch.capacity = runtime.context;
+            context.batch.cache = runtime.kv.view(runtime.states.rows().front()->operator[]("table").ptr<int>());
+            context.batch.cache.layout.sequences = caches.ptr<CacheSequence>();
+            auto state = state_bindings({}, capacity);
+            state.bind(context);
+            auto arguments = bindings(capacity, lane_capacity);
+            auto outputs = output_views(description.outputs);
+            run_forward(network, description.name, description.input,
+                {arguments.data(), arguments.size()}, {outputs.data(), outputs.size()}, context);
+        });
+    }
+    HostResults evaluate(const ProgramSpec &description) {
+        DeviceArena storage(runtime.memory, workspace(description, ForwardContext::Plan));
+        Tensor::Scope scope(storage);
+        const auto &input = description.input;
+        ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
         auto outputs = output_views(description.outputs);
-        run_forward(network, description.name, description.input,
-            {arguments.data(), arguments.size()}, {outputs.data(), outputs.size()}, context);
-        return planning.size;
+        run_forward(network, description.name, input, {}, {outputs.data(), outputs.size()},
+                    context, &runtime.memory);
+        HostResults result;
+        for (const auto &field : outputs) {
+            auto tensor = std::make_shared<HostTensor>(TensorShape{field.value.rows, field.value.cols}, field.value.type);
+            runtime.memory.download(tensor->view().data, field.value.data, field.value.size());
+            result.emplace(field.name, std::move(tensor));
+        }
+        return result;
     }
     void invoke(const ProgramSpec &description, int rows, int lanes, int partitions = 1,
                 ForwardContext::Mode mode = ForwardContext::Execute, bool replay = true) {
@@ -191,7 +208,7 @@ struct ModelRunner::Impl {
         for (auto &field : input.bindings)
             if (source_rows && field.value.rows == source_rows)
                 field.value = field.value.slice(0, lanes * time);
-        ForwardContext context(runtime.execution.workspace(), input.limits.batch,
+        ForwardContext context(input.limits.batch,
                                 input.limits.time, input.limits.rows);
         context.mode = mode;
         if (description.replay == ProgramSpec::Replay::Regions) {
@@ -341,20 +358,20 @@ struct ModelRunner::Impl {
           const ModelInfo &metadata, size_t runtime_bytes)
         : network(model), runtime(resources), planner(inputs), info(metadata), definition(inputs.definition()), programs(definition.programs),
           capacity(resources.batch), lane_capacity(capacity * definition.max_branches),
-          samples(size_t(capacity) * sizeof(SamplingRow), &resources.memory),
-          previous_codes(size_t(capacity) * sizeof(void *), &resources.memory),
-          code_rows(previous_codes.size(), &resources.memory), owners(size_t(lane_capacity) * sizeof(int), &resources.memory),
-          caches(size_t(lane_capacity) * sizeof(CacheSequence), &resources.memory),
-          audio_caches(size_t(capacity) * sizeof(CacheSequence), &resources.memory),
+          samples(size_t(capacity) * sizeof(SamplingRow)),
+          previous_codes(size_t(capacity) * sizeof(void *)),
+          code_rows(previous_codes.size()), owners(size_t(lane_capacity) * sizeof(int)),
+          caches(size_t(lane_capacity) * sizeof(CacheSequence)),
+          audio_caches(size_t(capacity) * sizeof(CacheSequence)),
           histories([&] {
               size_t maximum = 0;
               for (const auto &description : programs)
                   if (!description.history.empty()) maximum = std::max(maximum,
                       resources.states.rows().front()->history(description.history).history.size());
               return maximum * capacity * sizeof(ConvHistory);
-          }(), &resources.memory), done(size_t(capacity) * sizeof(int), &resources.memory),
-          counts(done.size(), &resources.memory), positions(done.size(), &resources.memory),
-          pcm(size_t(capacity) * definition.max_audio_frames * info.audio.samples_per_frame * sizeof(int16_t), &resources.memory),
+          }()), done(size_t(capacity) * sizeof(int)),
+          counts(done.size()), positions(done.size()),
+          pcm(size_t(capacity) * definition.max_audio_frames * info.audio.samples_per_frame * sizeof(int16_t)),
           host_done(capacity), host_layout(size_t(capacity) * 2), host_audio(pcm.size() / sizeof(int16_t)) {
         if (definition.query_heads > 0) {
             decode_plan = std::make_unique<FlashDecodePlan>(std::max(1,
@@ -367,7 +384,7 @@ struct ModelRunner::Impl {
         for (auto &description : programs) {
             if (description.replay == ProgramSpec::Replay::None) continue;
             for (const auto &field : description.input.uploads) {
-                input_storage.emplace_back(field.value.size(), &runtime.memory);
+                input_storage.emplace_back(field.value.size());
                 auto &buffer = input_storage.back();
                 runtime.memory.zero(buffer);
                 description.input.bindings.push_back({field.name,
@@ -388,8 +405,8 @@ struct ModelRunner::Impl {
         {
             DeviceArena storage(runtime.memory, preparation);
             for (const auto &description : programs) {
-                ScratchScope scope(storage);
-                ForwardContext context(storage, description.input.limits.batch,
+                Tensor::Scope scope(storage);
+                ForwardContext context(description.input.limits.batch,
                     description.input.limits.time, description.input.limits.rows);
                 context.mode = ForwardContext::Prepare;
                 context.batch.forward_mode = description.mode;
@@ -427,19 +444,20 @@ struct ModelRunner::Impl {
         runtime.memory.trim();
         size_t transfers = pcm.size();
         for (const auto &description : definition.programs) {
-            WorkspacePlan upload;
-            for (const auto &field : description.input.uploads) upload.allocate(field.value.size());
-            upload.allocate(description.input.sequence.metadata.size());
-            for (const auto &sequence : description.input.sequences) upload.allocate(sequence.value.metadata.size());
-            for (const auto &region : description.input.regions)
-                if (region.tensor.device < 0) upload.allocate(region.tensor.size());
-            transfers = std::max(transfers, upload.size);
+            const size_t upload = Tensor::plan([&] {
+                for (const auto &field : description.input.uploads) Tensor::reserve(field.value.size());
+                Tensor::reserve(description.input.sequence.metadata.size());
+                for (const auto &sequence : description.input.sequences) Tensor::reserve(sequence.value.metadata.size());
+                for (const auto &region : description.input.regions)
+                    if (region.tensor.device < 0) Tensor::reserve(region.tensor.size());
+            });
+            transfers = std::max(transfers, upload);
         }
         for (auto *buffer : {&samples, &previous_codes, &code_rows, &owners, &caches,
                             &audio_caches, &histories, &done, &counts, &positions})
-            transfers += BufferAllocator::aligned(buffer->size());
+            transfers += Tensor::aligned(buffer->size());
         for (const auto &row : runtime.states.rows())
-            for (const auto &field : row->fields()) transfers += BufferAllocator::aligned(field.second.size());
+            for (const auto &field : row->fields()) transfers += Tensor::aligned(field.second.size());
         runtime.memory.reserve_transfers(transfers);
         const size_t available = runtime.memory.available_bytes();
         const size_t budget = runtime_bytes ? runtime_bytes
@@ -491,29 +509,41 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     auto &implementation = *impl_;
     std::vector<Impl::State *> rows;
     std::vector<const InputBatch *> sources;
-    std::vector<int> blocks;
-    InputBatch packed;
     for (auto *request : requests) {
         auto &state = implementation.state(*request);
         if (state.is_prefilled || state.finished) continue;
-        sources.push_back(&state.current().input);
-        auto candidate = merge_inputs({sources.data(), sources.size()});
-        ProgramSpec description{implementation.definition.main_program, candidate, {"hidden_states", "logits", "done"}};
-        const size_t bytes = implementation.workspace(description, ForwardContext::Plan) +
-            BufferAllocator::aligned(size_t(candidate.sequence.shape.batch) * implementation.runtime.kv.block_stride() * sizeof(int));
-        if (!implementation.runtime.memory.can_allocate({bytes})) {
-            sources.pop_back();
-            if (rows.empty()) throw RequestOverloaded("input does not fit its admitted workspace");
-            break;
-        }
         rows.push_back(&state);
-        packed = std::move(candidate);
-        const auto &table = state.cache->block_table();
-        blocks.insert(blocks.end(), table.begin(), table.end());
+        sources.push_back(&state.current().input);
     }
     if (rows.empty()) return 0;
-    ProgramSpec description{implementation.definition.main_program, packed, {"hidden_states", "logits", "done"}};
-    const size_t bytes = implementation.workspace(description, ForwardContext::Plan) + BufferAllocator::aligned(blocks.size() * sizeof(int));
+    InputBatch packed;
+    size_t workspace_bytes = 0;
+    auto fits = [&](size_t count) {
+        auto candidate = merge_inputs({sources.data(), count});
+        ProgramSpec description{implementation.definition.main_program, candidate, {"hidden_states", "logits", "done"}};
+        const size_t required = implementation.workspace(description, ForwardContext::Plan);
+        const size_t bytes = required +
+            Tensor::aligned(size_t(candidate.sequence.shape.batch) * implementation.runtime.kv.block_stride() * sizeof(int));
+        if (!implementation.runtime.memory.can_allocate({bytes})) return false;
+        packed = std::move(candidate);
+        workspace_bytes = required;
+        return true;
+    };
+    // The usual case packs all ready rows once. Under memory pressure, retain
+    // the original FIFO prefix policy without assuming workspace monotonicity.
+    if (!fits(rows.size())) {
+        size_t count = 0;
+        while (count + 1 < rows.size() && fits(count + 1)) ++count;
+        if (!count) throw RequestOverloaded("input does not fit its admitted workspace");
+        rows.resize(count);
+    }
+    std::vector<int> blocks;
+    blocks.reserve(size_t(packed.sequence.shape.batch) * implementation.runtime.kv.block_stride());
+    for (const auto *state : rows) {
+        const auto &table = state->cache->block_table();
+        blocks.insert(blocks.end(), table.begin(), table.end());
+    }
+    const size_t bytes = workspace_bytes + Tensor::aligned(blocks.size() * sizeof(int));
     DeviceArena storage(implementation.runtime.memory, bytes);
     auto block_values = std::make_shared<HostTensor>(TensorShape{int(blocks.size()), 1}, Type::I32);
     std::copy(blocks.begin(), blocks.end(), block_values->view().ptr<int>());
@@ -521,12 +551,13 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     packed.owners.push_back(block_values);
     packed.batch_bindings.push_back({"cache_blocks", BatchField::CacheTable});
     implementation.map(rows, int(rows.size()), packed.sequence.shape.batch);
-    ForwardContext context(storage, packed.limits.batch, packed.limits.time, packed.limits.rows);
+    Tensor::Scope scope(storage);
+    ForwardContext context(packed.limits.batch, packed.limits.time, packed.limits.rows);
     context.batch.capacity = implementation.runtime.context;
     context.batch.cache = implementation.runtime.kv.view();
     auto arguments = implementation.bindings(int(rows.size()), packed.sequence.shape.batch);
-    auto outputs = output_views(description.outputs);
-    run_forward(implementation.network, description.name, packed, {arguments.data(), arguments.size()},
+    std::array<NamedTensor, 3> outputs{{{"hidden_states", {}}, {"logits", {}}, {"done", {}}}};
+    run_forward(implementation.network, implementation.definition.main_program, packed, {arguments.data(), arguments.size()},
                 {outputs.data(), outputs.size()}, context, &implementation.runtime.memory);
     implementation.sampled(rows);
     for (auto *state : rows) {
@@ -680,21 +711,8 @@ void ModelRunner::step(const std::vector<RequestState *> &requests,
     }
 }
 std::shared_ptr<const Reference> ModelRunner::prepare_reference(ReferencePlan &plan) {
-    auto &implementation = *impl_;
-    ProgramSpec description{plan.program, plan.input, plan.outputs};
-    const size_t bytes = implementation.workspace(description, ForwardContext::Plan);
-    DeviceArena storage(implementation.runtime.memory, bytes);
-    ForwardContext context(storage, plan.input.limits.batch, plan.input.limits.time, plan.input.limits.rows);
-    auto outputs = output_views(plan.outputs);
-    run_forward(implementation.network, plan.program, plan.input, {},
-                {outputs.data(), outputs.size()}, context, &implementation.runtime.memory);
-    HostResults result;
-    for (const auto &field : outputs) {
-        auto tensor = std::make_shared<HostTensor>(TensorShape{field.value.rows, field.value.cols}, field.value.type);
-        implementation.runtime.memory.download(tensor->view().data, field.value.data, field.value.size());
-        result.emplace(field.name, std::move(tensor));
-    }
-    return implementation.planner.finish_reference(plan, std::move(result));
+    return impl_->planner.finish_reference(plan,
+        impl_->evaluate({plan.program, plan.input, plan.outputs}));
 }
 std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
     auto &implementation = *impl_;
@@ -706,7 +724,8 @@ std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
     input.uploads.push_back({"waveform", TensorView(const_cast<float *>(mono.data()), int(mono.size()), 1, Type::F32)});
     ProgramSpec description{implementation.definition.reference_program, input, {"codes"}};
     DeviceArena storage(implementation.runtime.memory, implementation.workspace(description, ForwardContext::Plan));
-    ForwardContext context(storage, 1, int(mono.size()), int(mono.size()));
+    Tensor::Scope scope(storage);
+    ForwardContext context(1, int(mono.size()), int(mono.size()));
     NamedTensor outputs[] = {{"codes", {}}};
     run_forward(implementation.network, description.name, input, {}, {outputs, std::size(outputs)}, context,
                 &implementation.runtime.memory);
@@ -723,26 +742,26 @@ std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
         std::any_of(codes.begin(), codes.end(), [&](int code) { return code < 0 || code >= format.codebook_size; }))
         throw std::invalid_argument("audio codes do not match the model's declared layout");
     const auto &specification = implementation.runtime.states.history_spec(description.history);
-    auto allocate = [&](ScratchAllocator &storage) {
-        SequenceState history(specification, &storage);
-        storage.allocate(size_t(format.codebooks) * sizeof(int));
-        storage.allocate(sizeof(int *));
-        storage.allocate(sizeof(CacheSequence));
-        storage.allocate(specification.history_bytes.size() * sizeof(ConvHistory));
+    auto allocate = [&] {
+        SequenceState history(specification);
+        Tensor::reserve(size_t(format.codebooks) * sizeof(int));
+        Tensor::reserve(sizeof(int *));
+        Tensor::reserve(sizeof(CacheSequence));
+        Tensor::reserve(specification.history_bytes.size() * sizeof(ConvHistory));
     };
-    WorkspacePlan planning;
-    allocate(planning);
+    const size_t history_bytes = Tensor::plan(allocate);
     auto input = description.input;
     input.limits = {1, 1, 1};
     input.sequence = {{}, {1, 1, 1}};
     input.parameters = {{"history_stride", 1}};
     ProgramSpec sizing{description.name, input, description.outputs};
     const size_t network_bytes = implementation.workspace(sizing, ForwardContext::Plan);
-    DeviceArena storage(implementation.runtime.memory, planning.size + network_bytes);
-    SequenceState history(specification, &storage);
+    DeviceArena storage(implementation.runtime.memory, history_bytes + network_bytes);
+    Tensor::Scope allocation_scope(storage);
+    SequenceState history(specification);
     history.reset(implementation.runtime.memory.stream);
-    Buffer frame(size_t(format.codebooks) * sizeof(int), &storage), pointers(sizeof(int *), &storage);
-    Buffer cache(sizeof(CacheSequence), &storage), histories(specification.history_bytes.size() * sizeof(ConvHistory), &storage);
+    Buffer frame(size_t(format.codebooks) * sizeof(int)), pointers(sizeof(int *));
+    Buffer cache(sizeof(CacheSequence)), histories(specification.history_bytes.size() * sizeof(ConvHistory));
     const int *frame_pointer = frame.ptr<int>();
     CacheSequence sequence{history.keys.data(), history.values.data(), history.layer_bytes, nullptr, history.position.ptr<int>()};
     std::vector<ConvHistory> descriptors;
@@ -754,8 +773,8 @@ std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
     std::vector<float> result(frames * format.samples_per_frame);
     for (size_t frame_index = 0; frame_index < frames; ++frame_index) {
         implementation.runtime.memory.upload(frame.data(), codes.data() + frame_index * format.codebooks, frame.size());
-        ScratchScope scratch(storage);
-        ForwardContext context(storage, 1, 1, 1);
+        Tensor::Scope scratch;
+        ForwardContext context(1, 1, 1);
         context.batch.cache.layout.sequences = cache.ptr<CacheSequence>();
         const NamedTensor bindings[] = {{"code_rows", pointers.view(1, 1, Type::I64)},
             {"histories", histories.view(1, int(histories.size()), Type::I8)}};
@@ -771,20 +790,6 @@ std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
     return result;
 }
 void ModelRunner::prepare_task(PreparationTask &task) {
-    auto &implementation = *impl_;
-    const auto input = task.input();
-    ProgramSpec description{std::string(task.program()), input, task.outputs()};
-    DeviceArena storage(implementation.runtime.memory, implementation.workspace(description, ForwardContext::Plan));
-    ForwardContext context(storage, input.limits.batch, input.limits.time, input.limits.rows);
-    auto outputs = output_views(description.outputs);
-    run_forward(implementation.network, description.name, input, {}, {outputs.data(), outputs.size()},
-                context, &implementation.runtime.memory);
-    HostResults result;
-    for (const auto &field : outputs) {
-        auto tensor = std::make_shared<HostTensor>(TensorShape{field.value.rows, field.value.cols}, field.value.type);
-        implementation.runtime.memory.download(tensor->view().data, field.value.data, field.value.size());
-        result.emplace(field.name, std::move(tensor));
-    }
-    task.accept(std::move(result));
+    task.accept(impl_->evaluate({std::string(task.program()), task.input(), task.outputs()}));
 }
 } // namespace tts

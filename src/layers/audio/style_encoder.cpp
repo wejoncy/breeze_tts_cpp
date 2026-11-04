@@ -29,25 +29,24 @@ StyleEncoder::StyleEncoder(Weights &w, const std::string &prefix, int heads, int
             w, p, ops::ConvGeometry{hidden, 2 * hidden, s[2], 1, (s[2] - 1) / 2, 1, 1, false});
     }
 }
-StyleEncoder::Workspace::Workspace(const StyleEncoder &s, int batch, int time,
-                                   BufferAllocator *allocator)
+StyleEncoder::Workspace::Workspace(const StyleEncoder &s, int batch, int time)
     : max_batch(batch), max_time(time) {
     if (batch < 1 || time < 1)
         throw std::invalid_argument("invalid style workspace");
     size_t rows = size_t(batch) * time;
     Type type = s.first_.activation_type();
     int hidden_width = s.first_.output_channels();
-    hidden = Buffer(rows * hidden_width * bytes(type), allocator);
-    update = Buffer(hidden.size(), allocator);
-    attended = Buffer(hidden.size(), allocator);
-    gates = Buffer(hidden.size() * 2, allocator);
-    projected = Buffer(hidden.size() * 3, allocator);
-    embedding = Buffer(rows * s.final_.output_channels() * bytes(type), allocator);
+    hidden = Buffer(rows * hidden_width * bytes(type));
+    update = Buffer(hidden.size());
+    attended = Buffer(hidden.size());
+    gates = Buffer(hidden.size() * 2);
+    projected = Buffer(hidden.size() * 3);
+    embedding = Buffer(rows * s.final_.output_channels() * bytes(type));
     size_t scratch = 0;
     for (const auto &c : s.temporal_)
         scratch = std::max(scratch, c.workspace_bytes(batch, time));
-    convolution = Buffer(scratch, allocator);
-    lse = Buffer(rows * s.heads_ * sizeof(float), allocator);
+    convolution = Buffer(scratch);
+    lse = Buffer(rows * s.heads_ * sizeof(float));
 }
 void StyleEncoder::prepare(Workspace &workspace, TensorView spectrum) const {
     const auto type = first_.activation_type();

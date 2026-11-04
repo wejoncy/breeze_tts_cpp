@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "ops/basic.h"
 #include "models/gpt_sovits/dit.h"
 #include "core/tensor_batch.h"
@@ -29,13 +30,12 @@ class Flow {
         DiT::Workspace estimator;
         Buffer noise, velocity, prefixes;
         int max_batch;
-        Workspace(const Flow &f, int batch, int time, BufferAllocator *allocator)
-            : estimator(f.estimator_, f.execution_batch(batch, 1), time, allocator),
-              noise(size_t(batch) * time * f.mel_channels_ * bytes(f.estimator_.type()), allocator),
+        Workspace(const Flow &f, int batch, int time)
+            : estimator(f.estimator_, f.execution_batch(batch, 1), time),
+              noise(size_t(batch) * time * f.mel_channels_ * bytes(f.estimator_.type())),
               velocity(size_t(estimator.max_batch) * time * f.mel_channels_ *
-                           bytes(f.estimator_.type()),
-                       allocator),
-              prefixes(size_t(batch) * sizeof(int), allocator),
+                           bytes(f.estimator_.type())),
+              prefixes(size_t(batch) * sizeof(int)),
               max_batch(batch) {}
         void validate(int batch, int time) const {
             if (batch < 1 || batch > max_batch || time < 1 || time > estimator.max_time)

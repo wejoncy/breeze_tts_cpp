@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/transformer/decoder.h"
 #include "models/mimi/config.h"
 #include "ops/audio.h"
@@ -26,9 +27,9 @@ struct Conv {
 struct ConvState {
     Buffer history, projected;
     int batch, time;
-    ConvState(const Conv &c, int b, int t, BufferAllocator *arena, bool persistent = true)
-        : history(persistent ? c.history_bytes(b, t) : 0, arena),
-          projected(c.depthwise ? 0 : size_t(b) * t * c.kernel * c.out * sizeof(float), arena),
+    ConvState(const Conv &c, int b, int t, bool persistent = true)
+        : history(persistent ? c.history_bytes(b, t) : 0),
+          projected(c.depthwise ? 0 : size_t(b) * t * c.kernel * c.out * sizeof(float)),
           batch(b), time(t) {}
     void run(const Conv &, TensorView, TensorView, const int *frame, int rows = 0,
              const ConvHistory *states = nullptr);
@@ -44,7 +45,7 @@ struct CodecState {
     std::vector<std::unique_ptr<ConvState>> conv;
     Buffer a, b, saves[2], rvq1, rvq2, latent, hidden, position, pcm;
     int batch, max_elements;
-    CodecState(const class Codec &, int, BufferAllocator *arena, bool mapped = false);
+    CodecState(const class Codec &, int, bool mapped = false);
     void reset();
 };
 struct CodecBatch {

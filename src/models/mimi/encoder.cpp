@@ -1,37 +1,30 @@
 #include "support/profiler.h"
 #include "ops/basic.h"
 #include "models/mimi/encoder.h"
+#include "layers/convolution.h"
 #include "ops/audio_encoder.h"
 #include "ops/vector_quantization.h"
 #include <cmath>
 #include <algorithm>
 namespace tts {
-EncoderConv::EncoderConv(Weights &w, const std::string &p, int s, bool rep, int d)
-    : EncoderConv(w, p, w.get(p + ".conv.bias"), s, rep, d) {}
-EncoderConv::EncoderConv(Weights &w, const std::string &p, TensorView b, int s, bool rep, int d)
-    : bias(b), stride(s), dilation(d), replicate(rep) {
-    const auto &e = w.entry(p + ".conv.weight");
-    if (stride < 1 || dilation < 1 || (stride > 1 && dilation > 1) || e.type != Type::F32 ||
-        e.shape.size() != 3 || e.shape[0] < 1 || e.shape[1] < 1 || e.shape[2] < 1 ||
-        e.shape[2] % stride)
+EncoderConv::EncoderConv(Weights &weights, const std::string &prefix, int stride, bool replicate, int dilation)
+    : EncoderConv(weights, prefix, weights.get(prefix + ".conv.bias"), stride, replicate, dilation) {}
+EncoderConv::EncoderConv(Weights &weights, const std::string &prefix, TensorView bias,
+                         int stride, bool replicate, int dilation)
+    : bias(bias), stride(stride), dilation(dilation), replicate(replicate) {
+    const auto &entry = weights.entry(prefix + ".conv.weight");
+    if (stride < 1 || dilation < 1 || (stride > 1 && dilation > 1) || entry.type != Type::F32 ||
+        entry.shape.size() != 3 || entry.shape[0] < 1 || entry.shape[1] < 1 || entry.shape[2] < 1 ||
+        entry.shape[2] % stride)
         throw std::runtime_error("unsupported encoder convolution");
-    out = e.shape[0];
-    in = e.shape[1];
-    kernel = e.shape[2];
+    out = entry.shape[0];
+    in = entry.shape[1];
+    kernel = entry.shape[2];
     if (kernel > INT32_MAX / out || int64_t(kernel - 1) * dilation >= INT32_MAX)
         throw std::invalid_argument("encoder convolution indexing overflow");
     if (bias.data && (bias.type != Type::F32 || bias.numel() != size_t(out)))
-        throw std::invalid_argument("encoder convolution bias shape: " + p);
-    std::vector<float> packed(e.size / 4);
-    const float *src = static_cast<const float *>(e.data);
-    int taps = kernel / stride;
-    for (int phase = 0; phase < stride; phase++)
-        for (int tap = 0; tap < taps; tap++)
-            for (int o = 0; o < out; o++)
-                for (int c = 0; c < in; c++)
-                    packed[((size_t(phase) * taps + tap) * out + o) * in + c] =
-                        src[(size_t(o) * in + c) * kernel + tap * stride + phase];
-    weight = w.custom(p + ".phase_major", packed.data(), kernel * out, in, Type::F32);
+        throw std::invalid_argument("encoder convolution bias shape: " + prefix);
+    weight = load_convolution_weight(weights, prefix + ".conv", false, 1, stride);
 }
 void EncoderConv::project(TensorView x, TensorView p, int max_input_rows) const {
 
@@ -85,7 +78,7 @@ AudioEncoder::AudioEncoder(Weights &w, const std::string &prefix, EncoderConfig 
       last_(w, prefix + ".encoder.layers." +
                    std::to_string(2 + config_.ratios.size() * (config_.residual_layers + 2))),
       rope_storage_({config_.transformer.max_positions, config_.transformer.dim}, Type::F32,
-                    &w.allocator()) {
+                    w.device()) {
     const auto &c = config_.transformer;
     if (first_.in != 1 || first_.out != config_.filters || first_.kernel != config_.first_kernel ||
         last_.out != c.hidden || last_.kernel != config_.last_kernel)
@@ -173,7 +166,7 @@ AudioEncoder::AudioEncoder(Weights &w, const std::string &prefix, EncoderConfig 
 // Planning and allocation use the same shapes and alignment. No model-sized upper bounds.
 struct AudioEncoder::Storage {
     Buffer a, b, c, projected, qkv, q, k, v, att, ff, residual, scores, codes;
-    Storage(const AudioEncoder &model, int samples, BufferAllocator *arena) {
+    Storage(const AudioEncoder &model, int samples) {
         const auto &config = model.config_;
         const auto &tr = config.transformer;
         if (samples <= 0 ||
@@ -198,25 +191,23 @@ struct AudioEncoder::Storage {
         int frames = model.downsample_ ? conv(*model.downsample_, rows) : rows;
         if (elements > INT32_MAX || scratch > INT32_MAX)
             throw std::invalid_argument("encoder workspace exceeds kernel indexing capacity");
-        a = Buffer(elements * sizeof(float), arena);
-        b = Buffer(a.size(), arena);
-        c = Buffer(a.size(), arena);
-        projected = Buffer(scratch * sizeof(float), arena);
-        qkv = Buffer(size_t(rows) * (tr.heads + 2 * tr.kvheads) * tr.dim * sizeof(float), arena);
-        q = Buffer(size_t(rows) * tr.heads * tr.dim * sizeof(float), arena);
-        k = Buffer(size_t(rows) * tr.kvheads * tr.dim * sizeof(float), arena);
-        v = Buffer(k.size(), arena);
-        att = Buffer(q.size(), arena);
-        ff = Buffer(size_t(rows) * tr.intermediate * sizeof(float), arena);
-        residual = Buffer(size_t(frames) * config.codebook_dim * sizeof(float), arena);
-        scores = Buffer(size_t(frames) * config.codebook_size * sizeof(float), arena);
-        codes = Buffer(size_t(frames) * config.codebooks * sizeof(int), arena);
+        a = Buffer(elements * sizeof(float));
+        b = Buffer(a.size());
+        c = Buffer(a.size());
+        projected = Buffer(scratch * sizeof(float));
+        qkv = Buffer(size_t(rows) * (tr.heads + 2 * tr.kvheads) * tr.dim * sizeof(float));
+        q = Buffer(size_t(rows) * tr.heads * tr.dim * sizeof(float));
+        k = Buffer(size_t(rows) * tr.kvheads * tr.dim * sizeof(float));
+        v = Buffer(k.size());
+        att = Buffer(q.size());
+        ff = Buffer(size_t(rows) * tr.intermediate * sizeof(float));
+        residual = Buffer(size_t(frames) * config.codebook_dim * sizeof(float));
+        scores = Buffer(size_t(frames) * config.codebook_size * sizeof(float));
+        codes = Buffer(size_t(frames) * config.codebooks * sizeof(int));
     }
 };
 size_t AudioEncoder::workspace_bytes(int samples) const {
-    WorkspacePlan plan;
-    Storage storage(*this, samples, &plan);
-    return plan.size;
+    return Tensor::plan([&] { Storage storage(*this, samples); });
 }
 void AudioEncoder::prepare(ForwardContext &context, int max_samples) const {
     if (max_samples < 1) throw std::invalid_argument("invalid encoder planning capacity");
@@ -244,11 +235,11 @@ void AudioEncoder::prepare(ForwardContext &context, int max_samples) const {
         output_elements = std::max(output_elements, size_t(weight.rows));
     });
     const int samples = std::min(max_samples, config_.stride);
-    Buffer input(input_elements * sizeof(float), &context.storage);
-    Buffer output(output_elements * sizeof(float), &context.storage);
+    Buffer input(input_elements * sizeof(float));
+    Buffer output(output_elements * sizeof(float));
     auto waveform = context.tensor({samples, 1}, Type::F32);
     if (context.mode == ForwardContext::Plan || !input.data()) {
-        context.storage.allocate(workspace_bytes(samples));
+        Tensor::reserve(workspace_bytes(samples));
         return;
     }
     visit([&](const EncoderConv &conv, int rows) {
@@ -277,7 +268,7 @@ TensorView AudioEncoder::forward(TensorView waveform, ForwardContext &context) c
     }
     const auto &cfg = config_.transformer;
     auto [a, b, c, projected, qkv, q, k, v, att, ff, residual, scores, codes] =
-        Storage(*this, samples, &context.storage);
+        Storage(*this, samples);
     auto output_codes = codes.view(int(codes.size() / sizeof(int) / config_.codebooks),
                                    config_.codebooks, Type::I32);
     if (context.mode != ForwardContext::Execute) return output_codes;

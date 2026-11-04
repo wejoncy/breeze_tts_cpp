@@ -2,33 +2,17 @@
 #include "ops/storage.h"
 #include "core/tensor_storage.h"
 #include "io/model_loader.h"
-#include <memory>
 #include <cstring>
 #include <unordered_map>
 #include <functional>
 
 namespace tts {
-struct Weight {
-    Buffer storage;
-    std::vector<int> shape;
-    Type type;
-    TensorView view() const {
-        const int rows = shape.empty() ? 1 : shape.front();
-        if (rows < 1 || !storage.size())
-            throw std::invalid_argument("model parameter cannot be empty");
-        const size_t cols = storage.size() / bytes(type) / rows;
-        if (cols > size_t(INT32_MAX))
-            throw std::invalid_argument("weight exceeds tensor view dimensions");
-        return storage.view(rows, int(cols), type);
-    }
-};
-
 class Weights {
-    BufferAllocator &allocator_;
+    Device device_;
     Quantization quantization_;
     SafeTensors files_;
     const std::vector<std::string> checkpoint_files_;
-    std::unordered_map<std::string, std::unique_ptr<Weight>> loaded_;
+    std::unordered_map<std::string, Tensor> loaded_;
     std::vector<std::function<void()>> uploads_;
     std::vector<std::function<void()>> postprocess_;
     enum class Phase { Registering, Loading, Loaded, Sealed };
@@ -46,6 +30,46 @@ class Weights {
         if (phase_ != Phase::Registering)
             throw std::logic_error("parameter registration after weight loading started");
     }
+    TensorView allocate(const std::string &name, TensorShape shape, Type type) {
+        require_registration();
+        auto [parameter, inserted] = loaded_.try_emplace(name, shape, type, device_);
+        if (!inserted) throw std::invalid_argument("duplicate parameter: " + name);
+        return parameter->second.view();
+    }
+    static TensorShape checkpoint_shape(const SafeTensors::Entry &source) {
+        const int rows = source.shape.empty() ? 1 : source.shape.front();
+        if (rows < 1 || !source.size)
+            throw std::invalid_argument("model parameter cannot be empty");
+        const size_t row_bytes = size_t(rows) * bytes(source.type);
+        const size_t columns = source.size / row_bytes;
+        if (source.size % row_bytes || columns < 1 || columns > size_t(INT32_MAX))
+            throw std::invalid_argument("weight exceeds tensor view dimensions");
+        return {rows, int(columns)};
+    }
+    TensorView joined_shape(const std::vector<std::string> &parts) const {
+        if (parts.empty()) throw std::invalid_argument("weight has no sources");
+        const Type type = files_.get(parts.front()).type;
+        int rows = 0, columns = 0;
+        for (const auto &name : parts) {
+            const auto &source = files_.get(name);
+            const auto shape = checkpoint_shape(source);
+            if (source.shape.empty() || source.type != type || shape.rows > INT32_MAX - rows ||
+                (columns && columns != shape.cols))
+                throw std::invalid_argument("incompatible weight sources: " + name);
+            rows += shape.rows;
+            columns = shape.cols;
+        }
+        return TensorView::metadata(rows, columns, type);
+    }
+    void copy_sources(TensorView destination, const std::vector<std::string> &parts) const {
+        size_t offset = 0;
+        for (const auto &name : parts) {
+            const auto &source = files_.get(name);
+            ops::upload_bytes(device_.index(),
+                static_cast<char *>(destination.data) + offset, source.data, source.size);
+            offset += source.size;
+        }
+    }
 
   public:
     // Layers first declare destination storage and load transforms. Execute
@@ -55,7 +79,7 @@ class Weights {
         phase_ = Phase::Loading;
         for (const auto &upload : uploads_) upload();
         for (const auto &process : postprocess_) process();
-        ops::synchronize(allocator_.device_ordinal());
+        ops::synchronize(device_.index());
         uploads_.clear();
         postprocess_.clear();
         phase_ = Phase::Loaded;
@@ -71,81 +95,55 @@ class Weights {
         files_ = SafeTensors{};
         phase_ = Phase::Sealed;
     }
-    BufferAllocator &allocator() const { return allocator_; }
+    Device device() const { return device_; }
     Quantization quantization() const { return quantization_; }
-    explicit Weights(BufferAllocator &allocator, Quantization quantization,
+    explicit Weights(Device device, Quantization quantization,
                       ModelLoader::Checkpoint checkpoint)
-        : allocator_(allocator), quantization_(quantization), files_(std::move(checkpoint.tensors)),
+        : device_(device), quantization_(quantization), files_(std::move(checkpoint.tensors)),
           checkpoint_files_(std::move(checkpoint.files)) {}
     ~Weights() {
         // A failed load may still have H2D reads from the mapped checkpoint.
         // Pool frees are asynchronous; keep the mappings alive until reads finish.
         if (phase_ != Phase::Sealed) {
-            try { ops::synchronize(allocator_.device_ordinal()); } catch (...) {}
+            try { ops::synchronize(device_.index()); } catch (...) {}
         }
     }
     TensorView get(const std::string &name) {
         auto it = loaded_.find(name);
         if (it != loaded_.end())
-            return it->second->view();
+            return it->second.view();
         require_registration();
-        const auto &e = files_.get(name);
-        auto w = std::make_unique<Weight>();
-        w->shape = e.shape;
-        w->type = e.type;
-        w->storage = Buffer(e.size, &allocator_);
-        auto view = w->view();
-        uploads_.push_back([this, view, source = e.data, size = e.size] {
-            ops::upload_bytes(allocator_.device_ordinal(), view.data, source, size);
-        });
-        loaded_[name] = std::move(w);
+        const auto &source = files_.get(name);
+        auto view = allocate(name, checkpoint_shape(source), source.type);
+        uploads_.push_back([this, view, name] { copy_sources(view, {name}); });
         return view;
     }
     TensorView optional(const std::string &name) {
         auto it = loaded_.find(name);
-        if (it != loaded_.end()) return it->second->view();
+        if (it != loaded_.end()) return it->second.view();
         require_loading();
         return files_.has(name) ? get(name) : TensorView{};
     }
     RowScaledView quantized(const std::string &name, const std::vector<std::string> &parts) {
         require_unique(name);
         require_unique(name + ".scales");
-        if (parts.empty())
-            throw std::invalid_argument("quantized weight has no sources");
-        int rows = 0, cols = 0;
-        Type source_type = files_.get(parts.front()).type;
+        const auto shape = joined_shape(parts);
         for (const auto &part : parts) {
-            const auto &e = files_.get(part);
-            bool matrix = e.shape.size() == 2 || (e.shape.size() == 3 && e.shape[2] == 1);
-            if ((source_type != Type::BF16 && source_type != Type::F16) ||
-                e.type != source_type || !matrix || e.shape[0] < 1 || e.shape[1] < 1 ||
-                e.shape[0] > INT32_MAX - rows || (cols && cols != e.shape[1]))
+            const auto &source = files_.get(part);
+            const bool matrix = source.shape.size() == 2 ||
+                (source.shape.size() == 3 && source.shape[2] == 1);
+            if ((shape.type != Type::BF16 && shape.type != Type::F16) || !matrix)
                 throw std::invalid_argument(
                     "quantized weights require compatible F16/BF16 matrices or pointwise projections");
-            cols = e.shape[1];
-            rows += e.shape[0];
         }
-        auto values = std::make_unique<Weight>(), scales = std::make_unique<Weight>();
-        values->shape = {rows, cols};
-        values->type = quantized_type(quantization_);
-        scales->shape = {rows, 1};
-        scales->type = Type::F32;
-        values->storage = Buffer(size_t(rows) * cols, &allocator_);
-        scales->storage = Buffer(size_t(rows) * sizeof(float), &allocator_);
-        RowScaledView result{values->view(), scales->view()};
-        uploads_.push_back([this, parts, rows, cols, source_type, result] {
-            Buffer source(size_t(rows) * cols * sizeof(uint16_t), &allocator_);
-            size_t offset = 0;
-            for (const auto &part : parts) {
-                const auto &e = files_.get(part);
-                ops::upload_bytes(allocator_.device_ordinal(), source.ptr<char>() + offset, e.data, e.size);
-                offset += e.size;
-            }
-            ops::quantize_rows(source.view(rows, cols, source_type), result);
-            ops::synchronize(allocator_.device_ordinal()); // Reuse a single matrix's 16-bit source capacity during loading.
+        RowScaledView result{allocate(name, shape, quantized_type(quantization_)),
+                             allocate(name + ".scales", {shape.rows, 1}, Type::F32)};
+        uploads_.push_back([this, parts, shape, result] {
+            Tensor source(shape, shape.type, device_);
+            copy_sources(source.view(), parts);
+            ops::quantize_rows(source.view(), result);
+            ops::synchronize(device_.index()); // Reuse a single matrix's 16-bit source capacity during loading.
         });
-        loaded_[name] = std::move(values);
-        loaded_[name + ".scales"] = std::move(scales);
         return result;
     }
     const SafeTensors::Entry &entry(const std::string &name) const {
@@ -159,59 +157,22 @@ class Weights {
     }
     TensorView fused(const std::string &name, const std::vector<std::string> &parts) {
         require_unique(name);
-        if (parts.empty())
-            throw std::invalid_argument("fused weight has no sources");
-        auto w = std::make_unique<Weight>();
-        size_t size = 0;
-        int rows = 0, cols = 0;
-        for (const auto &p : parts) {
-            const auto &e = files_.get(p);
-            if (e.shape.empty() || e.shape[0] < 1 || !e.size ||
-                e.shape[0] > INT32_MAX - rows || e.size > SIZE_MAX - size)
-                throw std::runtime_error("invalid fused weight source: " + p);
-            size_t trailing = e.size / bytes(e.type) / e.shape[0];
-            if (trailing > size_t(INT32_MAX))
-                throw std::invalid_argument("fused weight row exceeds tensor dimensions");
-            int part_cols = int(trailing);
-            if (!cols) {
-                cols = part_cols;
-                w->type = e.type;
-            }
-            if (part_cols != cols || e.type != w->type)
-                throw std::runtime_error("fused weight shape");
-            size += e.size;
-            rows += e.shape[0];
-        }
-        w->shape = {rows, cols};
-        w->storage = Buffer(size, &allocator_);
-        auto view = w->view();
-        uploads_.push_back([this, parts, view] {
-            size_t pos = 0;
-            for (const auto &p : parts) {
-                const auto &e = files_.get(p);
-                ops::upload_bytes(allocator_.device_ordinal(), static_cast<char *>(view.data) + pos, e.data, e.size);
-                pos += e.size;
-            }
-        });
-        loaded_[name] = std::move(w);
+        const auto shape = joined_shape(parts);
+        auto view = allocate(name, shape, shape.type);
+        uploads_.push_back([this, parts, view] { copy_sources(view, parts); });
         return view;
     }
     TensorView custom(const std::string &name, const void *data, int rows, int cols, Type type) {
         require_unique(name);
         if (rows < 1 || cols < 1 || !data)
             throw std::invalid_argument("invalid custom weight");
-        auto w = std::make_unique<Weight>();
-        w->shape = {rows, cols};
-        w->type = type;
-        w->storage = Buffer(size_t(rows) * cols * bytes(type), &allocator_);
-        auto v = w->view();
-        std::vector<char> packed(w->storage.size());
+        auto view = allocate(name, {rows, cols}, type);
+        std::vector<char> packed(view.size());
         std::memcpy(packed.data(), data, packed.size());
-        uploads_.push_back([this, v, packed = std::move(packed)] {
-            ops::upload_bytes(allocator_.device_ordinal(), v.data, packed.data(), packed.size());
+        uploads_.push_back([this, view, packed = std::move(packed)] {
+            ops::upload_bytes(device_.index(), view.data, packed.data(), packed.size());
         });
-        loaded_[name] = std::move(w);
-        return v;
+        return view;
     }
     TensorView generated(const std::string &name, const std::vector<float> &values,
                          int rows, int cols, Type type);
@@ -230,10 +191,9 @@ class Weights {
     }
     std::vector<float> host_values(const std::string &name) const;
     size_t size() const {
-        size_t n = 0;
-        for (const auto &[k, w] : loaded_)
-            n += w->storage.size();
-        return n;
+        size_t total = 0;
+        for (const auto &parameter : loaded_) total += parameter.second.view().size();
+        return total;
     }
     const std::vector<std::string> &checkpoint_files() const { return checkpoint_files_; }
 };

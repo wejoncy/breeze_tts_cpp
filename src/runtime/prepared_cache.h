@@ -6,7 +6,7 @@
 
 namespace tts {
 // Initialization owns plan creation; serving only looks up the sealed working
-// set. Plans remain at stable addresses until backend destruction.
+// set. Plans remain at stable addresses until CUDA resource destruction.
 template <class Key, class Value> class PreparedCache {
     std::map<Key, std::unique_ptr<Value>> entries_;
     bool sealed_ = false;

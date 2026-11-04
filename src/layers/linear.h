@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "io/weights.h"
 #include "ops/linear.h"
 #include "ops/basic.h"
@@ -40,7 +41,7 @@ class Linear {
         Buffer values, scales;
         int max_rows = 0, max_input_channels = 0;
         Workspace() = default;
-        Workspace(int rows, int channels, BufferAllocator *allocator)
+        Workspace(int rows, int channels)
             : max_rows(rows), max_input_channels(channels) {
             if (rows < 1 || channels < 0)
                 throw std::invalid_argument("invalid linear workspace capacity");
@@ -49,8 +50,8 @@ class Linear {
             if (size_t(rows) > SIZE_MAX / size_t(channels) ||
                 size_t(rows) > SIZE_MAX / sizeof(float))
                 throw std::overflow_error("linear workspace size");
-            values = Buffer(size_t(rows) * channels, allocator);
-            scales = Buffer(size_t(rows) * sizeof(float), allocator);
+            values = Buffer(size_t(rows) * channels);
+            scales = Buffer(size_t(rows) * sizeof(float));
         }
         RowScaledView view(int rows, int channels, Type format) const {
             if (rows < 1 || rows > max_rows || channels < 1 || channels > max_input_channels ||
@@ -93,8 +94,7 @@ class Linear {
             input.type != activation_type_ || output.rows != input.rows ||
             output.cols != output_channels() || output.type != activation_type_)
             throw std::invalid_argument("linear input shape/type");
-        Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0,
-                            &context.storage);
+        Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0);
         if (context.mode == ForwardContext::Prepare && input.data && output.data)
             prepare_range(input, output, context.max_rows, finish.activation);
         else if (context.mode == ForwardContext::Execute)
@@ -103,8 +103,7 @@ class Linear {
     }
     TensorView forward_segments(TensorView input, TensorView segments, TensorView output,
                                  ForwardContext &context) const {
-        Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0,
-                            &context.storage);
+        Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0);
         if (context.mode == ForwardContext::Plan) return output;
         if (context.mode == ForwardContext::Prepare) {
             if (input.data && output.data)

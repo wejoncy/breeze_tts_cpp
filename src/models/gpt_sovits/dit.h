@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/convolution.h"
 #include "layers/linear.h"
 #include "models/gpt_sovits/sampling.h"
@@ -33,7 +34,7 @@ class DiT {
         Buffer condition, negative_condition, x, normalized, update, qkv, attended, expanded;
         Buffer text, text_update, text_expanded, statistics, convolution, lse;
         int max_batch, max_time;
-        Workspace(const DiT &, int batch, int time, BufferAllocator *);
+        Workspace(const DiT &, int batch, int time);
     };
     struct Condition {
         TensorView features;

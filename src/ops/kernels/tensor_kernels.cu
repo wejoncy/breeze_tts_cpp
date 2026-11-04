@@ -1,4 +1,5 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
+#include "ops/basic.h"
 #include "ops/cuda/blas_check.h"
 #include "ops/cuda/lt_linear.h"
 #include "ops/kernels/common/cuda_math.cuh"
@@ -52,61 +53,6 @@ __device__ float block_sum(float x) {
         x = warp_sum(x);
     return x;
 }
-Backend::Backend(int device, Quantization quantization, size_t memory_limit_bytes)
-    : memory(device, memory_limit_bytes), device(device), stream(memory.stream),
-      blas_workspace_(8 << 20, &memory) {
-    try {
-        CUDA(cudaSetDevice(device));
-        cudaDeviceProp p{};
-        CUDA(cudaGetDeviceProperties(&p, device));
-        shared_memory_per_block_ = p.sharedMemPerBlock;
-        multiprocessors_ = p.multiProcessorCount;
-        normalized_linear_capacity_ = ops::normalized_linear_capacity(
-            multiprocessors_, fp32_latency_warps(p.major, p.minor), normalized_qkv_capacity_);
-        if (p.major < 8)
-            throw std::runtime_error("BF16 engine requires SM80+");
-        BLAS(cublasCreate(&blas));
-        BLAS(cublasSetStream(blas, stream));
-        BLAS(cublasSetWorkspace(blas, blas_workspace_.data(), blas_workspace_.size()));
-        BLAS(cublasSetMathMode(blas, CUBLAS_TF32_TENSOR_OP_MATH));
-        BLAS(cublasLtCreate(&lt_));
-        lt_linear_ = std::make_unique<LtLinear>(lt_, blas);
-        initialize_flash_attention();
-        for (auto type : {Type::BF16, Type::F16})
-            for (int dim : {32, 64, 96, 128}) {
-                int resident = flash_decode_resident_blocks(dim, type);
-                int64_t slots = int64_t(multiprocessors_) * resident;
-                if (slots > INT_MAX) throw std::overflow_error("decode resident CTA capacity");
-                flash_decode_slots_[(type == Type::F16 ? 4 : 0) + dim / 32 - 1] = int(slots);
-            }
-        gemv_slots_ = gemv_capacities(multiprocessors_);
-        qkv_gemv_capacity_ = std::min(gemv_slots_[1], gemv_slots_[2]);
-        if (quantization != Quantization::None)
-            quant_ = std::make_unique<QuantBackend>(memory, lt_, blas_workspace_,
-                                                   quantized_type(quantization));
-        pdl_ = p.major >= 9 && compiled_pdl_support();
-    } catch (...) {
-        quant_.reset();
-        lt_linear_.reset();
-        if (lt_)
-            cublasLtDestroy(lt_);
-        if (blas)
-            cublasDestroy(blas);
-        throw;
-    }
-}
-Backend::~Backend() {
-    if (stream)
-        cudaStreamSynchronize(stream);
-    for (const auto &plan : fft_plans_) cufftDestroy(plan.second);
-    quant_.reset();
-    lt_linear_.reset();
-    if (lt_)
-        cublasLtDestroy(lt_);
-    if (blas)
-        cublasDestroy(blas);
-}
-
 // Four independent rows per CTA; contiguous vector loads coalesce weight reads.
 template <class T, int WARPS = 4, bool PDL = false>
 __global__ void gemv_kernel(const T *__restrict__ x, const T *__restrict__ w, T *__restrict__ y,
@@ -169,14 +115,30 @@ static bool compiled_pdl_support() {
     CUDA(cudaFuncGetAttributes(&compiled, gemv_kernel<__nv_bfloat16, 4, true>));
     return compiled.ptxVersion >= 90;
 }
-void Backend::linear(TensorView x, TensorView w, TensorView y, bool full_precision, float accumulation,
+void initialize_cuda_kernels(CudaContext &cuda) {
+    initialize_flash_attention();
+    for (auto type : {Type::BF16, Type::F16})
+        for (int dimensions : {32, 64, 96, 128}) {
+            int64_t slots = int64_t(cuda.multiprocessors) * flash_decode_resident_blocks(dimensions, type);
+            if (slots > INT_MAX) throw std::overflow_error("decode resident CTA capacity");
+            cuda.flash_decode_slots[(type == Type::F16 ? 4 : 0) + dimensions / 32 - 1] = int(slots);
+        }
+    cuda.gemv_slots = gemv_capacities(cuda.multiprocessors);
+    cuda.qkv_gemv_capacity = std::min(cuda.gemv_slots[1], cuda.gemv_slots[2]);
+    cuda.normalized_linear_capacity = ops::normalized_linear_capacity(
+        cuda.multiprocessors, fp32_latency_warps(cuda.sm_major, cuda.sm_minor), cuda.normalized_qkv_capacity);
+    cuda.pdl = cuda.sm_major >= 9 && compiled_pdl_support();
+}
+void ops::matmul(TensorView x, TensorView w, TensorView y, bool full_precision, float accumulation,
                        float product_scale) {
+    auto &cuda = execution_context(x, {w, y});
+    const auto stream = cuda.stream;
     if (x.cols != w.cols || y.rows != x.rows || y.cols != w.rows || x.type != w.type ||
         (x.type != y.type && !((x.type == Type::BF16 || x.type == Type::F16) && y.type == Type::F32)) ||
         !w.dense() || (x.type != Type::BF16 && x.type != Type::F16 && x.type != Type::F32))
         throw std::runtime_error("linear dimensions/dtype mismatch");
-    bool dependent = pdl_ && x.type == Type::BF16 && w.cols <= 1024;
-    int capacity = gemv_slots_[x.type == Type::F32 ? 0 : x.type == Type::F16 ? 1 : dependent ? 3 : 2];
+    bool dependent = cuda.pdl && x.type == Type::BF16 && w.cols <= 1024;
+    int capacity = cuda.gemv_slots[x.type == Type::F32 ? 0 : x.type == Type::F16 ? 1 : dependent ? 3 : 2];
     int64_t blocks = ((int64_t(w.rows) + 3) / 4) * x.rows;
     // Independent row reductions use GEMV while the complete grid fits one
     // residency wave. Larger grids use the prepared matrix-multiply plans.
@@ -198,14 +160,16 @@ void Backend::linear(TensorView x, TensorView w, TensorView y, bool full_precisi
                                                   w.rows, w.cols, x.rows, x.ld(), y.ld(), QkvProjectionWriteback{});
         return;
     }
-    if (!lt_linear_->linear(x, w, y, full_precision, accumulation, product_scale,
-                             blas_workspace_.data(), blas_workspace_.size(), stream))
+    if (!cuda.matmul->linear(x, w, y, full_precision, accumulation, product_scale,
+                             cuda.gemm_workspace.data(), cuda.gemm_workspace.size(), stream))
         throw std::invalid_argument("unsupported prepared Lt GEMM views");
 }
-bool Backend::linear_qkv(TensorView x, TensorView w, const QkvProjectionOutput &o) {
+bool ops::matmul_qkv(TensorView x, TensorView w, const QkvProjectionOutput &o) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     o.validate(x, w);
     int64_t blocks = ((int64_t(w.rows) + 3) / 4) * x.rows;
-    if (blocks > qkv_gemv_capacity_)
+    if (blocks > cuda.qkv_gemv_capacity)
         return false;
     dim3 grid((w.rows + 3) / 4, x.rows);
     QkvProjectionWriteback output(o);
@@ -381,8 +345,10 @@ template <class Launch> static void dispatch_float_storage(Type type, Launch &&l
     default: throw std::invalid_argument("operator requires F16, BF16 or F32 storage");
     }
 }
-void Backend::norm(TensorView x, TensorView w, TensorView y, float eps, bool gemma,
+void ops::norm(TensorView x, TensorView w, TensorView y, float eps, bool gemma,
                    TensorView bias) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     check_float_storage(x, {w, y, bias});
     if (!x.dense() || !y.dense() || !w.dense() || x.rows != y.rows || x.cols != y.cols ||
         x.type != y.type || w.numel() != size_t(x.cols) || w.type != x.type ||
@@ -400,8 +366,10 @@ void Backend::norm(TensorView x, TensorView w, TensorView y, float eps, bool gem
                                                    y.ptr<T>(), x.cols, eps, gemma);
     });
 }
-void Backend::residual_norm(TensorView x, TensorView update, TensorView w, TensorView out,
+void ops::residual_norm(TensorView x, TensorView update, TensorView w, TensorView out,
                             float eps, TensorView scale, bool gemma) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     check_float_storage(x, {update, w, out, scale});
     if (fast_rms<true>(stream, x, update, w, out, scale, eps, gemma))
         return;
@@ -413,8 +381,10 @@ void Backend::residual_norm(TensorView x, TensorView update, TensorView w, Tenso
             w.ptr<T>(), out.ptr<T>(), scale.ptr<T>(), x.cols, eps, gemma);
     });
 }
-void Backend::residual_norm_last(TensorView x, TensorView u, TensorView w, TensorView out,
+void ops::residual_norm_last(TensorView x, TensorView u, TensorView w, TensorView out,
                                  const int *ends, float eps) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     check_float_storage(x, {u, w, out});
     if (x.type != Type::BF16)
         throw std::invalid_argument("packed final norm requires BF16 storage");
@@ -427,7 +397,9 @@ __global__ void add_kernel(const T *a, const T *b, T *y, const T *scale, size_t 
     if (i < n)
         y[i] = r<T>(f(a[i]) + rounded<T>(f(b[i]) * (scale ? f(scale[i % cols]) : 1.f)));
 }
-void Backend::add(TensorView a, TensorView b, TensorView out, TensorView scale) {
+void ops::add(TensorView a, TensorView b, TensorView out, TensorView scale) {
+    auto &cuda = execution_context(a);
+    const auto stream = cuda.stream;
     check_float_storage(a, {b, out, scale});
     size_t n = size_t(a.rows) * a.cols;
     dispatch_float_storage(a.type, [&](auto storage) {
@@ -441,7 +413,9 @@ template <class T> __global__ void bias_kernel(T *x, const T *b, size_t n, int c
     if (i < n)
         x[i] = r<T>(f(x[i]) + f(b[i % cols]));
 }
-void Backend::bias(TensorView x, TensorView b) {
+void ops::bias(TensorView x, TensorView b) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     check_float_storage(x, {b});
     if (!b.data)
         return;
@@ -465,7 +439,9 @@ template <class T> __global__ void activation_kernel(const T *x, T *y, size_t n,
     if (i < n)
         y[i] = r<T>(act(f(x[i]), kind));
 }
-void Backend::activation(TensorView x, TensorView y, int kind) {
+void ops::activation(TensorView x, TensorView y, int kind) {
+    auto &cuda = execution_context(x);
+    const auto stream = cuda.stream;
     check_float_storage(x, {y});
     size_t n = size_t(x.rows) * x.cols;
     dispatch_float_storage(x.type, [&](auto storage) {
@@ -480,7 +456,9 @@ template <class T> __global__ void gated_kernel(const T *gu, T *y, size_t n, int
         y[i] = r<T>(rounded<T>(act(f(gu[p]), kind)) * f(gu[p + cols]));
     }
 }
-void Backend::gated(TensorView gu, TensorView y, int kind) {
+void ops::gated_activation(TensorView gu, TensorView y, int kind) {
+    auto &cuda = execution_context(gu);
+    const auto stream = cuda.stream;
     check_float_storage(y, {gu});
     size_t n = size_t(y.rows) * y.cols;
     dispatch_float_storage(y.type, [&](auto storage) {
@@ -499,8 +477,10 @@ __global__ void embedding_kernel(const T *w, const int *ids, T *out, int rows, i
                      : r<T>(f(w[size_t(id) * cols + i % cols]) * rounded<T>(scale));
     }
 }
-void Backend::embedding(TensorView table, const int *ids, TensorView out, float scale,
+void ops::lookup(TensorView table, const int *ids, TensorView out, float scale,
                         TensorView replacement, int replacement_id) {
+    auto &cuda = execution_context(table);
+    const auto stream = cuda.stream;
     check_float_storage(out, {table, replacement});
     size_t n = size_t(out.rows) * out.cols;
     dispatch_float_storage(out.type, [&](auto storage) {
@@ -532,8 +512,10 @@ __global__ void rope_table_kernel(T *table, int rows, int dim, float theta, floa
     table[p * dim + d] = r<T>(cosf(p * freq));
     table[p * dim + d + dim / 2] = r<T>(sinf(p * freq));
 }
-void Backend::make_rope(TensorView table, int dim, float theta, float factor, int rope_type,
+void ops::rotary_table(TensorView table, int dim, float theta, float factor, int rope_type,
                         float low_wave, float high_wave) {
+    auto &cuda = execution_context(table);
+    const auto stream = cuda.stream;
     check_float_storage(table, {});
     if (rope_type == 2 && !(low_wave > high_wave && high_wave > 0))
         throw std::invalid_argument("invalid Llama3 RoPE wavelength bounds");
@@ -642,10 +624,12 @@ static void launch_qkv(cudaStream_t stream, TensorView in, TensorView q, TensorV
         packed ? packed->row_batch : nullptr, packed ? packed->row_position : nullptr, cache,
         bias.ptr<T>(), in.ld(), q.ld());
 }
-void Backend::qkv(TensorView in, TensorView q, TensorView k, TensorView v, const int *pos,
+void ops::write_qkv(TensorView in, TensorView q, TensorView k, TensorView v, const int *pos,
                   int batch, int time, int slot, int cap, int nh, int nk, int dim, TensorView qn,
                   TensorView kn, float eps, bool gemma, TensorView rope, int fixed_position,
                   const SequenceLayout *packed, CacheLayout cache, TensorView bias) {
+    auto &cuda = execution_context(in);
+    const auto stream = cuda.stream;
     check_float_storage(in, {qn, kn, rope});
     if ((bias.data && (bias.numel() != size_t((nh + 2 * nk) * dim) || bias.type != in.type)) ||
         q.type != in.type || (k.cols && k.type != in.type) || (v.cols && v.type != in.type) ||
@@ -816,10 +800,12 @@ __global__ void depth_attention_kernel(const bf16 *q, const bf16 *k, const bf16 
         out[(size_t(row) * nh + h) * dim + d] = r<bf16>(value / sum);
     }
 }
-void Backend::attention(TensorView q, TensorView k, TensorView v, TensorView out, const int *pos,
+void ops::attention(TensorView q, TensorView k, TensorView v, TensorView out, const int *pos,
                         int batch, int time, int slot, int cap, int nh, int nk, int dim,
                         bool causal, int window, int fixed_position, const SequenceLayout *packed,
                         CacheLayout cache) {
+    auto &cuda = execution_context(q);
+    const auto stream = cuda.stream;
     check_float_storage(q, {k, v, out});
     if ((cache.block_table || cache.key_pages) &&
         (!cache.valid_paged() || cap <= 0 ||
@@ -827,16 +813,16 @@ void Backend::attention(TensorView q, TensorView k, TensorView v, TensorView out
         throw std::invalid_argument("invalid paged attention layout");
     if ((cache.block_table || cache.key_pages) && q.type == Type::BF16 && time == 1 &&
         (pos || cache.sequences) && !packed && dim == 128 && causal && !window && !slot) {
-        if (size_t(batch) * nh * sizeof(float) > flash_lse_.size())
+        if (size_t(batch) * nh * sizeof(float) > cuda.attention_lse.size())
             throw std::runtime_error("FlashAttention workspace was not prepared");
-        decode_attention( q, k, v, out, flash_lse_.ptr<float>(), pos, batch, nh, nk, cache);
+        decode_attention( q, k, v, out, cuda.attention_lse.ptr<float>(), pos, batch, nh, nk, cache);
         return;
     }
     if (q.type == Type::BF16 && (time >= 64 || packed) && fixed_position == 0 &&
         ((dim == 128 && causal) || (dim == 256 && !causal))) {
-        if (size_t(batch) * time * nh * sizeof(float) > flash_lse_.size())
+        if (size_t(batch) * time * nh * sizeof(float) > cuda.attention_lse.size())
             throw std::runtime_error("FlashAttention workspace bounds");
-        prefill_attention( q, k, v, out, flash_lse_.ptr<float>(), batch, time, slot, cap, nh, nk,
+        prefill_attention( q, k, v, out, cuda.attention_lse.ptr<float>(), batch, time, slot, cap, nh, nk,
                       dim, causal, window, packed, cache);
         return;
     }
@@ -879,7 +865,9 @@ __global__ void increment_sequences_kernel(const CacheSequence *sequences, int n
     if (i < n && sequences[i].position)
         ++*sequences[i].position;
 }
-void Backend::increment(int *p, int n, int v, const CacheSequence *sequences) {
+void ops::advance_positions(TensorView anchor, int *p, int n, int v, const CacheSequence *sequences) {
+    auto &cuda = execution_context(anchor);
+    const auto stream = cuda.stream;
     if (sequences)
         increment_sequences_kernel<<<(n + 255) / 256, 256, 0, stream>>>(sequences, n);
     else

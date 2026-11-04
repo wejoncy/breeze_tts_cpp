@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/convolution.h"
 #include "layers/transformer.h"
 namespace tts {
@@ -18,7 +19,7 @@ class RelativeEncoder {
     struct Workspace {
         Buffer projected, attended, update, expanded, scratch;
         int max_batch, max_time, max_rows;
-        Workspace(const RelativeEncoder &, int batch, int time, BufferAllocator *);
+        Workspace(const RelativeEncoder &, int batch, int time);
     };
     RelativeEncoder(Weights &, const std::string &, int layers, int heads);
     void prepare(Workspace &, int rows) const;

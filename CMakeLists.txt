@@ -15,7 +15,7 @@ include(cmake/Dependencies.cmake)
 corrosion_import_crate(MANIFEST_PATH tokenizer/Cargo.toml LOCKED)
 add_library(tts SHARED
   bindings/c_api.cpp
-  src/ops/kernels/backend.cu
+  src/ops/kernels/tensor_kernels.cu
   src/ops/cuda/lt_linear.cpp
   src/ops/cuda/grouped_linear.cpp
   src/ops/cuda/relative_attention.cpp
@@ -23,6 +23,8 @@ add_library(tts SHARED
   src/ops/cuda/execution_context.cpp
   src/ops/linear.cpp
   src/ops/basic.cpp
+  src/ops/tensor.cpp
+  src/runtime/cuda_context.cpp
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
@@ -84,7 +86,7 @@ add_library(tts SHARED
   src/ops/kernels/audio/audio_kernels.cu
   src/ops/kernels/audio/encoder_kernels.cu
   src/ops/kernels/audio/spectral_kernels.cu
-  src/ops/kernels/quant/quant_backend.cu
+  src/ops/kernels/quant/quantized_gemm.cu
   src/ops/kernels/quant/quant_dispatch.cu
   src/ops/kernels/quant/quant_gated.cu
   src/ops/kernels/quant/quant_gemm_sm80.cu
@@ -112,8 +114,8 @@ target_include_directories(tts PUBLIC include PRIVATE src "${PROJECT_SOURCE_DIR}
 target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
-  src/ops/kernels/backend.cu
-  src/ops/kernels/quant/quant_backend.cu
+  src/ops/kernels/tensor_kernels.cu
+  src/ops/kernels/quant/quantized_gemm.cu
   src/ops/kernels/quant/quant_norm.cu
   src/ops/kernels/quant/quant_gated.cu
   src/ops/kernels/quant/quant_dispatch.cu

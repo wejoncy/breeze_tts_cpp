@@ -1,5 +1,6 @@
 #include "ops/linear.h"
-#include "ops/cuda/backend.h"
+#include "ops/basic.h"
+#include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/norm_projection.h"
 #include <type_traits>
 
@@ -43,14 +44,14 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
                 !e.condition.data && !e.raw.data && e.value_scale == 1 && e.output_scale == 1 &&
                 !e.residual_rows && !e.valid_rows_per_sequence && e.input_repeat == 1 &&
                 e.rows_per_sequence > 0 && output.rows % e.rows_per_sequence == 0 &&
-                gpu.linear_gelu(*dense, matrix, bias, output))
+                tts::ops::matmul_gelu(*dense, matrix, bias, output))
                 return true;
-            gpu.linear(*dense, matrix, output);
+            tts::ops::matmul(*dense, matrix, output);
         } else {
             matrix.validate();
             RowScaledView activation;
             if (const auto *dense = std::get_if<TensorView>(&input)) {
-                gpu.quantized().quantize(*dense, scratch);
+                gpu.quantization->quantize(*dense, scratch);
                 activation = scratch;
             } else {
                 activation = std::get<RowScaledView>(input);
@@ -61,18 +62,18 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
                 throw std::invalid_argument("quantized linear dimensions/layout mismatch");
             if (!e.packed && !e.condition_sources && !e.output_rows && quantized_output.values.data &&
                 quantized_output.values.type == matrix.values.type &&
-                gpu.quantized().linear_finish(activation, matrix, output, e)) {
-                gpu.quantized().quantize(output, quantized_output);
+                gpu.quantization->linear_finish(activation, matrix, output, e)) {
+                gpu.quantization->quantize(output, quantized_output);
                 return true;
             }
-            gpu.quantized().linear(activation, matrix, output);
+            gpu.quantization->linear(activation, matrix, output);
         }
         return false;
     }, weight);
     if (fused)
         return;
     if (quantized_output.values.data) {
-        pointwise_quantize( output, quantized_output, e, {}, gpu.multiprocessors());
+        pointwise_quantize( output, quantized_output, e, {}, gpu.multiprocessors);
     } else if (bias.data || e.residual.data || e.gate.data || e.condition.data || e.raw.data ||
         e.activation != Activation::Identity || e.value_scale != 1 || e.output_scale != 1 ||
         e.valid_rows_per_sequence || e.packed || e.condition_sources || e.output_rows) {
@@ -95,18 +96,18 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
     if (const auto *quantized = std::get_if<RowScaledView>(&weight)) {
         if (writeback && quantized_output.values.data) return false;
         auto project = [&](const Epilogue &epilogue) {
-            return gpu.quantized().normalized_linear(input, normalized, norm_weight, norm_bias,
+            return gpu.quantization->normalized_linear(input, normalized, norm_weight, norm_bias,
                 epsilon, fusion, *quantized, output, epilogue, {}, writeback);
         };
         if (quantized_output.values.data) {
             e.bias = bias;
             validate_pointwise_quantize(output, quantized_output, e);
             if (quantized_output.values.type == quantized->values.type && project(e)) {
-                gpu.quantized().quantize(output, quantized_output);
+                gpu.quantization->quantize(output, quantized_output);
             } else {
                 if (!project({})) return false;
                 pointwise_quantize( output, quantized_output, e, {},
-                                   gpu.multiprocessors());
+                                   gpu.multiprocessors);
             }
             return true;
         }
@@ -117,6 +118,6 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
     if (!writeback) e.bias = bias;
     return normalized_linear(gpu.stream, input, normalized, norm_weight, norm_bias, epsilon,
                              fusion, std::get<TensorView>(weight), output, e,
-                             gpu.normalized_linear_capacity(writeback != nullptr), writeback);
+                             (writeback ? gpu.normalized_qkv_capacity : gpu.normalized_linear_capacity), writeback);
 }
 } // namespace tts::ops

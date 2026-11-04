@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/attention.h"
 #include "runtime/device.h"
 #include <type_traits>
@@ -304,7 +304,12 @@ void dense_attention( TensorView q, TensorView k, TensorView v, TensorView out,
 void decode_attention( TensorView q, TensorView k, TensorView v, TensorView out,
                   float *lse, const int *positions, int batch, int heads, int kvheads,
                   CacheLayout cache, FlashDecodeWorkspace scratch, int partitions) {
-    if (!scratch.output.data) scratch = execution_context(q).flash_decode_workspace();
+    if (!scratch.output.data) {
+        auto &gpu = execution_context(q);
+        if (gpu.decode_output.size()) scratch = {
+            gpu.decode_output.view(1, int(gpu.decode_output.size() / sizeof(float)), Type::F32),
+            gpu.decode_lse.view(1, int(gpu.decode_lse.size() / sizeof(float)), Type::F32)};
+    }
     const auto stream = execution_context(q).stream;
     int dim = heads > 0 ? q.cols / heads : 0;
     if (batch < 1 || heads < 1 || kvheads < 1 || heads % kvheads || q.cols != heads * dim ||

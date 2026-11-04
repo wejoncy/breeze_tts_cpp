@@ -1,12 +1,13 @@
 #include "ops/basic.h"
 #include "ops/audio.h"
 #include "models/mimi/decoder.h"
+#include "layers/convolution.h"
 #include <algorithm>
 #include <iterator>
 
 namespace tts {
 void Codec::forward(TensorInputs inputs, TensorOutputs outputs, ForwardContext &context) const {
-    CodecState workspace(*this, context.max_batch, &context.storage, true);
+    CodecState workspace(*this, context.max_batch, true);
     const int batch_size = context.batch.batch();
     auto waveform = workspace.a.view(batch_size * config.samples_per_frame, 1, Type::F32);
     if (context.mode == ForwardContext::Execute) {
@@ -18,37 +19,29 @@ void Codec::forward(TensorInputs inputs, TensorOutputs outputs, ForwardContext &
     outputs["waveform"] = waveform;
     outputs["pcm"] = workspace.pcm.view(batch_size, config.samples_per_frame, Type::I16);
 }
-Conv::Conv(Weights &weights, const std::string &name, int d, int s, bool trans, bool dw)
-    : dilation(d), stride(s), transpose(trans), depthwise(dw) {
-    const auto &e = weights.entry(name + ".weight");
-    if (e.type != Type::F32 || e.shape.size() != 3 || e.shape[0] < 1 || e.shape[1] < 1 ||
-        e.shape[2] < 1 || d < 1 || s < 1 || (dw && (trans || e.shape[1] != 1)) ||
-        (trans && e.shape[2] < s))
+Conv::Conv(Weights &weights, const std::string &name, int dilation, int stride,
+           bool transpose, bool depthwise)
+    : dilation(dilation), stride(stride), transpose(transpose), depthwise(depthwise) {
+    const auto &entry = weights.entry(name + ".weight");
+    if (entry.type != Type::F32 || entry.shape.size() != 3 || entry.shape[0] < 1 || entry.shape[1] < 1 ||
+        entry.shape[2] < 1 || dilation < 1 || stride < 1 ||
+        (depthwise && (transpose || entry.shape[1] != 1)) || (transpose && entry.shape[2] < stride))
         throw std::runtime_error("codec convolution requires F32");
-    kernel = e.shape[2];
-    in = trans ? e.shape[0] : e.shape[1];
-    out = trans ? e.shape[1] : e.shape[0];
-    if (dw)
+    kernel = entry.shape[2];
+    in = transpose ? entry.shape[0] : entry.shape[1];
+    out = transpose ? entry.shape[1] : entry.shape[0];
+    if (depthwise)
         in = out;
     bias = weights.get(name + ".bias");
     if (bias.type != Type::F32 || bias.numel() != size_t(out))
         throw std::invalid_argument("codec convolution bias mismatch: " + name);
-    if (dw) {
+    if (depthwise) {
         weight = weights.get(name + ".weight");
         return;
     }
     // Project each incoming sample through all taps at once, then accumulate
     // into the causal output ring. No input packing/zero insertion is needed.
-    std::vector<float> reordered(size_t(out) * kernel * in);
-    const float *src = static_cast<const float *>(e.data);
-    for (int o = 0; o < out; o++)
-        for (int k = 0; k < kernel; k++)
-            for (int i = 0; i < in; i++) {
-                size_t dest = (size_t(k) * out + o) * in + i;
-                reordered[dest] = src[trans ? (size_t(i) * out + o) * kernel + k
-                                            : (size_t(o) * in + i) * kernel + k];
-            }
-    weight = weights.custom(name + ".tap_major", reordered.data(), kernel * out, in, Type::F32);
+    weight = load_convolution_weight(weights, name, transpose);
 }
 void ConvState::run(const Conv &c, TensorView x, TensorView y, const int *frame,
                     int rows, const ConvHistory *states) {
@@ -207,22 +200,22 @@ SequenceStateSpec Codec::history_spec() const {
         }
     return spec;
 }
-CodecState::CodecState(const Codec &c, int b, BufferAllocator *arena, bool mapped)
-    : transformer(c.transformer.config, b, c.transformer.config.window, b, arena, {}, true,
+CodecState::CodecState(const Codec &c, int b, bool mapped)
+    : transformer(c.transformer.config, b, c.transformer.config.window, b, {}, true,
                   !mapped),
-      rvq1(size_t(b) * c.first_embedding_.cols * sizeof(float), arena), rvq2(rvq1.size(), arena),
-      latent(size_t(b) * c.config.latent_dim * sizeof(float), arena),
-      hidden(size_t(b) * c.config.transformer.hidden * sizeof(float), arena),
-      position(mapped ? 0 : size_t(b) * 4, arena),
-      pcm(size_t(b) * c.config.samples_per_frame * sizeof(int16_t), arena), batch(b) {
+      rvq1(size_t(b) * c.first_embedding_.cols * sizeof(float)), rvq2(rvq1.size()),
+      latent(size_t(b) * c.config.latent_dim * sizeof(float)),
+      hidden(size_t(b) * c.config.transformer.hidden * sizeof(float)),
+      position(mapped ? 0 : size_t(b) * 4),
+      pcm(size_t(b) * c.config.samples_per_frame * sizeof(int16_t)), batch(b) {
     int time = 1, channels = c.config.latent_dim;
     max_elements = b * std::max(c.config.latent_dim, c.config.codebook_dim);
-    conv.push_back(std::make_unique<ConvState>(c.pre_conv_, b, 1, arena, !mapped));
+    conv.push_back(std::make_unique<ConvState>(c.pre_conv_, b, 1, !mapped));
     for (const auto &op : c.ops_) {
         if (op.kind == CodecOp::Convolution) {
             if (op.conv->transpose && time > INT32_MAX / op.conv->stride)
                 throw std::invalid_argument("codec convolution time overflow");
-            conv.push_back(std::make_unique<ConvState>(*op.conv, b, time, arena, !mapped));
+            conv.push_back(std::make_unique<ConvState>(*op.conv, b, time, !mapped));
             if (op.conv->transpose)
                 time *= op.conv->stride;
             channels = op.conv->out;
@@ -236,10 +229,10 @@ CodecState::CodecState(const Codec &c, int b, BufferAllocator *arena, bool mappe
     }
     if (time != c.config.samples_per_frame || channels != 1)
         throw std::invalid_argument("codec output does not match configured frame size");
-    a = Buffer(size_t(max_elements) * 4, arena);
-    this->b = Buffer(a.size(), arena);
+    a = Buffer(size_t(max_elements) * 4);
+    this->b = Buffer(a.size());
     for (auto &save : saves)
-        save = Buffer(a.size(), arena);
+        save = Buffer(a.size());
 }
 void CodecState::reset(){
 

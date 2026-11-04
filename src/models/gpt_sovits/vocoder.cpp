@@ -21,7 +21,7 @@ TensorView Vocoder::forward(const TensorBatch &input, TensorView layout, Forward
         for (size_t index = context.batches.size; index; --index)
             for (int time : times) {
                 if (time > context.max_time) continue;
-                ScratchScope scratch(context.storage);
+                Tensor::Scope scratch;
                 const int batch = context.batches[index - 1];
                 auto invocation = context;
                 invocation.max_batch = batch;
@@ -35,7 +35,7 @@ TensorView Vocoder::forward(const TensorBatch &input, TensorView layout, Forward
     }
     int written = 0;
     for (const auto &chunk : input.chunks) {
-        ScratchScope scratch(context.storage);
+        Tensor::Scope scratch;
         int first = 0, end = chunk.time, offset = 0, count = chunk.time;
         if (chunk.frame_count) {
             count = std::min(chunk.frame_count,
@@ -64,10 +64,10 @@ TensorView Vocoder::forward(const TensorBatch &input, TensorView layout, Forward
 }
 TensorView Vocoder::forward(TensorView mel, TensorView destination, ForwardContext &context) const {
     if (context.mode == ForwardContext::Prepare) {
-        Workspace workspace(*this, 1, 1, &context.storage);
+        Workspace workspace(*this, 1, 1);
         if (workspace.activations[0].data()) prepare(workspace, context.max_batch, context.max_time);
     } else {
-        Workspace workspace(*this, context.max_batch, context.max_time, &context.storage);
+        Workspace workspace(*this, context.max_batch, context.max_time);
         if (context.mode == ForwardContext::Execute || context.mode == ForwardContext::Capture)
             context.run(this, "vocoder", {context.max_batch, context.max_time},
                 {mel.data, destination.data}, [&] { forward(workspace, mel, destination, context.batch); });
@@ -167,7 +167,7 @@ int Vocoder::tile_capacity(int core_frames) const {
         throw std::invalid_argument("invalid vocoder tile capacity");
     return int(size);
 }
-Vocoder::Workspace::Workspace(const Vocoder &v, int batch, int frames, BufferAllocator *allocator)
+Vocoder::Workspace::Workspace(const Vocoder &v, int batch, int frames)
     : max_batch(batch), max_frames(frames) {
     if (batch < 1 || frames < 1)
         throw std::invalid_argument("invalid vocoder capacity");
@@ -191,8 +191,8 @@ Vocoder::Workspace::Workspace(const Vocoder &v, int batch, int frames, BufferAll
     }
     visit(v.post_, time);
     for (auto &a : activations)
-        a = Buffer(activation_bytes, allocator);
-    projection = Buffer(projection_bytes, allocator);
+        a = Buffer(activation_bytes);
+    projection = Buffer(projection_bytes);
 }
 void Vocoder::prepare(Workspace &w, int batch, int frames) const {
     if (batch < 1 || frames < 1)

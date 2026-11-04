@@ -1,12 +1,13 @@
 #include "execution/model_runtime.h"
 #include "execution/runner_resources.h"
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
+#include "io/model_loader.h"
 #include "io/weights.h"
 #include <cmath>
 
 namespace tts {
 struct ModelRuntime::Impl {
-    Backend gpu;
+    CudaContext gpu;
     ModelComponents parts;
     Impl(const ModelLoader &loader, const ModelOptions &options, ModelFactory factory)
         : gpu(options.device, options.quantization, options.memory_limit_bytes) {
@@ -14,6 +15,7 @@ struct ModelRuntime::Impl {
         parts = factory(gpu.memory, loader, options);
         const auto &info = parts.info;
         if (!parts.network || !parts.planner || !parts.resources ||
+            info.model_type != loader.config().at("model_type").get<std::string>() ||
             info.audio.sample_rate < 1 || info.audio.samples_per_frame < 1 ||
             info.max_output_frames < 1 || !std::isfinite(parts.quantum_ms) || parts.quantum_ms <= 0)
             throw std::invalid_argument("invalid model execution description");
@@ -38,7 +40,7 @@ std::function<void()> ModelRuntime::executor_initializer() {
     return [this] { initialize_execution(impl_->gpu); };
 }
 MemoryStats ModelRuntime::memory_stats() const {
-    impl_->gpu.sync();
+    impl_->gpu.memory.sync();
     return impl_->gpu.memory.stats();
 }
 } // namespace tts

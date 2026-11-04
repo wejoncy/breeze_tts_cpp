@@ -48,24 +48,22 @@ RelativeEncoder::RelativeEncoder(Weights &w, const std::string &prefix, int laye
                            (relative.shape[1] - 1) / 2});
     }
 }
-RelativeEncoder::Workspace::Workspace(const RelativeEncoder &e, int batch, int time,
-                                      BufferAllocator *allocator)
+RelativeEncoder::Workspace::Workspace(const RelativeEncoder &e, int batch, int time)
     : max_batch(batch), max_time(time), max_rows(int64_t(batch) * time) {
     if (batch < 1 || time < 1 || int64_t(batch) * time > INT32_MAX)
         throw std::invalid_argument("invalid relative encoder workspace");
     size_t rows = size_t(batch) * time;
-    projected = Buffer(rows * e.hidden_ * 3 * bytes(e.type_), allocator);
-    attended = Buffer(rows * e.hidden_ * bytes(e.type_), allocator);
-    update = Buffer(attended.size(), allocator);
-    expanded = Buffer(rows * e.blocks_.front().first.geometry().output_channels * bytes(e.type_),
-                      allocator);
+    projected = Buffer(rows * e.hidden_ * 3 * bytes(e.type_));
+    attended = Buffer(rows * e.hidden_ * bytes(e.type_));
+    update = Buffer(attended.size());
+    expanded = Buffer(rows * e.blocks_.front().first.geometry().output_channels * bytes(e.type_));
     size_t scratch_bytes =
         ops::relative_attention_workspace_bytes(batch, time, e.heads_, e.hidden_ / e.heads_, e.type_);
     for (const auto &b : e.blocks_) {
         scratch_bytes = std::max(scratch_bytes, b.first.workspace_bytes(batch, time));
         scratch_bytes = std::max(scratch_bytes, b.second.workspace_bytes(batch, time));
     }
-    scratch = Buffer(scratch_bytes, allocator);
+    scratch = Buffer(scratch_bytes);
 }
 void RelativeEncoder::prepare(Workspace &w, int rows) const {
     auto x = w.update.view(1, hidden_, type_);

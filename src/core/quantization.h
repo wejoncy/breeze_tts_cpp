@@ -14,7 +14,7 @@ inline const char *quantized_name(Type type) {
     return type == Type::I8 ? "INT8" : "FP8";
 }
 // Values are row-major; scales are F32, one per row. Rows mean tokens for
-// activations and output channels for weights. No storage/backend dependency.
+// activations and output channels for weights. No storage/runtime dependency.
 struct RowScaledView {
     TensorView values, scales;
     void validate() const {

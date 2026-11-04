@@ -23,25 +23,24 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
             for (size_t index = context.batches.size; index; --index)
                 for (int time : times) {
                     if (time > maximum_time) continue;
-                    ScratchScope scratch(context.storage);
+                    Tensor::Scope scratch;
                     const int batch = context.batches[index - 1];
-                    Workspace workspace(*this, batch, time, &context.storage);
+                    Workspace workspace(*this, batch, time);
                     advance(workspace, ForwardBatch(batch, time), sampling(), {}, context);
                 }
         }
-        ScratchScope scratch(context.storage);
+        Tensor::Scope scratch;
         Workspace workspace(*this, context.mode == ForwardContext::Prepare ? 1 : context.max_batch,
-                              context.mode == ForwardContext::Prepare ? 1 : maximum_time, &context.storage);
+                              context.mode == ForwardContext::Prepare ? 1 : maximum_time);
         if (context.mode == ForwardContext::Prepare && workspace.noise.data())
             estimator_.prepare(workspace.estimator,
                 workspace.noise.view(1, mel_channels_, estimator_.type()),
                 workspace.velocity.view(1, mel_channels_, estimator_.type()),
                 2 * context.max_batch * maximum_time);
-        WorkspacePlan metadata;
-        metadata.allocate(size_t(context.max_batch) * maximum_time * 5 * sizeof(void *));
-        metadata.allocate(size_t(context.max_batch) * maximum_time * sizeof(int));
-        metadata.allocate(size_t(context.max_batch) * (sizeof(int) + 2 * sizeof(uint64_t)));
-        context.storage.allocate(metadata.size);
+
+        Tensor::reserve(size_t(context.max_batch) * maximum_time * 5 * sizeof(void *));
+        Tensor::reserve(size_t(context.max_batch) * maximum_time * sizeof(int));
+        Tensor::reserve(size_t(context.max_batch) * (sizeof(int) + 2 * sizeof(uint64_t)));
         std::vector<int> members(context.max_batch);
         std::iota(members.begin(), members.end(), 0);
         result.chunks.push_back({output, std::move(members), context.max_time});
@@ -86,8 +85,8 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
             frames > context.max_time || written + int(members.size()) * frames > output.rows)
             throw std::invalid_argument("flow window exceeds its declared tensor capacity");
         auto destination = output.slice(written, int(members.size()) * frames);
-        ScratchScope scratch(context.storage);
-        Workspace workspace(*this, int(members.size()), time, &context.storage);
+        Tensor::Scope scratch;
+        Workspace workspace(*this, int(members.size()), time);
         DiT::Condition condition;
         std::vector<const void *> feature_rows, prompt_rows;
         std::vector<void *> history_rows, retained_features, value_rows;

@@ -9,9 +9,8 @@ class StatePool {
   public:
     struct TensorSpec {
         std::string name;
-        size_t size;
-        Type type = Type::I8;
-        int columns = 1;
+        TensorShape shape;
+        Type type;
         bool host = false;
     };
     struct Layout {
@@ -25,19 +24,18 @@ class StatePool {
         std::map<std::string, SequenceState, std::less<>> histories_;
 
       public:
-        Row(const Layout &layout, BufferAllocator &storage) {
+        Row(const Layout &layout) {
             for (const auto &field : layout.tensors) {
-                const size_t row_bytes = size_t(field.columns) * bytes(field.type);
-                if (!row_bytes || field.size % row_bytes || field.size / row_bytes > INT32_MAX)
+                if (!field.shape.cols || field.shape.numel() > SIZE_MAX / bytes(field.type))
                     throw std::invalid_argument("persistent tensor shape/type mismatch: " + field.name);
-                const TensorShape shape{int(field.size / row_bytes), field.columns};
+                const auto shape = field.shape;
                 TensorView view;
                 if (field.host) {
                     auto tensor = host_.try_emplace(field.name, shape, field.type);
                     if (!tensor.second) throw std::invalid_argument("duplicate host state: " + field.name);
                     view = tensor.first->second.view();
                 } else {
-                    auto tensor = tensors_.try_emplace(field.name, field.size, &storage);
+                    auto tensor = tensors_.try_emplace(field.name, shape.numel() * bytes(field.type));
                     if (!tensor.second) throw std::invalid_argument("duplicate persistent tensor: " + field.name);
                     view = tensor.first->second.view(shape.rows, shape.cols, field.type);
                 }
@@ -45,7 +43,7 @@ class StatePool {
                     throw std::invalid_argument("duplicate persistent state: " + field.name);
             }
             for (const auto &field : layout.histories)
-                if (!histories_.try_emplace(field.first, field.second, &storage).second)
+                if (!histories_.try_emplace(field.first, field.second).second)
                     throw std::invalid_argument("duplicate persistent history: " + field.first);
         }
         Buffer &operator[](std::string_view name) {
@@ -83,15 +81,15 @@ class StatePool {
     void prepare(const Layout &layout, size_t count) {
         if (!rows_.empty() || !count)
             throw std::logic_error("invalid persistent state initialization");
-        WorkspacePlan planning;
-        Row measured(layout, planning);
-        if (planning.size && count > SIZE_MAX / planning.size)
+        const size_t row_bytes = Tensor::plan([&] { Row measured(layout); });
+        if (row_bytes && count > SIZE_MAX / row_bytes)
             throw std::overflow_error("persistent state capacity");
-        storage_.reserve(count * planning.size);
+        storage_.reserve(count * row_bytes);
+        Tensor::Scope scope(storage_);
         layout_ = layout;
         rows_.reserve(count);
         for (size_t row = 0; row < count; ++row)
-            rows_.push_back(std::make_unique<Row>(layout, storage_));
+            rows_.push_back(std::make_unique<Row>(layout));
     }
     const std::vector<std::unique_ptr<Row>> &rows() const { return rows_; }
     const SequenceStateSpec &history_spec(std::string_view name) const {

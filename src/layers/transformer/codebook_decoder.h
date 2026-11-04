@@ -33,7 +33,7 @@ class ResidualCodebooks {
                         TensorView sampling_rows, TensorView done, ForwardContext &context) const {
         const int lanes = backbone_states.rows, hidden_size = decoder_.config.hidden;
         TransformerState workspace(decoder_.config, context.max_rows, codebooks_,
-                                    context.max_rows * 2, &context.storage);
+                                    context.max_rows * 2);
         auto hidden_states = context.tensor({context.max_rows * 2, hidden_size}, decoder_.config.type);
         auto logits = context.tensor({context.max_rows, vocabulary_}, decoder_.config.type).slice(0, lanes);
         auto first_states = hidden_states.slice(0, lanes * 2).every_rows(0, 2, lanes);

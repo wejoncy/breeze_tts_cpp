@@ -20,8 +20,37 @@ inline void check(cudaError_t s, const char *expr) {
 }
 #define CUDA(x) ::tts::check((x), #x)
 // One execution stream and its pool. Model, KV, workspaces and tuning buffers
-// share this resource; allocator references never own or extend its lifetime.
-class DeviceContext final : public BufferAllocator {
+// share this resource. Owning tensors retain it until their storage is released.
+class DeviceContext final : public BufferAllocator, public std::enable_shared_from_this<DeviceContext> {
+    class HostPool final : public BufferAllocator {
+        DeviceContext &context_;
+        void *base_ = nullptr;
+        size_t bytes_ = 0;
+        std::unique_ptr<BlockPool> blocks_;
+      public:
+        explicit HostPool(DeviceContext &context) : context_(context) {}
+        void reserve(size_t bytes) {
+            auto blocks = std::make_unique<BlockPool>(bytes);
+            CUDA(cudaHostAlloc(&base_, bytes, cudaHostAllocDefault));
+            bytes_ = bytes;
+            blocks_ = std::move(blocks);
+        }
+        void release() { if (base_) cudaFreeHost(base_); }
+        bool ready() const { return bool(blocks_); }
+        bool owns(const void *data) const {
+            return base_ && uintptr_t(data) - uintptr_t(base_) < bytes_;
+        }
+        std::shared_ptr<BufferAllocator> lifetime() override { return context_.lifetime(); }
+        void *allocate(size_t bytes) override {
+            if (!blocks_) throw std::logic_error("pinned tensor pool is not initialized");
+            return static_cast<char *>(base_) + blocks_->allocate(Tensor::aligned(bytes));
+        }
+        void deallocate(void *data) noexcept override {
+            // A CPU allocation cannot be reused until its DMA has finished.
+            try { context_.sync(); } catch (...) {}
+            blocks_->deallocate(uintptr_t(data) - uintptr_t(base_));
+        }
+    } host_{*this};
     cudaMemPool_t pool_ = nullptr;
     void *runtime_base_ = nullptr;
     size_t runtime_bytes_ = 0;
@@ -32,7 +61,7 @@ class DeviceContext final : public BufferAllocator {
     size_t transfer_bytes_ = 0;
     mutable size_t transfer_used_ = 0;
     void *transfer(size_t bytes) const {
-        size_t n = aligned(bytes);
+        size_t n = Tensor::aligned(bytes);
         if (n > transfer_bytes_)
             throw std::logic_error("initialized host transfer arena exhausted");
         // Usually reset at the runner's existing completion checkpoint. A burst
@@ -93,6 +122,7 @@ class DeviceContext final : public BufferAllocator {
         cudaGetDevice(&previous);
         cudaSetDevice(device);
         cudaStreamSynchronize(stream);
+        host_.release();
         if (transfer_base_)
             cudaFreeHost(transfer_base_);
         if (runtime_base_) {
@@ -106,16 +136,53 @@ class DeviceContext final : public BufferAllocator {
     DeviceContext(const DeviceContext &) = delete;
     DeviceContext &operator=(const DeviceContext &) = delete;
     int device_ordinal() const override { return device; }
+    std::shared_ptr<BufferAllocator> lifetime() override { return weak_from_this().lock(); }
+    BufferAllocator &host_allocator() { return host_; }
+    bool has_host_tensor_backing() const { return host_.ready(); }
     // Init-only pinned backing. Uploads retain a snapshot until stream completion;
     // neither temporary CPU metadata nor request cancellation can invalidate it.
     void reserve_transfers(size_t bytes) {
         if (!bytes || transfer_base_ || runtime_)
             throw std::logic_error("invalid host transfer reservation");
         DeviceScope scope(device);
-        CUDA(cudaHostAlloc(&transfer_base_, aligned(bytes), cudaHostAllocDefault));
-        transfer_bytes_ = aligned(bytes);
+        CUDA(cudaHostAlloc(&transfer_base_, Tensor::aligned(bytes), cudaHostAllocDefault));
+        transfer_bytes_ = Tensor::aligned(bytes);
+        host_.reserve(transfer_bytes_);
     }
     bool has_transfer_backing() const { return transfer_base_ != nullptr; }
+    void copy(TensorView source, TensorView destination, bool non_blocking) {
+        if (source.type != destination.type ||
+            source.rows != destination.rows || source.cols != destination.cols ||
+            (source.device >= 0 && source.device != device) ||
+            (destination.device >= 0 && destination.device != device))
+            throw std::invalid_argument("tensor transfer requires matching storage on the initialized device");
+        if (!source.size()) return;
+        if (!source.data || !destination.data) throw std::invalid_argument("tensor transfer has no storage");
+        if (non_blocking && destination.device < 0 && !host_.owns(destination.data))
+            throw std::invalid_argument("non-blocking CPU copy requires pinned storage; use to(cpu, true)");
+        DeviceScope scope(device);
+        const void *input = source.data;
+        size_t pitch = size_t(source.ld()) * bytes(source.type);
+        if (source.device < 0 && destination.device >= 0 && !host_.owns(source.data)) {
+            if (non_blocking && !transfer_base_)
+                throw std::logic_error("non-blocking transfer requires initialized host backing");
+            if (transfer_base_) {
+                auto *snapshot = static_cast<char *>(transfer(source.size()));
+                for (int row = 0; row < source.rows; ++row)
+                    std::memcpy(snapshot + size_t(row) * source.cols * bytes(source.type),
+                        static_cast<const char *>(source.data) + size_t(row) * pitch,
+                        size_t(source.cols) * bytes(source.type));
+                input = snapshot;
+                pitch = size_t(source.cols) * bytes(source.type);
+            }
+        }
+        if (source.dense() && destination.dense())
+            CUDA(cudaMemcpyAsync(destination.data, input, source.size(), cudaMemcpyDefault, stream));
+        else
+            CUDA(cudaMemcpy2DAsync(destination.data, size_t(destination.ld()) * bytes(destination.type),
+                input, pitch, size_t(source.cols) * bytes(source.type), source.rows, cudaMemcpyDefault, stream));
+        if (!non_blocking && (source.device < 0 || destination.device < 0)) sync();
+    }
     void zero(const Buffer &buffer) {
         DeviceScope scope(device);
         CUDA(cudaMemsetAsync(buffer.data(), 0, buffer.size(), stream));
@@ -147,7 +214,7 @@ class DeviceContext final : public BufferAllocator {
     void reserve_runtime(size_t size) {
         if (runtime_)
             throw std::logic_error("invalid runtime reservation");
-        size = aligned(size);
+        size = Tensor::aligned(size);
         auto blocks = std::make_unique<BlockPool>(size);
         void *base = allocate(size);
         sync();
@@ -160,7 +227,7 @@ class DeviceContext final : public BufferAllocator {
             return nullptr;
         if (runtime_) {
             try {
-                return static_cast<char *>(runtime_base_) + runtime_->allocate(aligned(size));
+                return static_cast<char *>(runtime_base_) + runtime_->allocate(Tensor::aligned(size));
             } catch (const std::bad_alloc &) {
                 throw DeviceOutOfMemory("initialized runtime pool exhausted: needs " +
                                         std::to_string(size) + " bytes, largest free region " +
@@ -258,7 +325,7 @@ class DeviceContext final : public BufferAllocator {
         try {
             for (auto size : sizes)
                 if (size)
-                    planned.allocate(aligned(size));
+                    planned.allocate(Tensor::aligned(size));
             return true;
         } catch (const std::bad_alloc &) {
             return false;
@@ -285,11 +352,12 @@ class DeviceArena : public ScratchAllocator {
             throw std::logic_error("cannot grow an active device arena");
         memory_.sync();
         storage_ = Buffer();
-        storage_ = Buffer(aligned(n), &memory_);
+        Tensor::Scope allocation(memory_);
+        storage_ = Buffer(Tensor::aligned(n));
         memory_.sync();
     }
     void *allocate(size_t size) override {
-        size_t n = aligned(size);
+        size_t n = Tensor::aligned(size);
         if (n > capacity() - used_)
             throw std::runtime_error("reserved device workspace exhausted");
         auto *base = static_cast<char *>(storage_.data());

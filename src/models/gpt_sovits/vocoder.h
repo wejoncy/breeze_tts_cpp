@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "layers/convolution.h"
 #include "core/forward_context.h"
 #include "core/tensor_batch.h"
@@ -20,7 +21,7 @@ class Vocoder {
     struct Workspace {
         Buffer activations[6], projection;
         int max_batch, max_frames;
-        Workspace(const Vocoder &, int batch, int frames, BufferAllocator *);
+        Workspace(const Vocoder &, int batch, int frames);
     };
     void prepare(Workspace &, int max_batch, int max_frames) const;
     void forward(Workspace &, TensorView mel, TensorView audio, const ForwardBatch &) const;

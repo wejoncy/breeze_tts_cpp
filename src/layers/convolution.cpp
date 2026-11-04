@@ -3,6 +3,39 @@
 #include <cstring>
 
 namespace tts {
+TensorView load_convolution_weight(Weights &weights, const std::string &name, bool transpose,
+                                   int groups, int phases) {
+    const auto &entry = weights.entry(name + ".weight");
+    const auto &shape = entry.shape;
+    if (shape.size() != 3 || groups < 1 || phases < 1 || shape[0] < 1 || shape[1] < 1 ||
+        shape[2] < 1 || shape[0] % groups || shape[2] % phases)
+        throw std::invalid_argument("invalid convolution weight layout: " + name);
+    const int64_t total_output_channels = transpose ? int64_t(shape[1]) * groups : shape[0];
+    if (total_output_channels > INT32_MAX / shape[2])
+        throw std::invalid_argument("convolution weight exceeds tensor dimensions: " + name);
+    const int input_channels = transpose ? shape[0] / groups : shape[1];
+    const int output_channels = transpose ? shape[1] : shape[0] / groups;
+    const int kernel = shape[2], taps = kernel / phases;
+    const size_t element_bytes = bytes(entry.type);
+    std::vector<char> packed(entry.size);
+    for (int group = 0; group < groups; ++group)
+        for (int packed_tap = 0; packed_tap < kernel; ++packed_tap) {
+            const int source_tap = (packed_tap % taps) * phases + packed_tap / taps;
+            for (int output_channel = 0; output_channel < output_channels; ++output_channel)
+                for (int input_channel = 0; input_channel < input_channels; ++input_channel) {
+                    const size_t source_channel = transpose
+                        ? size_t(group * input_channels + input_channel) * output_channels + output_channel
+                        : size_t(group * output_channels + output_channel) * input_channels + input_channel;
+                    const size_t source = source_channel * kernel + source_tap;
+                    const size_t destination = ((size_t(group) * kernel + packed_tap) *
+                        output_channels + output_channel) * input_channels + input_channel;
+                    std::memcpy(packed.data() + destination * element_bytes,
+                        static_cast<const char *>(entry.data) + source * element_bytes, element_bytes);
+                }
+        }
+    return weights.custom(name + ".packed", packed.data(), kernel * output_channels * groups,
+                          input_channels, entry.type);
+}
 Convolution::Convolution(Weights &weights, const std::string &prefix, ops::ConvGeometry geometry)
     : Convolution(weights, prefix, geometry, weights.get(prefix + ".bias")) {}
 Convolution::Convolution(Weights &weights, const std::string &prefix, ops::ConvGeometry geometry,
@@ -10,30 +43,14 @@ Convolution::Convolution(Weights &weights, const std::string &prefix, ops::ConvG
     : geometry_(geometry), bias_(bias) {
     geometry_.output_length(1 + geometry.kernel * geometry.dilation);
     const auto &entry = weights.entry(prefix + ".weight");
-    int in = geometry.input_channels / geometry.groups;
-    int out = geometry.output_channels / geometry.groups;
+    const int input_channels = geometry.input_channels / geometry.groups;
+    const int output_channels = geometry.output_channels / geometry.groups;
     std::vector<int> expected =
-        geometry.transpose ? std::vector<int>{geometry.input_channels, out, geometry.kernel}
-                           : std::vector<int>{geometry.output_channels, in, geometry.kernel};
+        geometry.transpose ? std::vector<int>{geometry.input_channels, output_channels, geometry.kernel}
+                           : std::vector<int>{geometry.output_channels, input_channels, geometry.kernel};
     if (entry.shape != expected)
         throw std::invalid_argument("convolution checkpoint/configuration mismatch: " + prefix);
-    std::vector<char> packed(entry.size);
-    size_t element_bytes = bytes(entry.type);
-    for (int group = 0; group < geometry.groups; ++group)
-        for (int tap = 0; tap < geometry.kernel; ++tap)
-            for (int o = 0; o < out; ++o)
-                for (int i = 0; i < in; ++i) {
-                    size_t source =
-                        geometry.transpose
-                            ? (size_t(group * in + i) * out + o) * geometry.kernel + tap
-                            : (size_t(group * out + o) * in + i) * geometry.kernel + tap;
-                    size_t dest = ((size_t(group) * geometry.kernel + tap) * out + o) * in + i;
-                    std::memcpy(packed.data() + dest * element_bytes,
-                                static_cast<const char *>(entry.data) + source * element_bytes,
-                                element_bytes);
-                }
-    weight_ = weights.custom(prefix + ".packed", packed.data(),
-                             geometry.kernel * geometry.output_channels, in, entry.type);
+    weight_ = load_convolution_weight(weights, prefix, geometry.transpose, geometry.groups);
     if (bias_.data && (bias_.numel() != size_t(geometry.output_channels) || bias_.type != type()))
         throw std::invalid_argument("convolution bias mismatch: " + prefix);
 }

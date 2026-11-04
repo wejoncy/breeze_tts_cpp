@@ -4,6 +4,9 @@
 #include "core/forward_batch.h"
 
 namespace tts {
+// Load-time checkpoint layout -> [group, phase, tap, output, input].
+TensorView load_convolution_weight(Weights &, const std::string &name, bool transpose = false,
+                                   int groups = 1, int phases = 1);
 // All activations are [batch * time, channels]. Weights are explicitly packed
 // once at load; execution projects directly from strided channel groups.
 class Convolution {

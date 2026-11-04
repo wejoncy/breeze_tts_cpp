@@ -21,11 +21,8 @@ class ExecutionResources {
         graphs_.clear();
         arena_.reserve(bytes);
     }
-    ScratchAllocator &workspace() {
-        return arena_;
-    }
-    ScratchScope lease_workspace() {
-        return ScratchScope(arena_);
+    Tensor::Scope lease_workspace() {
+        return Tensor::Scope(arena_);
     }
     void seal() {
         graphs_.seal();

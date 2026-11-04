@@ -1,4 +1,5 @@
 #pragma once
+#include "core/buffer.h"
 #include "core/tensor_storage.h"
 
 namespace tts {
@@ -21,9 +22,9 @@ class Spectrogram {
   public:
     struct Workspace {
         Buffer frames, spectrum, magnitude, mel;
-        explicit Workspace(const Spectrogram &, BufferAllocator *);
+        explicit Workspace(const Spectrogram &);
     };
-    Spectrogram(BufferAllocator &, SpectrogramConfig, int max_frames);
+    Spectrogram(SpectrogramConfig, int max_frames, Device device);
     int frames(int samples) const;
     int output_channels() const {
         return config_.mel_channels ? config_.mel_channels : config_.fft / 2 + 1;

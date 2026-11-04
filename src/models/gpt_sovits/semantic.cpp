@@ -54,7 +54,7 @@ TensorView Semantic::forward(TensorInputs inputs, ForwardContext &context) const
     if (context.mode == ForwardContext::Prepare) {
         auto hidden_states = context.tensor({1, hidden()}, type());
         auto logits = context.tensor({1, head_.output_channels()}, type());
-        TransformerEncoder::Workspace workspace(transformer_, 1, 1, &context.storage, 1);
+        TransformerEncoder::Workspace workspace(transformer_, 1, 1, 1);
         if (hidden_states.data) {
             transformer_.prepare(workspace, context.max_rows);
             head_.prepare_range(hidden_states, logits, context.max_batch);
@@ -65,8 +65,7 @@ TensorView Semantic::forward(TensorInputs inputs, ForwardContext &context) const
                              .slice(0, context.batch.rows());
     auto logits = context.tensor({context.max_batch, head_.output_channels()}, type())
                       .slice(0, context.batch.batch());
-    TransformerEncoder::Workspace workspace(transformer_, context.max_batch, context.max_time,
-                                            &context.storage, context.max_rows);
+    TransformerEncoder::Workspace workspace(transformer_, context.max_batch, context.max_time, context.max_rows);
     auto attention = context.batch;
     auto final_states = hidden_states;
     if (!attention.is_decode()) {

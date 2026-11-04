@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/sampling.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include <cuda_fp16.h>

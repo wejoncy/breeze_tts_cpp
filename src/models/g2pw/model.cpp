@@ -5,7 +5,7 @@
 
 namespace tts {
 TensorView Pronunciation::forward(TensorInputs inputs, ForwardContext &context) const {
-    Workspace workspace(*this, context.max_rows, &context.storage);
+    Workspace workspace(*this, context.max_rows);
     auto labels = context.tensor({context.max_rows, 1}, Type::I32);
     if (context.mode == ForwardContext::Prepare && workspace.selected.data()) {
         prepare();
@@ -62,11 +62,11 @@ Pronunciation::Pronunciation(Weights &w, const std::string &prefix, const Json &
     }
     legal_ = w.custom(prefix + ".legal_pronunciations", legal.data(), chars, words, Type::I32);
 }
-Pronunciation::Workspace::Workspace(const Pronunciation &p, int time, BufferAllocator *allocator)
-    : bert(p.bert_, p.max_tokens_, time, allocator, time),
-      selected(size_t(time) * p.bert_.hidden() * bytes(p.bert_.type()), allocator),
-      logits(size_t(time) * p.classifier_.output_channels() * sizeof(float), allocator),
-      pos_logits(size_t(time) * p.pos_classifier_.output_channels() * sizeof(float), allocator),
+Pronunciation::Workspace::Workspace(const Pronunciation &p, int time)
+    : bert(p.bert_, p.max_tokens_, time, time),
+      selected(size_t(time) * p.bert_.hidden() * bytes(p.bert_.type())),
+      logits(size_t(time) * p.classifier_.output_channels() * sizeof(float)),
+      pos_logits(size_t(time) * p.pos_classifier_.output_channels() * sizeof(float)),
       max_time(time) {
     if (time > p.max_tokens_)
         throw std::invalid_argument("G2PW workspace exceeds configured token limit");

@@ -1,4 +1,4 @@
-#include "ops/cuda/backend.h"
+#include "runtime/cuda_context.h"
 #include "ops/pronunciation.h"
 #include "runtime/device.h"
 #include <cub/block/block_reduce.cuh>
