@@ -8,26 +8,38 @@ namespace tts {
 TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs inputs, ForwardContext &context) const {
     const int prefix_capacity = context.state["reference_mel"][0].rows;
     const int maximum_time = std::min(max_time_, prefix_capacity + context.max_time);
+    const int64_t maximum_rows = int64_t(context.max_batch) * maximum_time * 2;
+    if (maximum_rows < 1 || maximum_rows > INT32_MAX)
+        throw std::invalid_argument("flow row capacity exceeds tensor dimensions");
     auto output = context.tensor({context.max_batch * context.max_time, mel_channels_}, estimator_.type());
     TensorBatch result;
     if (context.mode != ForwardContext::Execute) {
-        context.for_each_shape("flow", [&](ForwardShape shape) {
+        auto evaluate = [&](ForwardShape shape, const ForwardContext &base) {
             Tensor::Scope scratch;
-            Workspace workspace(*this, shape.batch, shape.time);
-            advance(workspace, ForwardBatch(shape.batch, shape.time), sampling(), {}, context);
-        });
-        Tensor::Scope scratch;
-        Workspace workspace(*this, context.mode == ForwardContext::Prepare ? 1 : context.max_batch,
-                              context.mode == ForwardContext::Prepare ? 1 : maximum_time);
-        if (context.mode == ForwardContext::Prepare && workspace.noise.data())
-            estimator_.prepare(workspace.estimator,
-                workspace.noise.view(1, mel_channels_, estimator_.type()),
-                workspace.velocity.view(1, mel_channels_, estimator_.type()),
-                2 * context.max_batch * maximum_time);
+            auto invocation = base.with_sequence(SequenceLayout::uniform(shape.batch, shape.time));
+            invocation.max_rows = int(maximum_rows);
+            auto noise = invocation.tensor({shape.rows, mel_channels_}, estimator_.type());
+            auto prefixes = invocation.tensor({shape.batch, 1}, Type::I32);
+            auto parameters = sampling();
+            if (base.mode == ForwardContext::Plan || base.mode == ForwardContext::Prepare)
+                parameters.guidance = std::max(parameters.guidance, 1.f);
+            auto condition = estimator_.forward({}, invocation, parameters.guidance > 1.e-5f);
+            {
+                Tensor::Scope noise_inputs;
+                for (int field = 0; field < 2; ++field)
+                    Tensor::reserve(size_t(shape.batch) * sizeof(uint64_t));
+            }
+            advance(noise, condition, prefixes, invocation, parameters);
+            for (int field = 0; field < 3; ++field)
+                Tensor::reserve(size_t(shape.rows) * sizeof(void *));
+        };
+        context.for_each_shape("flow", [&](ForwardShape shape) { evaluate(shape, context); });
+        const bool preparing = context.mode == ForwardContext::Prepare;
+        const int batch = preparing ? 1 : context.max_batch, time = preparing ? 1 : maximum_time;
+        auto sizing = context;
+        sizing.mode = preparing ? ForwardContext::Prepare : ForwardContext::Plan;
+        evaluate({batch, time, batch * time}, sizing);
 
-        Tensor::reserve(size_t(context.max_batch) * maximum_time * 5 * sizeof(void *));
-        Tensor::reserve(size_t(context.max_batch) * maximum_time * sizeof(int));
-        Tensor::reserve(size_t(context.max_batch) * (sizeof(int) + 2 * sizeof(uint64_t)));
         std::vector<int> members(context.max_batch);
         std::iota(members.begin(), members.end(), 0);
         result.chunks.push_back({output, std::move(members), context.max_time});
@@ -73,7 +85,10 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
             throw std::invalid_argument("flow window exceeds its declared tensor capacity");
         auto destination = output.slice(written, int(members.size()) * frames);
         Tensor::Scope scratch;
-        Workspace workspace(*this, int(members.size()), time);
+        auto invocation = context.with_sequence(SequenceLayout::uniform(int(members.size()), time));
+        invocation.max_rows = int(maximum_rows);
+        auto noise = invocation.tensor({int(members.size()) * time, mel_channels_}, estimator_.type());
+        auto prefix_tensor = invocation.tensor({int(members.size()), 1}, Type::I32);
         DiT::Condition condition;
         std::vector<const void *> feature_rows, prompt_rows;
         std::vector<void *> history_rows, retained_features, value_rows;
@@ -112,23 +127,25 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
         auto upload = [&](const void *data, int rows, Type type) {
             return upload_metadata(context, data, {rows, 1}, type);
         };
-        condition.feature_rows = upload(feature_rows.data(), int(feature_rows.size()), Type::I64).ptr<const void *>();
-        condition.mel_rows = upload(mel_rows.data(), int(mel_rows.size()), Type::I32).ptr<int>();
+        condition.feature_rows = TensorView(feature_rows.data(), int(feature_rows.size()), 1, Type::I64);
+        condition.mel_rows = TensorView(mel_rows.data(), int(mel_rows.size()), 1, Type::I32);
         if (!retained_features.empty())
-            condition.retained_feature_rows = upload(retained_features.data(), int(retained_features.size()), Type::I64).ptr<void *>();
-        ops::upload_bytes(workspace.prefixes.view(int(prefixes.size()), 1, Type::I32).device,
-            workspace.prefixes.data(), prefixes.data(), prefixes.size() * sizeof(int));
-        const auto seed = upload(seeds.data(), int(seeds.size()), Type::I64);
-        const auto window = upload(windows.data(), int(windows.size()), Type::I64);
+            condition.retained_feature_rows = TensorView(retained_features.data(), int(retained_features.size()), 1, Type::I64);
+        ops::upload_bytes(prefix_tensor.device, prefix_tensor.data, prefixes.data(), prefixes.size() * sizeof(int));
         const auto parameters = sampling(steps, guidance);
-        ForwardBatch batch_input(int(members.size()), time);
-        prepare(workspace, condition, batch_input, parameters);
-        initialize(workspace, batch_input, workspace.prefixes.ptr<int>(), seed.ptr<uint64_t>(), window.ptr<uint64_t>());
+        auto conditioned = estimator_.forward(condition, invocation, parameters.guidance > 1.e-5f);
+        {
+            Tensor::Scope noise_inputs;
+            const auto seed = upload(seeds.data(), int(seeds.size()), Type::I64);
+            const auto window = upload(windows.data(), int(windows.size()), Type::I64);
+            ops::gaussian_noise(noise, time, prefix_tensor.ptr<int>(), seed.ptr<uint64_t>(), window.ptr<uint64_t>(), temperature_);
+        }
+        auto velocity = advance(noise, conditioned, prefix_tensor, invocation, parameters);
         ops::EulerOutput target{destination, prefix - left, frames, minimum_, maximum_,
             upload(prompt_rows.data(), int(prompt_rows.size()), Type::I64).ptr<const void *>(),
             upload(history_rows.data(), int(history_rows.size()), Type::I64).ptr<void *>(),
             value_rows.empty() ? nullptr : upload(value_rows.data(), int(value_rows.size()), Type::I64).ptr<void *>()};
-        advance(workspace, batch_input, parameters, target, context);
+        update(noise, velocity, prefix_tensor, time, parameters, target);
         if (defer_audio) deferred();
         else result.chunks.push_back({destination, members, frames});
         written += int(members.size()) * frames;

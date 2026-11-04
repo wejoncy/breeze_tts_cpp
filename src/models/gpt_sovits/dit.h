@@ -27,23 +27,16 @@ class DiT {
     TensorView text_positions_, rotary_;
     Tensor final_time_modulation_;
     std::map<int, int> sampling_offsets_;
+    int quant_input_channels_ = 0;
 
   public:
-    struct Workspace {
-        Linear::Workspace linear;
-        Buffer condition, negative_condition, x, normalized, update, qkv, attended, expanded;
-        Buffer text, text_update, text_expanded, statistics, convolution, lse;
-        int max_batch, max_time;
-        Workspace(const DiT &, int batch, int time);
-    };
     struct Condition {
         TensorView features;
-        const void *const *feature_rows = nullptr;
-        // Project independent prompt spans into the shared workspace. The row
+        TensorView feature_rows;
+        // Project independent prompt spans into the condition tensor. The row
         // indices select their projected rows; -1 is an unconditioned target.
         std::vector<TensorView> mel;
-        const int *mel_rows = nullptr;
-        void *const *retained_feature_rows = nullptr;
+        TensorView mel_rows, retained_feature_rows;
     };
     DiT(Weights &, const std::string &prefix, const Json &, int max_time);
     Type type() const {
@@ -53,13 +46,10 @@ class DiT {
         return steps_;
     }
     bool supports_steps(int steps) const { return sampling_offsets_.count(steps) != 0; }
-    void prepare(Workspace &, TensorView mel_input, TensorView mel_output,
-                 int max_rows) const;
-    void prepare_condition(Workspace &, const Condition &, const ForwardBatch &,
-                           bool negative) const;
+    TensorView forward(const Condition &, ForwardContext &, bool negative) const;
     // Velocity may contain a second batch for the unconditional CFG branch.
     // Both branches consume the same noise directly; no concatenation is needed.
-    void forward(Workspace &, TensorView noisy_mel, TensorView velocity, const ForwardBatch &,
-                 int step, int steps) const;
+    TensorView forward(TensorView noisy_mel, TensorView condition, TensorView velocity,
+                        ForwardContext &, int step, int steps) const;
 };
 } // namespace tts

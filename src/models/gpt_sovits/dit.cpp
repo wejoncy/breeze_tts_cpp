@@ -85,6 +85,14 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
     }
     if (blocks_.empty())
         throw std::invalid_argument("empty DiT");
+    for (const auto &block : blocks_)
+        for (const auto *layer : {&block.qkv, &block.up, &block.down})
+            if (layer->is_quantized())
+                quant_input_channels_ = std::max(quant_input_channels_, layer->input_channels());
+    for (const auto &block : text_blocks_)
+        for (const auto *layer : {&block.up, &block.down})
+            if (layer->is_quantized())
+                quant_input_channels_ = std::max(quant_input_channels_, layer->input_channels());
     text_positions_ = w.generated(root + ".text_positions", positions(max_time, text_channels_),
                                   max_time, text_channels_, type_);
     // Upstream rotates the first head_dim features before reshaping into heads.
@@ -148,231 +156,221 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
         }
     });
 }
-DiT::Workspace::Workspace(const DiT &d, int batch, int time)
-    : max_batch(batch), max_time(time) {
-    if (batch < 1 || time < 1)
-        throw std::invalid_argument("invalid DiT workspace");
-    size_t rows = size_t(batch) * time;
-    auto tensor = [&](int width, Type type) {
-        return Buffer(rows * width * bytes(type));
+TensorView DiT::forward(const Condition &condition, ForwardContext &context,
+                        bool need_negative) const {
+    const int batch = context.batch.batch(), time = context.batch.time();
+    const int rows = context.batch.rows(), branches = need_negative ? 2 : 1;
+    if (batch < 1 || time < 1 || rows != int64_t(batch) * time || rows > INT32_MAX / branches)
+        throw std::invalid_argument("invalid DiT conditioning dimensions");
+    auto output = context.tensor({rows * branches, hidden_}, type_);
+    const auto positive = output.slice(0, rows);
+    const auto negative = need_negative ? output.slice(rows, rows) : TensorView{};
+    Tensor::Scope scratch;
+    auto text = context.tensor({rows, text_channels_}, type_);
+    Buffer update_storage(size_t(rows) * std::max(text_channels_, hidden_) * bytes(type_));
+    auto update = update_storage.view(rows, text_channels_, type_);
+    const int expanded_width = text_blocks_.empty() ? text_channels_
+                                                   : text_blocks_.front().up.output_channels();
+    Buffer expanded_storage(size_t(rows) * expanded_width * bytes(type_));
+    Buffer statistics(size_t(batch) * expanded_width * sizeof(float));
+    Linear::Workspace linear(rows, quant_input_channels_);
+    auto upload_rows = [&](TensorView source, Type type) {
+        auto destination = context.tensor({rows, 1}, type);
+        if (context.mode == ForwardContext::Execute && source.numel()) {
+            if (source.rows != rows || source.cols != 1 || source.type != type ||
+                source.device != -1 || !source.dense())
+                throw std::invalid_argument("invalid DiT conditioning row metadata");
+            ops::upload_bytes(destination.device, destination.data, source.data, source.size());
+        }
+        return source.numel() ? destination : TensorView{};
     };
-    condition = tensor(d.hidden_, d.type_);
-    negative_condition = tensor(d.hidden_, d.type_);
-    x = tensor(d.hidden_, d.type_);
-    normalized = tensor(d.hidden_, d.type_);
-    update = tensor(d.hidden_, d.type_);
-    qkv = tensor(3 * d.hidden_, d.type_);
-    attended = tensor(d.hidden_, d.type_);
-    int expanded_width = d.blocks_.front().up.output_channels();
-    expanded = tensor(expanded_width, d.type_);
-    text = tensor(d.text_channels_, d.type_);
-    text_update = tensor(d.text_channels_, d.type_);
-    int text_width =
-        d.text_blocks_.empty() ? d.text_channels_ : d.text_blocks_.front().up.output_channels();
-    text_expanded = tensor(text_width, d.type_);
-    statistics = Buffer(size_t(batch) * text_width * sizeof(float));
-    lse = Buffer(rows * d.heads_ * sizeof(float));
-    size_t projection = 0;
-    for (const auto &c : d.position_convs_)
-        projection = std::max(projection, c.workspace_bytes(batch, time));
-    convolution = Buffer(projection);
-    int quant_input = 0;
-    auto consider = [&](const Linear &layer) {
-        if (layer.is_quantized()) quant_input = std::max(quant_input, layer.input_channels());
-    };
-    for (const auto &block : d.blocks_)
-        for (const auto *layer : {&block.qkv, &block.up, &block.down}) consider(*layer);
-    for (const auto &block : d.text_blocks_)
-        for (const auto *layer : {&block.up, &block.down}) consider(*layer);
-    if (rows > INT32_MAX) throw std::invalid_argument("DiT row capacity exceeds tensor dimensions");
-    linear = Linear::Workspace(int(rows), quant_input);
-}
-void DiT::prepare(Workspace &w, TensorView mel_input, TensorView mel_output,
-                  int max_rows) const {
-
-    if (max_rows < 1)
-        throw std::invalid_argument("invalid DiT planning capacity");
-    for (const auto &c : position_convs_)
-        if (c.workspace_bytes(1, 1))
-            c.prepare(w.x.view(1, c.geometry().input_channels, c.type()),
-                      w.convolution.view(1, c.geometry().kernel * c.geometry().output_channels,
-                                         Type::F32), max_rows);
-    auto prepare = [&](const Linear &layer, Buffer &input, Buffer &output,
-                       ops::Activation activation = ops::Activation::Identity) {
-        layer.prepare_range(input.view(1, layer.input_channels(), type_),
-                            output.view(1, layer.output_channels(), type_), max_rows, activation);
-    };
-    prepare(text_projection_, w.text, w.condition);
-    auto projected = w.update.view(1, hidden_, type_);
-    condition_projection_.prepare_range(mel_input, projected, max_rows);
-    ops::prepare_matmul(mel_input, condition_projection_.dense_weight(), projected, false, 1, 1,
-                       1, max_rows);
-    noise_projection_.prepare_range(mel_input, projected, max_rows);
-    output_.prepare_range(w.normalized.view(1, hidden_, type_), mel_output, max_rows);
-    for (const auto &block : blocks_) {
-        prepare(block.qkv, w.normalized, w.qkv);
-        prepare(block.out, w.attended, w.update);
-        prepare(block.up, w.normalized, w.expanded, ops::Activation::GeluTanh);
-        prepare(block.down, w.expanded, w.update);
+    auto feature_rows = upload_rows(condition.feature_rows, Type::I64);
+    auto mel_row_map = upload_rows(condition.mel_rows, Type::I32);
+    auto retained_feature_rows = upload_rows(condition.retained_feature_rows, Type::I64);
+    if (context.mode == ForwardContext::Prepare && output.data) {
+        text_projection_.prepare_range(text.slice(0), positive.slice(0), context.max_rows);
+        auto mel = context.tensor({1, mel_channels_}, type_);
+        auto projected = update_storage.view(1, hidden_, type_);
+        condition_projection_.prepare_range(mel, projected, context.max_rows);
+        ops::prepare_matmul(mel, condition_projection_.dense_weight(), projected, false, 1, 1,
+                           1, context.max_rows);
+        for (const auto &block : text_blocks_) {
+            auto expanded = expanded_storage.view(1, block.up.output_channels(), type_);
+            block.up.prepare_range(update.slice(0), expanded, context.max_rows);
+            block.down.prepare_range(expanded, update.slice(0), context.max_rows);
+        }
     }
-    for (const auto &block : text_blocks_) {
-        prepare(block.up, w.text_update, w.text_expanded);
-        prepare(block.down, w.text_expanded, w.text_update);
-    }
-}
-void DiT::prepare_condition(Workspace &w, const Condition &c, const ForwardBatch &input,
-                            bool need_negative) const {
-
-    int batch = input.batch(), time = input.time();
-    if (batch < 1 || batch > w.max_batch || time < 1 || time > w.max_time ||
-        (!c.feature_rows && (c.features.rows != batch * time || c.features.cols != text_channels_ ||
-                             c.features.type != type_)))
-        throw std::invalid_argument("DiT condition exceeds initialized workspace");
-    int rows = batch * time;
+    if (context.mode != ForwardContext::Execute) return output;
+    if (!condition.feature_rows.numel() && (condition.features.rows != rows ||
+        condition.features.cols != text_channels_ || condition.features.type != type_))
+        throw std::invalid_argument("invalid DiT feature condition");
     int mel_rows = 0;
-    for (auto mel : c.mel) {
+    for (auto mel : condition.mel) {
         if (mel.cols != mel_channels_ || mel.type != type_ || mel.rows > rows - mel_rows)
             throw std::invalid_argument("invalid DiT mel condition span");
         mel_rows += mel.rows;
     }
-    if (!mel_rows || (!c.mel_rows && mel_rows != rows))
+    if (!mel_rows || (!condition.mel_rows.numel() && mel_rows != rows))
         throw std::invalid_argument("invalid DiT mel condition rows");
-    auto text = w.text.view(rows, text_channels_, type_);
-    auto update = w.text_update.view(rows, text_channels_, type_);
-    ops::positional_add( c.features, text, text_positions_, time, 0, {}, c.feature_rows,
-                        c.retained_feature_rows);
-    for (const auto &b : text_blocks_) {
-        b.depthwise.forward(text, update, ForwardBatch{batch, time}, {});
-        auto expanded = w.text_expanded.view(rows, b.up.output_channels(), type_);
+    ops::positional_add( condition.features, text, text_positions_, time, 0, {}, feature_rows.ptr<const void *>(),
+                        retained_feature_rows.ptr<void *>());
+    for (const auto &block : text_blocks_) {
+        block.depthwise.forward(text, update, ForwardBatch{batch, time}, {});
+        auto expanded = expanded_storage.view(rows, block.up.output_channels(), type_);
         ops::Epilogue activation;
         activation.activation = ops::Activation::Gelu;
-        if (!b.up.normalized_forward(w.linear, update,
-                                      b.up.is_quantized() ? TensorView{} : update, expanded,
-                                      b.norm, b.norm_bias, 1.e-6f, {}, activation)) {
-            ops::layer_norm( update, update, b.norm, b.norm_bias, 1.e-6f);
-            b.up.forward(w.linear, update, expanded, activation);
+        if (!block.up.normalized_forward(linear, update,
+                                      block.up.is_quantized() ? TensorView{} : update, expanded,
+                                      block.norm, block.norm_bias, 1.e-6f, {}, activation)) {
+            ops::layer_norm( update, update, block.norm, block.norm_bias, 1.e-6f);
+            block.up.forward(linear, update, expanded, activation);
         }
-        ops::global_response_norm( expanded, expanded, b.gamma, b.beta, batch, time,
-                                  w.statistics.view(batch, expanded.cols, Type::F32));
+        ops::global_response_norm( expanded, expanded, block.gamma, block.beta, batch, time,
+                                  statistics.view(batch, expanded.cols, Type::F32));
         ops::Epilogue residual;
         residual.residual = text;
-        b.down.project(w.linear, expanded, update);
-        residual.bias = b.down.bias();
+        block.down.project(linear, expanded, update);
+        residual.bias = block.down.bias();
         ops::pointwise(update, text, residual);
     }
-    auto positive = w.condition.view(rows, hidden_, type_);
-    auto negative = w.negative_condition.view(rows, hidden_, type_);
     if (need_negative)
         text_projection_.forward(text, negative);
-    if (!c.mel_rows) {
+    if (!mel_row_map.data) {
         text_projection_.forward(text, positive);
         int offset = 0;
-        for (auto mel : c.mel) {
+        for (auto mel : condition.mel) {
             ops::matmul(mel, condition_projection_.dense_weight(), positive.slice(offset, mel.rows), false,
                        1.f);
             offset += mel.rows;
         }
     } else {
-        auto projected = w.update.view(mel_rows, hidden_, type_);
+        auto projected = update_storage.view(mel_rows, hidden_, type_);
         int offset = 0;
-        for (auto mel : c.mel) {
+        for (auto mel : condition.mel) {
             condition_projection_.project(mel, projected.slice(offset, mel.rows));
             offset += mel.rows;
         }
-        ops::Epilogue e;
-        e.residual = projected;
-        e.residual_rows = c.mel_rows;
-        text_projection_.forward(text, positive, e);
+        ops::Epilogue epilogue;
+        epilogue.residual = projected;
+        epilogue.residual_rows = mel_row_map.ptr<int>();
+        text_projection_.forward(text, positive, epilogue);
     }
+    return output;
 }
-void DiT::forward(Workspace &w, TensorView noise, TensorView velocity, const ForwardBatch &input,
-                  int step, int steps) const {
-
-    int batch = input.batch(), time = input.time();
-    int branches = noise.rows > 0 ? velocity.rows / noise.rows : 0;
-    if (batch < 1 || batch > w.max_batch || time < 1 || time > w.max_time || step < 0 ||
-        step >= steps || !supports_steps(steps) || noise.rows != int64_t(batch) * time || noise.cols != mel_channels_ ||
-        (branches != 1 && branches != 2) || velocity.rows != int64_t(noise.rows) * branches ||
-        batch > w.max_batch / branches || velocity.cols != mel_channels_ || noise.type != type_ ||
-        velocity.type != type_)
-        throw std::invalid_argument("DiT execution exceeds initialized workspace");
-    int time_index = sampling_offsets_.at(steps) + step;
-    int input_rows = batch * time;
-    batch *= branches;
-    int rows = batch * time;
-    auto x = w.x.view(rows, hidden_, type_), norm = w.normalized.view(rows, hidden_, type_);
-    auto update = w.update.view(rows, hidden_, type_), qkv = w.qkv.view(rows, 3 * hidden_, type_);
-    auto attended = w.attended.view(rows, hidden_, type_);
-    ops::Epilogue e;
+TensorView DiT::forward(TensorView noise, TensorView condition, TensorView velocity,
+                        ForwardContext &context, int step, int steps) const {
+    const int batch = context.batch.batch(), time = context.batch.time();
+    const int input_rows = context.batch.rows();
+    const int branches = input_rows > 0 ? velocity.rows / input_rows : 0;
+    if (batch < 1 || time < 1 || step < 0 || step >= steps || !supports_steps(steps) ||
+        input_rows != int64_t(batch) * time || noise.rows != input_rows || noise.cols != mel_channels_ ||
+        (branches != 1 && branches != 2) || velocity.rows != int64_t(input_rows) * branches ||
+        velocity.cols != mel_channels_ || noise.type != type_ || velocity.type != type_ ||
+        condition.rows != velocity.rows || condition.cols != hidden_ || condition.type != type_)
+        throw std::invalid_argument("invalid DiT forward dimensions");
+    const int rows = velocity.rows, effective_batch = batch * branches;
+    Tensor::Scope scratch;
+    auto hidden_states = context.tensor({rows, hidden_}, type_);
+    auto normalized = context.tensor({rows, hidden_}, type_);
+    auto update = context.tensor({rows, hidden_}, type_);
+    auto projected_qkv = context.tensor({rows, 3 * hidden_}, type_);
+    auto attended = context.tensor({rows, hidden_}, type_);
+    Buffer expanded_storage(size_t(rows) * blocks_.front().up.output_channels() * bytes(type_));
+    auto lse = context.tensor({rows, heads_}, Type::F32);
+    size_t convolution_bytes = 0;
+    for (const auto &convolution : position_convs_)
+        convolution_bytes = std::max(convolution_bytes, convolution.workspace_bytes(effective_batch, time));
+    Buffer convolution_storage(convolution_bytes);
+    Linear::Workspace linear(rows, quant_input_channels_);
+    if (context.mode == ForwardContext::Prepare && velocity.data) {
+        for (const auto &convolution : position_convs_)
+            if (convolution.workspace_bytes(1, 1))
+                convolution.prepare(hidden_states.slice(0),
+                    convolution_storage.view(1, convolution.geometry().kernel * hidden_, Type::F32),
+                    context.max_rows);
+        noise_projection_.prepare_range(noise.slice(0), update.slice(0), context.max_rows);
+        output_.prepare_range(normalized.slice(0), velocity.slice(0), context.max_rows);
+        for (const auto &block : blocks_) {
+            auto expanded = expanded_storage.view(1, block.up.output_channels(), type_);
+            block.qkv.prepare_range(normalized.slice(0), projected_qkv.slice(0), context.max_rows);
+            block.out.prepare_range(attended.slice(0), update.slice(0), context.max_rows);
+            block.up.prepare_range(normalized.slice(0), expanded, context.max_rows, ops::Activation::GeluTanh);
+            block.down.prepare_range(expanded, update.slice(0), context.max_rows);
+        }
+    }
+    if (context.mode != ForwardContext::Execute) return velocity;
+    const int time_index = sampling_offsets_.at(steps) + step;
+    ops::Epilogue epilogue;
     auto projected = update.slice(0, input_rows);
     noise_projection_.project(noise, projected);
     for (int branch = 0; branch < branches; ++branch) {
-        e.residual = (branch ? w.negative_condition : w.condition).view(input_rows, hidden_, type_);
-        ops::pointwise( projected, x.slice(branch * input_rows, input_rows), e);
+        epilogue.residual = (branch ? condition.slice(input_rows, input_rows) : condition.slice(0, input_rows));
+        ops::pointwise( projected, hidden_states.slice(branch * input_rows, input_rows), epilogue);
     }
-    e = {};
-    e.activation = ops::Activation::Mish;
-    for (size_t i = 0; i < position_convs_.size(); ++i) {
-        const auto &c = position_convs_[i];
-        c.forward(i ? norm : x, i ? update : norm, ForwardBatch{batch, time},
-                  w.convolution.view(rows, c.geometry().kernel * hidden_, Type::F32), e);
+    epilogue = {};
+    epilogue.activation = ops::Activation::Mish;
+    for (size_t index = 0; index < position_convs_.size(); ++index) {
+        const auto &convolution = position_convs_[index];
+        convolution.forward(index ? normalized : hidden_states, index ? update : normalized, ForwardBatch{effective_batch, time},
+                  convolution_storage.view(rows, convolution.geometry().kernel * hidden_, Type::F32), epilogue);
     }
-    // Keep each residual update in its projection buffer until the next norm.
-    // That norm also materializes x for the following attention residual.
-    ops::NormFusion pending;
-    pending.residual = x;
-    pending.rows_per_sequence = time;
-    for (const auto &b : blocks_) {
-        auto mod = b.time_modulation.view().slice(time_index);
-        auto part = [&](int i) { return mod.columns(i * hidden_, hidden_); };
-        auto f = pending;
-        f.raw = x;
-        f.shift = part(0);
-        f.scale = part(1);
-        if (b.qkv.is_quantized()) {
-            auto input = b.qkv.normalize_input(w.linear, update, {}, {}, 1.e-6f, f);
-            b.qkv.project(input, qkv);
+    // Keep each residual update in its projection buffer until the next normalization.
+    // That normalization also materializes hidden_states for the following attention residual.
+    ops::NormFusion pending_fusion;
+    pending_fusion.residual = hidden_states;
+    pending_fusion.rows_per_sequence = time;
+    for (const auto &block : blocks_) {
+        auto mod = block.time_modulation.view().slice(time_index);
+        auto part = [&](int index) { return mod.columns(index * hidden_, hidden_); };
+        auto fusion = pending_fusion;
+        fusion.raw = hidden_states;
+        fusion.shift = part(0);
+        fusion.scale = part(1);
+        if (block.qkv.is_quantized()) {
+            auto input = block.qkv.normalize_input(linear, update, {}, {}, 1.e-6f, fusion);
+            block.qkv.project(input, projected_qkv);
         } else {
-            ops::layer_norm( update, norm, {}, {}, 1.e-6f, f);
-            b.qkv.project(w.linear, norm, qkv);
+            ops::layer_norm( update, normalized, {}, {}, 1.e-6f, fusion);
+            block.qkv.project(linear, normalized, projected_qkv);
         }
-        ops::qkv_rotary( qkv, b.qkv.bias(), rotary_, time, heads_, head_dim_, head_dim_,
+        ops::qkv_rotary( projected_qkv, block.qkv.bias(), rotary_, time, heads_, head_dim_, head_dim_,
                         false);
-        dense_attention( qkv.columns(0, hidden_), qkv.columns(hidden_, hidden_),
-                    qkv.columns(2 * hidden_, hidden_), attended, w.lse.ptr<float>(), batch, time,
+        dense_attention( projected_qkv.columns(0, hidden_), projected_qkv.columns(hidden_, hidden_),
+                    projected_qkv.columns(2 * hidden_, hidden_), attended, lse.ptr<float>(), effective_batch, time,
                     time, heads_, head_dim_);
-        b.out.project(attended, update);
-        f.residual = x;
-        f.raw = x;
-        f.gate = part(2);
-        f.projection_bias = b.out.bias();
-        f.shift = part(3);
-        f.scale = part(4);
-        auto expanded = w.expanded.view(rows, b.up.output_channels(), type_);
-        e = {};
-        e.activation = ops::Activation::GeluTanh;
-        auto down_input = b.down.is_quantized() ? b.down.quantized_view(w.linear, rows)
+        block.out.project(attended, update);
+        fusion.residual = hidden_states;
+        fusion.raw = hidden_states;
+        fusion.gate = part(2);
+        fusion.projection_bias = block.out.bias();
+        fusion.shift = part(3);
+        fusion.scale = part(4);
+        auto expanded = expanded_storage.view(rows, block.up.output_channels(), type_);
+        epilogue = {};
+        epilogue.activation = ops::Activation::GeluTanh;
+        auto down_input = block.down.is_quantized() ? block.down.quantized_view(linear, rows)
                                                 : RowScaledView{};
-        if (!b.up.normalized_forward(w.linear, update,
-                                      b.up.is_quantized() ? TensorView{} : norm, expanded,
-                                      {}, {}, 1.e-6f, f, e,
+        if (!block.up.normalized_forward(linear, update,
+                                      block.up.is_quantized() ? TensorView{} : normalized, expanded,
+                                      {}, {}, 1.e-6f, fusion, epilogue,
                                       nullptr, down_input)) {
-            ops::layer_norm( update, norm, {}, {}, 1.e-6f, f);
-            b.up.forward(w.linear, norm, expanded, e, down_input);
+            ops::layer_norm( update, normalized, {}, {}, 1.e-6f, fusion);
+            block.up.forward(linear, normalized, expanded, epilogue, down_input);
         }
         // The next normalization consumes this projection with its residual.
-        if (b.down.is_quantized())
-            b.down.project(down_input, update);
+        if (block.down.is_quantized())
+            block.down.project(down_input, update);
         else
-            b.down.project(w.linear, expanded, update);
-        pending.projection_bias = b.down.bias();
-        pending.gate = part(5);
+            block.down.project(linear, expanded, update);
+        pending_fusion.projection_bias = block.down.bias();
+        pending_fusion.gate = part(5);
     }
     auto mod = final_time_modulation_.view().slice(time_index);
-    auto f = pending;
-    f.scale = mod.columns(0, hidden_);
-    f.shift = mod.columns(hidden_, hidden_);
-    ops::layer_norm( update, norm, {}, {}, 1.e-6f, f);
-    output_.forward(norm, velocity);
+    auto fusion = pending_fusion;
+    fusion.scale = mod.columns(0, hidden_);
+    fusion.shift = mod.columns(hidden_, hidden_);
+    ops::layer_norm( update, normalized, {}, {}, 1.e-6f, fusion);
+    output_.forward(normalized, velocity);
+    return velocity;
 }
 } // namespace tts
