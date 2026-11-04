@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include <functional>
 #include <memory>
+#include <utility>
 namespace tts {
 class BufferAllocator;
 class ScratchAllocator;
@@ -57,6 +58,9 @@ class Tensor {
     Tensor() = default;
     explicit Tensor(TensorShape shape, Type dtype = Type::F32, Device device = Device::cpu());
     explicit Tensor(TensorView source);
+    Tensor(Storage storage, TensorShape shape, Type dtype)
+        : storage_(std::make_shared<Storage>(std::move(storage))),
+          tensor_(storage_->view(shape.rows, shape.cols, dtype)) {}
     static Tensor empty(TensorShape shape, Type dtype = Type::F32, Device device = Device::cpu()) {
         return Tensor(shape, dtype, device);
     }

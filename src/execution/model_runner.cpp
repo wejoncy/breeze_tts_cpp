@@ -134,7 +134,7 @@ struct ModelRunner::Impl {
     std::vector<State *> active_audio;
     StateBindings state_bindings(const std::vector<State *> &rows, int padded) const {
         StateBindings result;
-        const auto &prototype = runtime.states.rows().front()->views();
+        const auto &prototype = runtime.states.rows().front()->fields();
         result.values.reserve(prototype.size());
         result.fields.reserve(prototype.size());
         for (const auto &field : prototype) {
@@ -144,7 +144,7 @@ struct ModelRunner::Impl {
             for (int row = 0; row < padded; ++row) {
                 const auto &source = rows.empty() ? *runtime.states.rows().at(std::min<size_t>(row, capacity - 1))
                     : rows.at(std::min<size_t>(row, rows.size() - 1))->data;
-                values.push_back(source.views().at(field.first));
+                values.push_back(source.view(field.first));
             }
             result.fields.push_back({field.first, {values.data(), values.size()}});
         }
@@ -370,19 +370,22 @@ struct ModelRunner::Impl {
         state.cache.reset();
         state.cache = std::make_unique<PagedKVCache::Lease>(runtime.kv, input.lengths, input.capacities,
                                                           state.data["table"].ptr<int>());
-        for (auto name : {"codes", "done", "seen"}) runtime.memory.zero(state.data[name]);
+        for (auto name : {"codes", "done", "seen"}) {
+            auto tensor = state.data[name];
+            if (tensor.size()) ops::zero(tensor);
+        }
         state.options.seed = input.seed;
-        runtime.memory.upload(state.data["rng"].data(), &input.seed, sizeof(input.seed));
-        runtime.memory.upload(state.data["positions"].data(), input.lengths.data(), input.lengths.size() * sizeof(int));
+        runtime.memory.upload(state.data["rng"].data, &input.seed, sizeof(input.seed));
+        runtime.memory.upload(state.data["positions"].data, input.lengths.data(), input.lengths.size() * sizeof(int));
         for (const auto &field : input.initializers) {
-            auto &destination = state.data[field.name];
+            auto destination = state.data[field.name];
             if (field.value.size() > destination.size()) throw std::invalid_argument("initial state exceeds its declared capacity");
-            runtime.memory.upload(destination.data(), field.value.data, field.value.size());
+            runtime.memory.upload(destination.data, field.value.data, field.value.size());
         }
         for (const auto &address : input.input.addresses) {
             auto values = std::make_shared<Tensor>(Tensor::zeros({int(address.offsets.size()), 1}, Type::I64));
             auto *pointers = values->view().ptr<uint64_t>();
-            auto &buffer = state.data[address.state];
+            auto buffer = state.data[address.state];
             for (size_t row = 0; row < address.offsets.size(); ++row) {
                 const auto offset = address.offsets[row];
                 if (offset >= 0 && uint64_t(offset) >= buffer.size()) throw std::invalid_argument("state input address exceeds its field");
@@ -493,7 +496,8 @@ struct ModelRunner::Impl {
                             &audio_caches, &histories, &done, &counts, &positions})
             transfers += Tensor::aligned(buffer->size());
         for (const auto &row : runtime.states.rows())
-            for (const auto &field : row->fields()) transfers += Tensor::aligned(field.second.size());
+            for (const auto &field : row->fields())
+                if (!field.second.device().is_cpu()) transfers += Tensor::aligned(field.second.nbytes());
         runtime.memory.reserve_transfers(transfers);
         const size_t available = runtime.memory.available_bytes();
         const size_t budget = runtime_bytes ? runtime_bytes

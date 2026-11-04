@@ -19,9 +19,7 @@ class StatePool {
         std::vector<std::pair<std::string, SequenceStateSpec>> histories;
     };
     class Row {
-        std::map<std::string, Buffer, std::less<>> tensors_;
-        std::map<std::string, Tensor, std::less<>> host_;
-        std::map<std::string, TensorView, std::less<>> views_;
+        std::map<std::string, Tensor, std::less<>> tensors_;
         std::map<std::string, SequenceState, std::less<>> histories_;
 
       public:
@@ -29,33 +27,19 @@ class StatePool {
             for (const auto &field : layout.tensors) {
                 if (!field.shape.cols || field.shape.numel() > SIZE_MAX / bytes(field.type))
                     throw std::invalid_argument("persistent tensor shape/type mismatch: " + field.name);
-                const auto shape = field.shape;
-                TensorView view;
-                if (field.host) {
-                    auto tensor = host_.try_emplace(field.name, Tensor::zeros(shape, field.type));
-                    if (!tensor.second) throw std::invalid_argument("duplicate host state: " + field.name);
-                    view = tensor.first->second.view();
-                } else {
-                    auto tensor = tensors_.try_emplace(field.name, shape.numel() * bytes(field.type));
-                    if (!tensor.second) throw std::invalid_argument("duplicate persistent tensor: " + field.name);
-                    view = tensor.first->second.view(shape.rows, shape.cols, field.type);
-                }
-                if (!views_.emplace(field.name, view).second)
+                auto tensor = field.host ? Tensor::zeros(field.shape, field.type)
+                    : Tensor(Buffer(field.shape.numel() * bytes(field.type)), field.shape, field.type);
+                if (!tensors_.try_emplace(field.name, std::move(tensor)).second)
                     throw std::invalid_argument("duplicate persistent state: " + field.name);
             }
             for (const auto &field : layout.histories)
                 if (!histories_.try_emplace(field.first, field.second).second)
                     throw std::invalid_argument("duplicate persistent history: " + field.first);
         }
-        Buffer &operator[](std::string_view name) {
+        TensorView operator[](std::string_view name) const {
             auto field = tensors_.find(name);
-            if (field == tensors_.end()) throw std::out_of_range("unknown persistent tensor");
-            return field->second;
-        }
-        const Buffer &operator[](std::string_view name) const {
-            auto field = tensors_.find(name);
-            if (field == tensors_.end()) throw std::out_of_range("unknown persistent tensor");
-            return field->second;
+            if (field == tensors_.end() || field->second.device().is_cpu()) throw std::out_of_range("unknown persistent tensor");
+            return field->second.view();
         }
         SequenceState &history(std::string_view name) {
             auto field = histories_.find(name);
@@ -63,9 +47,13 @@ class StatePool {
             return field->second;
         }
         const auto &fields() const { return tensors_; }
-        const auto &views() const { return views_; }
+        TensorView view(std::string_view name) const {
+            auto field = tensors_.find(name);
+            if (field == tensors_.end()) throw std::out_of_range("unknown persistent state");
+            return field->second.view();
+        }
         void reset_host() {
-            for (auto &field : host_) {
+            for (const auto &field : tensors_) if (field.second.device().is_cpu()) {
                 const auto tensor = field.second.view();
                 if (tensor.size()) std::memset(tensor.data, 0, tensor.size());
             }
