@@ -9,7 +9,8 @@ and streaming PCM. Python is optional; native inference needs no PyTorch or mode
 Requires CMake 3.28+, a C++17 compiler, CUDA 13+, Rust/Cargo, Git, libsndfile and
 libsoxr. Rust is a build dependency only. CUDA/cuBLAS and audio libraries are
 found locally; [FetchContent](cmake/Dependencies.cmake) fetches pinned JSON,
-spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention and missing audio headers.
+spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention, cppjieba, fastText,
+Open JTalk/MeCab-Ko and missing audio headers.
 
 ```sh
 cmake -S . -B build -DTTS_BUILD_PYTHON=OFF
@@ -21,7 +22,7 @@ machine without a visible GPU, select the deployment architectures explicitly
 with `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS`. BF16 is the default.
 `--quantization int8` supports SM80+;
 `--quantization fp8` supports SM90+. Both use per-channel weights and dynamic
-per-token activations; FlashAttention and its Q/K/V/KV storage remain BF16.
+per-token activations; FlashAttention and its Q/K/V/KV storage keep the checkpoint's 16-bit dtype.
 Quantization speed and accuracy depend on the workload; FP8 is not always faster.
 
 On Windows, use an x64 MSVC developer shell, CUDA and the MSVC Rust toolchain.
