@@ -1,40 +1,25 @@
 #pragma once
-#include "io/weights.h"
+#include "layers/convolution.h"
 #include "core/forward_context.h"
 #include "models/mimi/config.h"
 namespace tts {
-struct EncoderConv {
-    TensorView weight, bias;
-    int in, out, kernel, stride, dilation;
-    bool replicate;
-    EncoderConv(Weights &, const std::string &, int stride = 1, bool replicate = false,
-                int dilation = 1);
-    EncoderConv(Weights &, const std::string &, TensorView bias, int stride = 1,
-                bool replicate = false, int dilation = 1);
-    int rows(int input) const {
-        return input / stride + (input % stride != 0);
-    }
-    void project(TensorView x, TensorView projected, int max_input_rows = 0) const;
-    void run(TensorView x, TensorView projected, TensorView out, bool elu = false,
-             TensorView residual = {}) const;
-};
 class AudioEncoder {
     struct Layer {
         TensorView pre, pre_bias, post, post_bias, qkv, out, fc1, fc2, attn_scale, mlp_scale;
     };
     struct Residual {
-        EncoderConv first, second;
+        CausalConvolution first, second;
         Residual(Weights &, const std::string &prefix, int index, int dilation);
     };
     struct Stage {
         std::vector<Residual> blocks;
-        EncoderConv down;
+        CausalConvolution down;
         Stage(Weights &, const std::string &prefix, int index, int ratio, const EncoderConfig &);
     };
     struct Storage;
     EncoderConfig config_;
-    EncoderConv first_, last_;
-    std::unique_ptr<EncoderConv> downsample_;
+    CausalConvolution first_, last_;
+    std::unique_ptr<CausalConvolution> downsample_;
     std::vector<Stage> stages_;
     std::vector<Layer> layers_;
     TensorView semantic_proj_, acoustic_proj_;
@@ -44,8 +29,9 @@ class AudioEncoder {
 
   public:
     AudioEncoder(Weights &, const std::string &prefix, EncoderConfig);
+    TensorView forward(TensorView waveform, ForwardContext &) const;
+  private:
     size_t workspace_bytes(int max_samples) const;
     void prepare(ForwardContext &, int max_samples) const;
-    TensorView forward(TensorView waveform, ForwardContext &) const;
 };
 } // namespace tts

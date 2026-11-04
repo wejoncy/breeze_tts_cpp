@@ -6,40 +6,6 @@
 #include <iterator>
 
 namespace tts {
-Codec::Conv::Conv(Weights &weights, const std::string &name, int dilation, int stride,
-           bool transpose, bool depthwise)
-    : dilation(dilation), stride(stride), transpose(transpose), depthwise(depthwise) {
-    const auto &entry = weights.entry(name + ".weight");
-    if (entry.type != Type::F32 || entry.shape.size() != 3 || entry.shape[0] < 1 || entry.shape[1] < 1 ||
-        entry.shape[2] < 1 || dilation < 1 || stride < 1 ||
-        (depthwise && (transpose || entry.shape[1] != 1)) || (transpose && entry.shape[2] < stride))
-        throw std::runtime_error("codec convolution requires F32");
-    kernel = entry.shape[2];
-    in = transpose ? entry.shape[0] : entry.shape[1];
-    out = transpose ? entry.shape[1] : entry.shape[0];
-    if (depthwise)
-        in = out;
-    bias = weights.get(name + ".bias");
-    if (bias.type != Type::F32 || bias.numel() != size_t(out))
-        throw std::invalid_argument("codec convolution bias mismatch: " + name);
-    if (depthwise) {
-        weight = weights.get(name + ".weight");
-        return;
-    }
-    // Project each incoming sample through all taps at once, then accumulate
-    // into the causal output ring. No input packing/zero insertion is needed.
-    weight = load_convolution_weight(weights, name, transpose);
-}
-void Codec::Conv::forward(TensorView input, TensorView output, TensorView projection,
-                           int batch, int time, const ConvHistory *histories) const {
-    if (depthwise) {
-        tts::depthwise(input, {}, weight, bias, output, batch, time, kernel, nullptr, histories);
-    } else {
-        ops::matmul(input, weight, projection);
-        tts::conv_accumulate(projection, {}, bias, output, batch, time, kernel, dilation,
-                             stride, transpose, nullptr, histories);
-    }
-}
 static TensorView codebook(Weights &weights, const std::string &prefix, int count, int entries,
                            int dimension) {
     std::vector<float> table(size_t(count) * entries * dimension);
@@ -79,7 +45,8 @@ Codec::Codec(Weights &w, const std::string &prefix, CodecConfig cfg)
                   bool dw = false) {
         Operation o{};
         o.kind = Operation::Convolution;
-        o.conv = std::make_unique<Conv>(w, root + name + ".conv", dilation, stride, trans, dw);
+        o.conv = std::make_unique<CausalConvolution>(w, root + name + ".conv",
+            CausalConvolution::Config{stride, dilation, trans, dw});
         ops_.push_back(std::move(o));
     };
     auto op = [&](Operation::Kind kind, std::string name = "", int save = 0) {
@@ -224,13 +191,14 @@ void Codec::forward(TensorInputs inputs, TensorOutputs outputs, ForwardContext &
     const bool execute = context.mode == ForwardContext::Execute;
     if (execute && (!code_rows || !histories || !cache || history_stride < batch))
         throw std::invalid_argument("codec requires runner-owned history and cache rows");
-    auto convolve = [&](const Conv &convolution, TensorView input, TensorView output,
+    auto convolve = [&](const CausalConvolution &convolution, TensorView input, TensorView output,
                         int time, int history_index) {
         if (!execute)
             return;
         auto projection = convolution.depthwise ? TensorView{} : workspace.convolution.view(
             batch * time, convolution.kernel * convolution.out, Type::F32);
-        convolution.forward(input, output, projection, batch, time, histories + history_index * history_stride);
+        convolution.forward(input, output, projection, ForwardBatch{batch, time},
+                            histories + history_index * history_stride);
     };
     auto first = workspace.activations[0].view(batch, config.codebook_dim, Type::F32);
     auto second = workspace.activations[1].view(batch, config.codebook_dim, Type::F32);

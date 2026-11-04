@@ -2,59 +2,15 @@
 #include "ops/basic.h"
 #include "models/mimi/encoder.h"
 #include "layers/convolution.h"
-#include "ops/audio_encoder.h"
 #include "ops/vector_quantization.h"
 #include <cmath>
 #include <algorithm>
 namespace tts {
-EncoderConv::EncoderConv(Weights &weights, const std::string &prefix, int stride, bool replicate, int dilation)
-    : EncoderConv(weights, prefix, weights.get(prefix + ".conv.bias"), stride, replicate, dilation) {}
-EncoderConv::EncoderConv(Weights &weights, const std::string &prefix, TensorView bias,
-                         int stride, bool replicate, int dilation)
-    : bias(bias), stride(stride), dilation(dilation), replicate(replicate) {
-    const auto &entry = weights.entry(prefix + ".conv.weight");
-    if (stride < 1 || dilation < 1 || (stride > 1 && dilation > 1) || entry.type != Type::F32 ||
-        entry.shape.size() != 3 || entry.shape[0] < 1 || entry.shape[1] < 1 || entry.shape[2] < 1 ||
-        entry.shape[2] % stride)
-        throw std::runtime_error("unsupported encoder convolution");
-    out = entry.shape[0];
-    in = entry.shape[1];
-    kernel = entry.shape[2];
-    if (kernel > INT32_MAX / out || int64_t(kernel - 1) * dilation >= INT32_MAX)
-        throw std::invalid_argument("encoder convolution indexing overflow");
-    if (bias.data && (bias.type != Type::F32 || bias.numel() != size_t(out)))
-        throw std::invalid_argument("encoder convolution bias shape: " + prefix);
-    weight = load_convolution_weight(weights, prefix + ".conv", false, 1, stride);
-}
-void EncoderConv::project(TensorView x, TensorView p, int max_input_rows) const {
-
-    const int input_rows = max_input_rows ? max_input_rows : x.rows, taps = kernel / stride;
-    for (int phase = 0; phase < stride && phase < input_rows; ++phase) {
-        int count = (input_rows - 1 - phase) / stride + 1;
-        auto input = x.every_rows(phase, stride, max_input_rows ? 1 : count);
-        auto output = p.columns(phase * taps * out, taps * out).slice(0, input.rows);
-        auto weights = weight.slice(phase * taps * out, taps * out);
-        if (max_input_rows) ops::prepare_matmul(input, weights, output, true, 0, 1, 1, count);
-        else ops::matmul(input, weights, output, true);
-    }
-}
-void EncoderConv::run(TensorView x, TensorView scratch, TensorView y, bool elu,
-                      TensorView residual) const {
-
-    const int n = rows(x.rows);
-    if (x.cols != in || y.rows != n || y.cols != out)
-        throw std::runtime_error("encoder convolution shape");
-    auto p = scratch.reshape({int(scratch.numel() / (kernel * out)), kernel * out}).slice(0, n);
-    project(x, p);
-    encoder_conv_finish( x, p, weight, bias, y, kernel, stride, replicate, elu, residual,
-                        dilation);
-}
 AudioEncoder::Residual::Residual(Weights &w, const std::string &prefix, int i, int dilation)
-    : first(w, prefix + ".encoder.layers." + std::to_string(i) + ".block.1", 1, false,
-            dilation),
-      second(w, prefix + ".encoder.layers." + std::to_string(i) + ".block.3") {}
+    : first(w, prefix + ".encoder.layers." + std::to_string(i) + ".block.1.conv", CausalConvolution::Config{1, dilation}),
+      second(w, prefix + ".encoder.layers." + std::to_string(i) + ".block.3.conv") {}
 AudioEncoder::Stage::Stage(Weights &w, const std::string &prefix, int i, int ratio, const EncoderConfig &c)
-    : down(w, prefix + ".encoder.layers." + std::to_string(i + c.residual_layers + 1), ratio) {
+    : down(w, prefix + ".encoder.layers." + std::to_string(i + c.residual_layers + 1) + ".conv", CausalConvolution::Config{ratio}) {
     int dilation = 1;
     for (int j = 0; j < c.residual_layers; ++j) {
         blocks.emplace_back(w, prefix, i + j, dilation);
@@ -73,10 +29,10 @@ AudioEncoder::Stage::Stage(Weights &w, const std::string &prefix, int i, int rat
         throw std::invalid_argument("encoder downsampling weight/configuration mismatch");
 }
 AudioEncoder::AudioEncoder(Weights &w, const std::string &prefix, EncoderConfig config)
-    : config_(std::move(config)), first_(w, prefix + ".encoder.layers.0"),
+    : config_(std::move(config)), first_(w, prefix + ".encoder.layers.0.conv"),
       // Mimi's ModuleList: first conv, (residual blocks, ELU, downconv)*stages, ELU, last conv.
       last_(w, prefix + ".encoder.layers." +
-                   std::to_string(2 + config_.ratios.size() * (config_.residual_layers + 2))),
+                   std::to_string(2 + config_.ratios.size() * (config_.residual_layers + 2)) + ".conv"),
       rope_storage_({config_.transformer.max_positions, config_.transformer.dim}, Type::F32,
                     w.device()) {
     const auto &c = config_.transformer;
@@ -94,8 +50,8 @@ AudioEncoder::AudioEncoder(Weights &w, const std::string &prefix, EncoderConfig 
     if (last_.in != channels)
         throw std::invalid_argument("encoder last convolution channel mismatch");
     if (config_.downsample_stride != 1) {
-        downsample_ = std::make_unique<EncoderConv>(w, prefix + ".downsample",
-                                                    TensorView{}, config_.downsample_stride, true);
+        downsample_ = std::make_unique<CausalConvolution>(w, prefix + ".downsample.conv",
+            CausalConvolution::Config{config_.downsample_stride, 1, false, false, true}, TensorView{});
         if (downsample_->in != c.hidden || downsample_->out != c.hidden ||
             downsample_->kernel != 2 * config_.downsample_stride)
             throw std::invalid_argument("encoder resampling weight/configuration mismatch");
@@ -173,7 +129,7 @@ struct AudioEncoder::Storage {
             samples / config.stride + (samples % config.stride != 0) > tr.max_positions)
             throw std::invalid_argument("reference audio is empty or exceeds encoder positions");
         size_t elements = size_t(samples) * model.first_.out, scratch = 0;
-        auto conv = [&](const EncoderConv &op, int rows) {
+        auto conv = [&](const CausalConvolution &op, int rows) {
             int n = op.rows(rows);
             elements = std::max({elements, size_t(rows) * op.in, size_t(n) * op.out});
             scratch = std::max(scratch, size_t(n) * op.kernel * op.out);
@@ -227,7 +183,7 @@ void AudioEncoder::prepare(ForwardContext &context, int max_samples) const {
         matrix(semantic_proj_, rows); matrix(acoustic_proj_, rows);
         for (auto table : tables_) matrix(table, rows);
     };
-    visit([&](const EncoderConv &conv, int) {
+    visit([&](const CausalConvolution &conv, int) {
         input_elements = std::max(input_elements, size_t(conv.stride) * conv.in);
         output_elements = std::max(output_elements, size_t(conv.kernel) * conv.out);
     }, [&](TensorView weight, int) {
@@ -242,8 +198,8 @@ void AudioEncoder::prepare(ForwardContext &context, int max_samples) const {
         Tensor::reserve(workspace_bytes(samples));
         return;
     }
-    visit([&](const EncoderConv &conv, int rows) {
-        conv.project(input.view(conv.stride, conv.in, Type::F32),
+    visit([&](const CausalConvolution &conv, int rows) {
+        conv.prepare(input.view(conv.stride, conv.in, Type::F32),
                         output.view(1, conv.kernel * conv.out, Type::F32), rows);
     }, [&](TensorView weight, int rows) {
         ops::prepare_matmul(input.view(1, weight.cols, Type::F32), weight,
@@ -272,34 +228,33 @@ TensorView AudioEncoder::forward(TensorView waveform, ForwardContext &context) c
     auto output_codes = codes.view(int(codes.size() / sizeof(int) / config_.codebooks),
                                    config_.codebooks, Type::I32);
     if (context.mode != ForwardContext::Execute) return output_codes;
-    auto workspace = [&](const EncoderConv &cv, int n) {
-        return projected.view(cv.rows(n), cv.kernel * cv.out, Type::F32);
+    const auto *projection_storage = &projected;
+    auto workspace = [&](const CausalConvolution &cv, int n) {
+        return projection_storage->view(cv.rows(n), cv.kernel * cv.out, Type::F32);
     };
     auto x = a.view(samples, first_.out, Type::F32);
-    encoder_first_conv(waveform, first_.weight,
-                       first_.bias, x, first_.kernel);
+    first_.forward(waveform, x, {});
     for (const auto &stage : stages_) {
         auto activated = b.view(x.rows, x.cols, Type::F32);
         ops::activation(x, activated, 3);
         for (size_t i = 0; i < stage.blocks.size(); ++i) {
             const auto &block = stage.blocks[i];
             auto mid = c.view(x.rows, block.first.out, Type::F32);
-            block.first.run(activated, workspace(block.first, x.rows), mid, true);
+            block.first.forward(activated, mid, workspace(block.first, x.rows), true);
             // Keep the residual unactivated until all residual blocks have consumed it.
             bool last = i + 1 == stage.blocks.size();
-            block.second.run(mid, workspace(block.second, mid.rows), last ? activated : x, last,
-                             x);
+            block.second.forward(mid, last ? activated : x, workspace(block.second, mid.rows), last, x);
             if (!last)
                 ops::activation(x, activated, 3);
         }
         auto next = a.view(stage.down.rows(x.rows), stage.down.out, Type::F32);
-        stage.down.run(activated, workspace(stage.down, x.rows), next);
+        stage.down.forward(activated, next, workspace(stage.down, x.rows));
         x = next;
     }
     auto act = b.view(x.rows, x.cols, Type::F32);
     ops::activation(x, act, 3);
     x = a.view(act.rows, last_.out, Type::F32);
-    last_.run(act, workspace(last_, act.rows), x);
+    last_.forward(act, x, workspace(last_, act.rows));
     auto norm = b.view(x.rows, cfg.hidden, Type::F32),
          update = c.view(x.rows, cfg.hidden, Type::F32);
     for (const auto &l : layers_) {
@@ -329,7 +284,7 @@ TensorView AudioEncoder::forward(TensorView waveform, ForwardContext &context) c
     auto down = x;
     if (downsample_) {
         down = b.view(downsample_->rows(x.rows), downsample_->out, Type::F32);
-        downsample_->run(x, workspace(*downsample_, x.rows), down);
+        downsample_->forward(x, down, workspace(*downsample_, x.rows));
     }
     auto r = residual.view(down.rows, config_.codebook_dim, Type::F32),
          sc = scores.view(down.rows, config_.codebook_size, Type::F32);
