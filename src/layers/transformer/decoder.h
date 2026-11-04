@@ -14,32 +14,33 @@ struct TransformerLayer {
         mlp_scale;
     RowScaledView qkv_quant, gateup_quant, down_quant;
 };
-struct TransformerState {
-    Buffer keys, values, normed, projected, query, attended, update, gateup, gated;
-    Buffer quant_values, quant_scales;
-    int batch, capacity, max_rows;
-    KVCacheView external_kv;
-    bool ring;
-    TransformerState(const TransformerConfig &c, int b, int cap, int rows,
-                     KVCacheView cache = {}, bool circular = false, bool owns_cache = true)
-        : keys((!owns_cache || cache.layout.block_table || cache.layout.sequences ||
-                cache.layout.key_pages)
-                   ? 0
-                   : size_t(c.layers) * b * cap * c.kvheads * c.dim * bytes(c.type)),
-          values(keys.size()),
-          normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
-          projected(size_t(rows) * (c.heads + 2 * c.kvheads) * c.dim * bytes(c.type)),
-          query(size_t(rows) * c.heads * c.dim * bytes(c.type)),
-          attended(query.size()), update(size_t(rows) * c.hidden * bytes(c.type)),
-          gateup(size_t(rows) * c.intermediate * 2 * bytes(c.type)),
-          gated(c.quantization != Quantization::None ? 0 : gateup.size() / 2),
-          quant_values(c.quantization != Quantization::None
-                           ? size_t(rows) * std::max(c.hidden, c.intermediate)
-                           : 0),
-          quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0),
-          batch(b), capacity(cap), max_rows(rows), external_kv(cache), ring(circular) {}
-};
 class Transformer {
+    struct Workspace {
+        Buffer keys, values, normed, projected, query, attended, update, gateup, gated;
+        Buffer quant_values, quant_scales;
+        int batch, capacity, max_rows;
+        bool ring;
+        Workspace(const TransformerConfig &c, int b, int cap, int rows,
+                         KVCacheView cache = {}, bool circular = false, bool owns_cache = true)
+            : keys((!owns_cache || cache.layout.block_table || cache.layout.sequences ||
+                    cache.layout.key_pages)
+                       ? 0
+                       : size_t(c.layers) * b * cap * c.kvheads * c.dim * bytes(c.type)),
+              values(keys.size()),
+              normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
+              projected(size_t(rows) * (c.heads + 2 * c.kvheads) * c.dim * bytes(c.type)),
+              query(size_t(rows) * c.heads * c.dim * bytes(c.type)),
+              attended(query.size()), update(size_t(rows) * c.hidden * bytes(c.type)),
+              gateup(size_t(rows) * c.intermediate * 2 * bytes(c.type)),
+              gated(c.quantization != Quantization::None ? 0 : gateup.size() / 2),
+              quant_values(c.quantization != Quantization::None
+                               ? size_t(rows) * std::max(c.hidden, c.intermediate)
+                               : 0),
+              quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0),
+              batch(b), capacity(cap), max_rows(rows), ring(circular) {}
+    };
+    friend class ResidualCodebooks;
+
   public:
     TransformerConfig config;
     std::vector<TransformerLayer> layers;
@@ -140,6 +141,24 @@ class Transformer {
                                         cfg.rope_low_wave, cfg.rope_high_wave);
         }
     }
+    TensorView forward(TensorView hidden_states, ForwardContext &context) const {
+        Tensor::Scope scratch;
+        if (context.mode == ForwardContext::Prepare) {
+            Workspace workspace(config, 1, 1, 1);
+            if (workspace.update.data()) {
+                ops::reserve_attention(hidden_states.device,
+                    size_t(context.max_batch) * context.max_time * config.heads);
+                prepare(workspace, context.max_rows);
+            }
+            return context.batch.output.numel() ? context.batch.output : hidden_states;
+        }
+        Workspace workspace(config, context.max_batch, context.max_time, context.max_rows, context.batch.cache,
+                             context.batch.cache.layout.ring, !context.batch.is_decode());
+        if (context.mode == ForwardContext::Execute)
+            forward(workspace, hidden_states, context.batch);
+        return context.batch.output.numel() ? context.batch.output : hidden_states;
+    }
+  private:
     void prepare_range(int max_rows) const {
         if (config.quantization == Quantization::None)
             return;
@@ -159,23 +178,7 @@ class Transformer {
               std::pair{2 * c.intermediate, c.hidden}, std::pair{c.hidden, c.intermediate}})
             ops::prepare_quantized(layers.front().pre, rows, shape.first, shape.second, config.type);
     }
-    TensorView forward(TensorView hidden_states, ForwardContext &context) const {
-        if (context.mode == ForwardContext::Prepare) {
-            TransformerState workspace(config, 1, 1, 1);
-            if (workspace.update.data()) {
-                ops::reserve_attention(hidden_states.device,
-                    size_t(context.max_batch) * context.max_time * config.heads);
-                prepare(workspace, context.max_rows);
-            }
-            return context.batch.output.numel() ? context.batch.output : hidden_states;
-        }
-        TransformerState workspace(config, context.max_batch, context.max_time, context.max_rows, context.batch.cache, false,
-                                    !context.batch.is_decode());
-        if (context.mode == ForwardContext::Execute)
-            forward(workspace, hidden_states, context.batch);
-        return context.batch.output.numel() ? context.batch.output : hidden_states;
-    }
-    void prepare(TransformerState &workspace, int max_rows) const {
+    void prepare(Workspace &workspace, int max_rows) const {
         prepare_range(max_rows);
 
         auto input = workspace.update.view(1, config.hidden, config.type);
@@ -192,7 +195,7 @@ class Transformer {
                 layer.out, input, false, 0, 1, 1, max_rows);
         }
     }
-    void forward(TransformerState &s, TensorView x, const ForwardBatch &input) const {
+    void forward(Workspace &s, TensorView x, const ForwardBatch &input) const {
 
         const auto &c = config;
         int batch = input.batch(), time = input.time(), slot = input.slot;

@@ -6,20 +6,7 @@
 #include <iterator>
 
 namespace tts {
-void Codec::forward(TensorInputs inputs, TensorOutputs outputs, ForwardContext &context) const {
-    CodecState workspace(*this, context.max_batch, true);
-    const int batch_size = context.batch.batch();
-    auto waveform = workspace.a.view(batch_size * config.samples_per_frame, 1, Type::F32);
-    if (context.mode == ForwardContext::Execute) {
-        CodecBatch batch{inputs["code_rows"].ptr<const int *>(), context.batch.cache.layout.sequences,
-                         inputs["histories"].ptr<ConvHistory>(),
-                         int(context.parameters["history_stride"])};
-        waveform = forward(workspace, nullptr, batch_size, &batch);
-    }
-    outputs["waveform"] = waveform;
-    outputs["pcm"] = workspace.pcm.view(batch_size, config.samples_per_frame, Type::I16);
-}
-Conv::Conv(Weights &weights, const std::string &name, int dilation, int stride,
+Codec::Conv::Conv(Weights &weights, const std::string &name, int dilation, int stride,
            bool transpose, bool depthwise)
     : dilation(dilation), stride(stride), transpose(transpose), depthwise(depthwise) {
     const auto &entry = weights.entry(name + ".weight");
@@ -43,20 +30,14 @@ Conv::Conv(Weights &weights, const std::string &name, int dilation, int stride,
     // into the causal output ring. No input packing/zero insertion is needed.
     weight = load_convolution_weight(weights, name, transpose);
 }
-void ConvState::run(const Conv &c, TensorView x, TensorView y, const int *frame,
-                    int rows, const ConvHistory *states) {
-
-    int batch = rows ? rows : this->batch;
-    if (c.depthwise) {
-        auto h = states ? TensorView{} : history.view(batch * c.history(), c.in, Type::F32);
-        tts::depthwise( x, h, c.weight, c.bias, y, batch, time, c.kernel, frame, states);
+void Codec::Conv::forward(TensorView input, TensorView output, TensorView projection,
+                           int batch, int time, const ConvHistory *histories) const {
+    if (depthwise) {
+        tts::depthwise(input, {}, weight, bias, output, batch, time, kernel, nullptr, histories);
     } else {
-        auto p = projected.view(batch * time, c.kernel * c.out, Type::F32);
-        ops::matmul(x, c.weight, p);
-        auto pending =
-            states ? TensorView{} : history.view(int(history.size() / 4 / c.out), c.out, Type::F32);
-        tts::conv_accumulate( p, pending, c.bias, y, batch, time, c.kernel, c.dilation,
-                             c.stride, c.transpose, frame, states);
+        ops::matmul(input, weight, projection);
+        tts::conv_accumulate(projection, {}, bias, output, batch, time, kernel, dilation,
+                             stride, transpose, nullptr, histories);
     }
 }
 static TensorView codebook(Weights &weights, const std::string &prefix, int count, int entries,
@@ -96,77 +77,77 @@ Codec::Codec(Weights &w, const std::string &prefix, CodecConfig cfg)
     output_b_ = w.get(root + "pre_transformer.output_proj.bias");
     auto cv = [&](std::string name, int dilation = 1, int stride = 1, bool trans = false,
                   bool dw = false) {
-        CodecOp o{};
-        o.kind = CodecOp::Convolution;
+        Operation o{};
+        o.kind = Operation::Convolution;
         o.conv = std::make_unique<Conv>(w, root + name + ".conv", dilation, stride, trans, dw);
         ops_.push_back(std::move(o));
     };
-    auto op = [&](CodecOp::Kind kind, std::string name = "", int save = 0) {
-        CodecOp o{};
+    auto op = [&](Operation::Kind kind, std::string name = "", int save = 0) {
+        Operation o{};
         o.kind = kind;
         o.save = save;
-        if (kind == CodecOp::Snake) {
-            o.w = w.get(root + name + ".alpha");
-            o.b = w.get(root + name + ".beta");
-        } else if (kind == CodecOp::Linear || kind == CodecOp::LayerNorm) {
-            o.w = w.get(root + name + ".weight");
-            o.b = w.get(root + name + ".bias");
-        } else if (kind == CodecOp::ScaleAdd)
-            o.w = w.get(root + name + ".gamma");
+        if (kind == Operation::Snake) {
+            o.weight = w.get(root + name + ".alpha");
+            o.bias = w.get(root + name + ".beta");
+        } else if (kind == Operation::Linear || kind == Operation::LayerNorm) {
+            o.weight = w.get(root + name + ".weight");
+            o.bias = w.get(root + name + ".bias");
+        } else if (kind == Operation::ScaleAdd)
+            o.weight = w.get(root + name + ".gamma");
         ops_.push_back(std::move(o));
     };
     for (size_t i = 0; i < config.upsampling_ratios.size(); i++) {
         std::string p = "upsample." + std::to_string(i);
         cv(p + ".0", 1, config.upsampling_ratios[i], true);
         p += ".1";
-        op(CodecOp::Save, "", 0);
+        op(Operation::Save, "", 0);
         cv(p + ".dwconv", 1, 1, false, true);
-        op(CodecOp::LayerNorm, p + ".norm");
-        op(CodecOp::Linear, p + ".pwconv1");
-        op(CodecOp::Gelu);
-        op(CodecOp::Linear, p + ".pwconv2");
-        op(CodecOp::ScaleAdd, p, 0);
+        op(Operation::LayerNorm, p + ".norm");
+        op(Operation::Linear, p + ".pwconv1");
+        op(Operation::Gelu);
+        op(Operation::Linear, p + ".pwconv2");
+        op(Operation::ScaleAdd, p, 0);
     }
     cv("decoder.0");
     if (ops_.back().conv->out != config.decoder_dim)
         throw std::invalid_argument("codec decoder_dim does not match its first convolution");
     for (size_t i = 0; i < config.upsample_rates.size(); i++) {
         std::string p = "decoder." + std::to_string(i + 1) + ".block.";
-        op(CodecOp::Snake, p + "0");
+        op(Operation::Snake, p + "0");
         cv(p + "1", 1, config.upsample_rates[i], true);
         // Qwen3 DAC residual-unit definition, fixed by modeling_qwen3_tts_tokenizer_v2.py;
         // dilation is not stored in weight shapes or the checkpoint config.
         constexpr int dilations[] = {1, 3, 9};
         for (size_t j = 0; j < std::size(dilations); j++) {
             std::string r = p + std::to_string(j + 2);
-            op(CodecOp::Save, "", 1);
-            op(CodecOp::Snake, r + ".act1");
+            op(Operation::Save, "", 1);
+            op(Operation::Snake, r + ".act1");
             cv(r + ".conv1", dilations[j]);
-            op(CodecOp::Snake, r + ".act2");
+            op(Operation::Snake, r + ".act2");
             cv(r + ".conv2");
-            op(CodecOp::Add, "", 1);
+            op(Operation::Add, "", 1);
         }
     }
-    op(CodecOp::Snake, "decoder." + std::to_string(config.upsample_rates.size() + 1));
+    op(Operation::Snake, "decoder." + std::to_string(config.upsample_rates.size() + 1));
     cv("decoder." + std::to_string(config.upsample_rates.size() + 2));
     int channels = config.latent_dim, saved[2]{};
     for (const auto &o : ops_) {
-        if ((o.w.data && o.w.type != Type::F32) || (o.b.data && o.b.type != Type::F32))
+        if ((o.weight.data && o.weight.type != Type::F32) || (o.bias.data && o.bias.type != Type::F32))
             throw std::invalid_argument("codec operator requires F32 parameters");
-        if (o.kind == CodecOp::Convolution) {
+        if (o.kind == Operation::Convolution) {
             if (o.conv->in != channels)
                 throw std::invalid_argument("codec convolution chain shape");
             channels = o.conv->out;
-        } else if (o.kind == CodecOp::Linear) {
-            if (o.w.cols != channels || o.b.numel() != size_t(o.w.rows))
+        } else if (o.kind == Operation::Linear) {
+            if (o.weight.cols != channels || o.bias.numel() != size_t(o.weight.rows))
                 throw std::invalid_argument("codec linear weight/bias shape");
-            channels = o.w.rows;
+            channels = o.weight.rows;
         } else {
-            if ((o.w.data && o.w.numel() != size_t(channels)) ||
-                (o.b.data && o.b.numel() != size_t(channels)))
+            if ((o.weight.data && o.weight.numel() != size_t(channels)) ||
+                (o.bias.data && o.bias.numel() != size_t(channels)))
                 throw std::invalid_argument("codec channel parameter shape");
-            if (o.kind == CodecOp::Save) saved[o.save] = channels;
-            if (o.kind == CodecOp::Add || o.kind == CodecOp::ScaleAdd) {
+            if (o.kind == Operation::Save) saved[o.save] = channels;
+            if (o.kind == Operation::Add || o.kind == Operation::ScaleAdd) {
                 if (saved[o.save] != channels)
                     throw std::invalid_argument("codec residual channel shape");
                 saved[o.save] = 0;
@@ -193,145 +174,159 @@ SequenceStateSpec Codec::history_spec() const {
     spec.history_bytes.push_back(pre_conv_.history_bytes(1, 1));
     int time = 1;
     for (const auto &op : ops_)
-        if (op.kind == CodecOp::Convolution) {
+        if (op.kind == Operation::Convolution) {
             spec.history_bytes.push_back(op.conv->history_bytes(1, time));
             if (op.conv->transpose)
                 time *= op.conv->stride;
         }
     return spec;
 }
-CodecState::CodecState(const Codec &c, int b, bool mapped)
-    : transformer(c.transformer.config, b, c.transformer.config.window, b, {}, true,
-                  !mapped),
-      rvq1(size_t(b) * c.first_embedding_.cols * sizeof(float)), rvq2(rvq1.size()),
-      latent(size_t(b) * c.config.latent_dim * sizeof(float)),
-      hidden(size_t(b) * c.config.transformer.hidden * sizeof(float)),
-      position(mapped ? 0 : size_t(b) * 4),
-      pcm(size_t(b) * c.config.samples_per_frame * sizeof(int16_t)), batch(b) {
-    int time = 1, channels = c.config.latent_dim;
-    max_elements = b * std::max(c.config.latent_dim, c.config.codebook_dim);
-    conv.push_back(std::make_unique<ConvState>(c.pre_conv_, b, 1, !mapped));
-    for (const auto &op : c.ops_) {
-        if (op.kind == CodecOp::Convolution) {
-            if (op.conv->transpose && time > INT32_MAX / op.conv->stride)
-                throw std::invalid_argument("codec convolution time overflow");
-            conv.push_back(std::make_unique<ConvState>(*op.conv, b, time, !mapped));
-            if (op.conv->transpose)
-                time *= op.conv->stride;
-            channels = op.conv->out;
+Codec::Workspace::Workspace(const Codec &model, int batch)
+    : rvq_first(size_t(batch) * model.first_embedding_.cols * sizeof(float)),
+      rvq_rest(rvq_first.size()), latent(size_t(batch) * model.config.latent_dim * sizeof(float)),
+      hidden(size_t(batch) * model.config.transformer.hidden * sizeof(float)),
+      pcm(size_t(batch) * model.config.samples_per_frame * sizeof(int16_t)) {
+    int time = 1, channels = model.config.latent_dim;
+    int64_t max_elements = int64_t(batch) * std::max(channels, model.config.codebook_dim);
+    size_t projection_elements = size_t(batch) * model.pre_conv_.kernel * model.pre_conv_.out;
+    for (const auto &operation : model.ops_) {
+        if (operation.kind == Operation::Convolution) {
+            const auto &convolution = *operation.conv;
+            if (!convolution.depthwise)
+                projection_elements = std::max(projection_elements,
+                    size_t(batch) * time * convolution.kernel * convolution.out);
+            if (convolution.transpose) {
+                if (time > INT32_MAX / convolution.stride)
+                    throw std::invalid_argument("codec convolution time overflow");
+                time *= convolution.stride;
+            }
+            channels = convolution.out;
         }
-        if (op.kind == CodecOp::Linear)
-            channels = op.w.rows;
-        int64_t elements = int64_t(b) * time * channels;
-        if (elements > INT32_MAX)
-            throw std::invalid_argument("codec workspace exceeds kernel indexing capacity");
-        max_elements = std::max(max_elements, int(elements));
+        if (operation.kind == Operation::Linear)
+            channels = operation.weight.rows;
+        max_elements = std::max(max_elements, int64_t(batch) * time * channels);
     }
-    if (time != c.config.samples_per_frame || channels != 1)
+    if (max_elements > INT32_MAX || projection_elements > INT32_MAX)
+        throw std::invalid_argument("codec workspace exceeds kernel indexing capacity");
+    if (time != model.config.samples_per_frame || channels != 1)
         throw std::invalid_argument("codec output does not match configured frame size");
-    a = Buffer(size_t(max_elements) * 4);
-    this->b = Buffer(a.size());
-    for (auto &save : saves)
-        save = Buffer(a.size());
+    for (auto &activation : activations)
+        activation = Buffer(size_t(max_elements) * sizeof(float));
+    convolution = Buffer(projection_elements * sizeof(float));
 }
-void CodecState::reset(){
-
-    ops::zero(position.view(1, int(position.size()), Type::I8));
-    for (auto &c : conv)
-        ops::zero(c->history.view(1, int(c->history.size()), Type::I8));
-}
-TensorView Codec::forward(CodecState &s, const int *codes, int batch,
-                          const CodecBatch *mapped) const {
-
-    batch = batch ? batch : s.batch;
-    auto histories = [&](int op) {
-        return mapped ? mapped->histories + op * mapped->stride : nullptr;
+void Codec::forward(TensorInputs inputs, TensorOutputs outputs, ForwardContext &context) const {
+    Workspace workspace(*this, context.max_batch);
+    const int batch = context.batch.batch();
+    const auto *code_rows = inputs["code_rows"].ptr<const int *>();
+    const auto *histories = inputs["histories"].ptr<ConvHistory>();
+    const int history_stride = int(context.parameters["history_stride"]);
+    const auto *cache = context.batch.cache.layout.sequences;
+    const bool execute = context.mode == ForwardContext::Execute;
+    if (execute && (!code_rows || !histories || !cache || history_stride < batch))
+        throw std::invalid_argument("codec requires runner-owned history and cache rows");
+    auto convolve = [&](const Conv &convolution, TensorView input, TensorView output,
+                        int time, int history_index) {
+        if (!execute)
+            return;
+        auto projection = convolution.depthwise ? TensorView{} : workspace.convolution.view(
+            batch * time, convolution.kernel * convolution.out, Type::F32);
+        convolution.forward(input, output, projection, batch, time, histories + history_index * history_stride);
     };
-    auto a = s.a.view(batch, config.codebook_dim, Type::F32),
-         b = s.b.view(batch, config.codebook_dim, Type::F32);
-    auto r1 = s.rvq1.view(batch, first_embedding_.cols, Type::F32),
-         r2 = s.rvq2.view(batch, rest_embedding_.cols, Type::F32);
-    tts::rvq( first_embedding_, codes, r1, batch, 0, config.semantic_codebooks,
-             config.codebooks, mapped ? mapped->codes : nullptr);
-    tts::rvq( rest_embedding_, codes, r2, batch, config.semantic_codebooks,
-             config.codebooks - config.semantic_codebooks, config.codebooks,
-             mapped ? mapped->codes : nullptr);
-    ops::matmul(r1, first_proj_, a);
-    ops::matmul(r2, rest_proj_, b);
-    ops::add(a, b, a);
-    auto latent = s.latent.view(batch, config.latent_dim, Type::F32),
-         hidden = s.hidden.view(batch, config.transformer.hidden, Type::F32);
-    s.conv[0]->run(pre_conv_, a, latent, s.position.ptr<int>(), batch, histories(0));
-    ops::matmul(latent, input_w_, hidden);
-    ops::bias(hidden, input_b_);
-    ForwardBatch input{batch, 1};
-    input.positions = mapped ? nullptr : s.position.ptr<int>();
-    input.cache = s.transformer.external_kv;
-    input.cache.layout.sequences = mapped ? mapped->cache : nullptr;
-    transformer.forward(s.transformer, hidden, input);
-    a = s.a.view(batch, config.latent_dim, Type::F32);
-    ops::matmul(hidden, output_w_, a);
-    ops::bias(a, output_b_);
-    int ci = 1, time = 1, channels = config.latent_dim, current = 0;
+    auto first = workspace.activations[0].view(batch, config.codebook_dim, Type::F32);
+    auto second = workspace.activations[1].view(batch, config.codebook_dim, Type::F32);
+    auto first_codes = workspace.rvq_first.view(batch, first_embedding_.cols, Type::F32);
+    auto rest_codes = workspace.rvq_rest.view(batch, rest_embedding_.cols, Type::F32);
+    auto latent = workspace.latent.view(batch, config.latent_dim, Type::F32);
+    auto hidden = workspace.hidden.view(batch, config.transformer.hidden, Type::F32);
+    if (execute) {
+        tts::rvq(first_embedding_, nullptr, first_codes, batch, 0, config.semantic_codebooks,
+                  config.codebooks, code_rows);
+        tts::rvq(rest_embedding_, nullptr, rest_codes, batch, config.semantic_codebooks,
+                  config.codebooks - config.semantic_codebooks, config.codebooks, code_rows);
+        ops::matmul(first_codes, first_proj_, first);
+        ops::matmul(rest_codes, rest_proj_, second);
+        ops::add(first, second, first);
+    }
+    convolve(pre_conv_, first, latent, 1, 0);
+    if (execute) {
+        ops::matmul(latent, input_w_, hidden);
+        ops::bias(hidden, input_b_);
+    }
+    auto decoder_context = context;
+    decoder_context.batch = ForwardBatch{batch, 1};
+    decoder_context.batch.cache.layout.sequences = cache;
+    decoder_context.batch.cache.layout.ring = true;
+    decoder_context.batch.forward_mode = ForwardMode::Decode;
+    decoder_context.max_time = config.transformer.window;
+    transformer.forward(hidden, decoder_context);
+    first = workspace.activations[0].view(batch, config.latent_dim, Type::F32);
+    if (execute) {
+        ops::matmul(hidden, output_w_, first);
+        ops::bias(first, output_b_);
+    }
+    int convolution_index = 1, time = 1, channels = config.latent_dim, current = 0;
     TensorView saved[2];
-    int saved_index[2] = {-1, -1};
-    const Buffer *buffers[] = {&s.a, &s.b, &s.saves[0], &s.saves[1]};
-    for (const auto &op : ops_) {
-        TensorView x = buffers[current]->view(batch * time, channels, Type::F32);
-        int newtime = time, newchannels = channels;
-        if (op.kind == CodecOp::Save) {
-            saved[op.save] = x;
-            saved_index[op.save] = current;
+    int saved_indices[2] = {-1, -1};
+    for (const auto &operation : ops_) {
+        auto input = workspace.activations[current].view(batch * time, channels, Type::F32);
+        int next_time = time, next_channels = channels;
+        if (operation.kind == Operation::Save) {
+            saved[operation.save] = input;
+            saved_indices[operation.save] = current;
             continue;
         }
-        if (op.kind == CodecOp::Convolution) {
-            newtime = time * (op.conv->transpose ? op.conv->stride : 1);
-            newchannels = op.conv->out;
+        if (operation.kind == Operation::Convolution) {
+            next_time = time * (operation.conv->transpose ? operation.conv->stride : 1);
+            next_channels = operation.conv->out;
         }
-        if (op.kind == CodecOp::Linear)
-            newchannels = op.w.rows;
+        if (operation.kind == Operation::Linear)
+            next_channels = operation.weight.rows;
         int next = 0;
-        while (next == current || next == saved_index[0] || next == saved_index[1])
+        while (next == current || next == saved_indices[0] || next == saved_indices[1])
             ++next;
-        if (next >= 4)
+        if (next >= int(workspace.activations.size()))
             throw std::runtime_error("codec buffer liveness invariant");
-        TensorView y = buffers[next]->view(batch * newtime, newchannels, Type::F32);
-        switch (op.kind) {
-        case CodecOp::Convolution:
-            s.conv[ci]->run(*op.conv, x, y, s.position.ptr<int>(), batch, histories(ci));
-            ++ci;
-            break;
-        case CodecOp::Snake:
-            tts::snake( x, op.w, op.b, y);
-            break;
-        case CodecOp::Add:
-            ops::add(x, saved[op.save], y);
-            break;
-        case CodecOp::ScaleAdd:
-            ops::add(saved[op.save], x, y, op.w);
-            break;
-        case CodecOp::LayerNorm:
-            ops::norm(x, op.w, y, 1e-6f, false, op.b);
-            break;
-        case CodecOp::Linear:
-            ops::matmul(x, op.w, y);
-            ops::bias(y, op.b);
-            break;
-        case CodecOp::Gelu:
-            ops::activation(x, y, 2);
-            break;
-        default:
-            break;
+        auto output = workspace.activations[next].view(batch * next_time, next_channels, Type::F32);
+        if (execute) {
+            switch (operation.kind) {
+            case Operation::Convolution:
+                convolve(*operation.conv, input, output, time, convolution_index++);
+                break;
+            case Operation::Snake:
+                tts::snake(input, operation.weight, operation.bias, output);
+                break;
+            case Operation::Add:
+                ops::add(input, saved[operation.save], output);
+                break;
+            case Operation::ScaleAdd:
+                ops::add(saved[operation.save], input, output, operation.weight);
+                break;
+            case Operation::LayerNorm:
+                ops::norm(input, operation.weight, output, 1e-6f, false, operation.bias);
+                break;
+            case Operation::Linear:
+                ops::matmul(input, operation.weight, output);
+                ops::bias(output, operation.bias);
+                break;
+            case Operation::Gelu:
+                ops::activation(input, output, 2);
+                break;
+            default:
+                break;
+            }
         }
-        if (op.kind == CodecOp::Add || op.kind == CodecOp::ScaleAdd)
-            saved_index[op.save] = -1;
+        if (operation.kind == Operation::Add || operation.kind == Operation::ScaleAdd)
+            saved_indices[operation.save] = -1;
         current = next;
-        time = newtime;
-        channels = newchannels;
+        time = next_time;
+        channels = next_channels;
     }
-    auto result = buffers[current]->view(batch * config.samples_per_frame, 1, Type::F32);
-    tts::pcm( result, s.pcm.ptr<int16_t>());
-    ops::advance_positions(s.a.view(1, 1, Type::F32), s.position.ptr<int>(), batch, 1, mapped ? mapped->cache : nullptr);
-    return result;
+    auto waveform = workspace.activations[current].view(batch * config.samples_per_frame, 1, Type::F32);
+    if (execute) {
+        tts::pcm(waveform, workspace.pcm.ptr<int16_t>());
+        ops::advance_positions(workspace.activations[0].view(1, 1, Type::F32), nullptr, batch, 1, cache);
+    }
+    outputs["waveform"] = waveform;
+    outputs["pcm"] = workspace.pcm.view(batch, config.samples_per_frame, Type::I16);
 }
 } // namespace tts
