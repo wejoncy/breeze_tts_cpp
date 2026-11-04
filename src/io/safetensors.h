@@ -19,7 +19,11 @@ class SafeTensors {
     std::unordered_map<std::string, Entry> entries_;
 
   public:
-    void open_file(const std::string &path, const std::string &prefix = "");
+    std::vector<std::string> open_file(const std::string &path, const std::string &prefix = "");
+    // Standard single-file or indexed/sharded checkpoint, shared by all models.
+    // Returns paths relative to directory for the model's asset manifest.
+    std::vector<std::string> open_checkpoint(const std::string &directory,
+                                            const std::string &prefix = "");
     const Entry &get(const std::string &name) const {
         auto it = entries_.find(name);
         if (it == entries_.end())

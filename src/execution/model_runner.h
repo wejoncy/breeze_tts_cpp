@@ -1,75 +1,65 @@
 #pragma once
-#include "tts/request.h"
-#include "runtime/graph.h"
-#include "runtime/graph_shapes.h"
-#include <tuple>
-#include <set>
+#include "execution/request_planner.h"
+#include "execution/runner_resources.h"
+#include "core/model.h"
+#include "tts/model_info.h"
+#include <exception>
+#include <chrono>
+
 namespace tts {
-struct Model;
-class Backend;
-class PagedKVCache;
-template <class Key, class GraphState> class ExecutionResources;
-struct GenerationState;
-struct RequestPlan;
+// The executor exclusively owns this interface and every admission/state created
+// through it. Model weights and init-time workspaces outlive those states.
 class ModelRunner {
-    struct Graphs {
-        Graph decoder, codec;
-    };
-    const Model &model;
-    Backend &gpu;
-    int max_batch, context;
-    GraphShapes graph_shapes_;
-    uint64_t request_sequence_ = 0;
-    std::unique_ptr<PagedKVCache> kv_;
-    struct Slot;
-    std::vector<std::unique_ptr<Slot>> slots_;
-    struct DecodeBatch;
-    struct Batch;
-    std::unique_ptr<Batch> batch_;
-    struct PrefillWork;
-    std::unique_ptr<PrefillWork> prefill_;
-    std::multiset<size_t> prefill_credits_;
-    std::multiset<int> kv_credits_;
-    void initialize_graphs();
-    void depth_frame(GenerationState &, int batch, const DecodeBatch &, bool debug = false);
-    void next_frame(GenerationState &, int batch, const DecodeBatch &);
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 
   public:
-    ModelRunner(const Model &, Backend &, int batch, int context, int page_tokens,
-                size_t runtime_memory_bytes = 0);
-    ~ModelRunner();
-    // Executor-owned memory credits for the whole request, across input waves.
-    // Must outlive every RequestState prepared from it.
-    class RequestAdmission {
-        friend class ModelRunner;
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
-        explicit RequestAdmission(std::unique_ptr<Impl>);
-
-      public:
-        ~RequestAdmission();
-    };
-    // CPU progress plus a lease on engine-owned request buffers and KV pages.
-    // It owns no executor, model workspace, graph cache or private KV pool.
+    ModelRunner(const Model &, RunnerResources &, RequestPlanner &, const ModelInfo &,
+                 size_t runtime_memory_bytes);
+    // Reserves a request's capacity across all input waves. Destroy states before
+    // releasing this admission, including on cancellation and executor failure.
+    using RequestAdmission = RequestAdmissionPool::Lease;
+    // Executor-owned progress and leases common to all networks. Tensor storage
+    // stays in RunnerResources; a plan can add CPU preparation data.
     class RequestState {
-        friend class ModelRunner;
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
-        explicit RequestState(std::unique_ptr<Impl>);
-
       public:
-        ~RequestState();
-        bool done() const;
-        bool prefilled() const;
-        Stats stats() const;
-        std::exception_ptr error() const;
+        std::unique_ptr<RequestAdmission::RowLease> row_credit;
+        std::unique_ptr<RequestSlots::Lease> slot;
+        StatePool::Row &data;
+        GenerationOptions options;
+        std::unique_ptr<PagedKVCache::Lease> cache;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        Stats metrics;
+        std::exception_ptr failure;
+        bool finished = false, is_prefilled = false;
+        RequestState(RunnerResources &resources, std::unique_ptr<RequestAdmission::RowLease> credit,
+                     std::unique_ptr<RequestSlots::Lease> reservation, GenerationOptions parameters)
+            : row_credit(std::move(credit)), slot(std::move(reservation)),
+              data(*resources.states.rows().at(slot->index)), options(std::move(parameters)) {}
+        virtual ~RequestState() = default;
+        bool done() const { return finished; }
+        bool prefilled() const { return is_prefilled; }
+        Stats stats() const { return metrics; }
+        std::exception_ptr error() const { return failure; }
     };
+    ~ModelRunner();
+    // Init-time host staging bound for all audio callbacks of one input in one
+    // step(), including any pending tail and inter-segment silence.
+    size_t max_step_samples() const;
+    void prepare_tasks(std::vector<PreparedTask> &);
+    // Empty means temporarily unavailable; retry after a release checkpoint.
+    // Invalid requests and requests that cannot fit alone throw a terminal error.
     std::unique_ptr<RequestAdmission> admit(RequestPlan &);
-    std::unique_ptr<RequestState> prepare(RequestPlan &, size_t lane, RequestAdmission &);
-    // Advance a packed prefill checkpoint; returns the number of inputs advanced.
-    // Fixed pool capacity can reduce the offered batch without rejecting its inputs.
+    // Empty means this admitted request has no free row credit. The input must
+    // remain untouched; retry this row after a resource-release checkpoint.
+    std::unique_ptr<RequestState> prepare(RequestPlan &, size_t input, RequestAdmission &);
+    // Advance model-defined preparation checkpoints. A model may pack fewer rows
+    // than offered to respect admitted workspace; it must make forward progress.
     size_t prefill_step(const std::vector<RequestState *> &);
+    // Advance each ready input by a model-defined execution quantum. Callback i
+    // receives that input's audio, if produced; state records completion/errors.
     void step(const std::vector<RequestState *> &, const std::vector<AudioCallback> &);
+    std::shared_ptr<const Reference> prepare_reference(ReferencePlan &);
     std::vector<int> encode_audio(const std::vector<float> &);
     std::vector<float> decode_codes(const std::vector<int> &);
 };

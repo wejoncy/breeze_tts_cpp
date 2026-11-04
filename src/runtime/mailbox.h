@@ -9,7 +9,7 @@ struct MailboxTraits : moodycamel::ConcurrentQueueDefaultTraits {
 };
 // Message storage is lock-free; empty consumers park without spinning.
 template <class T> using Mailbox = moodycamel::BlockingConcurrentQueue<T, MailboxTraits>;
-template <class T, class U> void send(Mailbox<T> &queue, U &&value) {
+template <class Queue, class U> void send(Queue &queue, U &&value) {
     if (!queue.enqueue(std::forward<U>(value)))
         throw std::bad_alloc();
 }

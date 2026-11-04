@@ -5,7 +5,7 @@
 #include <cmath>
 #include <limits>
 
-namespace tts {
+namespace tts::breeze {
 namespace {
 int integer(const Json &j, const char *key, int minimum) {
     const auto &v = j.at(key);
@@ -44,7 +44,7 @@ int product(const std::vector<int> &values) {
     return int(result);
 }
 } // namespace
-ModelConfig load_model_config(const std::string &dir, int batch, int context,
+ModelConfig parse_model_config(const Json &c, const Json &a, int batch, int context,
                               Quantization quantization) {
     if (batch < 1 || context < 1)
         throw std::invalid_argument("batch and context must be positive");
@@ -53,7 +53,6 @@ ModelConfig load_model_config(const std::string &dir, int batch, int context,
     // Packed text has up to two sequences per lane. Its offsets use int32.
     if (2LL * rows + 4LL * lanes + 1 > INT32_MAX)
         throw std::invalid_argument("packed request metadata exceeds int32 indexing");
-    auto c = read_json(dir + "/config.json");
     auto require = [&](const Json &j, const char *key, const Json &value) {
         if (!j.contains(key) || j[key] != value)
             throw std::runtime_error(std::string("unsupported checkpoint field: ") + key);
@@ -81,7 +80,6 @@ ModelConfig load_model_config(const std::string &dir, int batch, int context,
     for (const auto *cfg : {&bc, &dc})
         if (cfg->contains("mlp_bias")) // Qwen3 omits this field; its MLP is bias-free.
             require(*cfg, "mlp_bias", false);
-    auto a = read_json(dir + "/audio_tokenizer/config.json");
     require(a, "model_type", "qwen3_tts_tokenizer_12hz");
     const auto &ec = a.at("encoder_config"), &ac = a.at("decoder_config");
     require(ec, "audio_channels", 1); // Input adapter supplies mono audio.
@@ -102,6 +100,9 @@ ModelConfig load_model_config(const std::string &dir, int batch, int context,
         result.dim = positive(j, "head_dim");
         result.intermediate = positive(j, "intermediate_size");
         product({2, result.intermediate});
+        result.layer_scale = j.contains("layer_scale_initial_scale");
+        if (result.layer_scale && !std::isfinite(j.at("layer_scale_initial_scale").get<float>()))
+            throw std::invalid_argument("invalid transformer layer scale configuration");
         result.eps = positive_float(j, eps);
         result.theta = j.contains("rope_theta") ? positive_float(j, "rope_theta") : 0;
         if (result.heads % result.kvheads || result.dim % 2)
@@ -256,4 +257,4 @@ ModelConfig load_model_config(const std::string &dir, int batch, int context,
         quantization;
     return result;
 }
-} // namespace tts
+} // namespace tts::breeze

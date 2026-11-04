@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define TTS_ABI_VERSION 3
+#define TTS_ABI_VERSION 7
 typedef struct tts_engine tts_engine;
 typedef struct tts_reference tts_reference;
 typedef enum {
@@ -35,6 +35,7 @@ typedef struct {
 /* Process-wide for this library. NULL restores INFO/stderr/text. Successful
    replacement waits for old callbacks, after which old user data may be released. */
 int tts_configure_logging(const tts_log_config *, char *error, size_t error_capacity);
+typedef enum { TTS_SYNTHESIS_OFFLINE, TTS_SYNTHESIS_FIXED, TTS_SYNTHESIS_HYBRID } tts_synthesis_mode;
 typedef struct {
     uint32_t abi_version;
     int32_t max_frames;
@@ -53,12 +54,23 @@ typedef struct {
     int32_t dual_cfg;
     float cfg_scale_ref;
     float cfg_scale_ins;
+    double speed_factor;
+    int32_t sample_steps; /* zero selects model default */
+    float cfg_rate;       /* -1 selects model default */
+    int32_t synthesis_mode; /* tts_synthesis_mode */
+    double streaming_chunk_seconds; /* zero selects model default */
+    double streaming_lookahead_seconds; /* -1 selects model default */
+    double streaming_overlap_seconds; /* -1 selects model default */
+    double semantic_lookahead_seconds; /* -1 selects model default */
 } tts_options;
 typedef struct {
     const char *text;
     const char *instruction;
     const char *speaker; /* NULL = S0; empty string = no prefix */
     const tts_reference *reference;
+    const char *language; /* NULL = model default */
+    const char *text_split_method; /* NULL = single segment; cut0..cut5 */
+    double fragment_interval; /* seconds between text segments */
 } tts_request;
 typedef struct {
     double prefill_ms;
@@ -73,9 +85,10 @@ typedef struct {
 typedef int (*tts_audio_callback)(void *user, int32_t batch_index, const int16_t *pcm,
                                   size_t samples);
 tts_options tts_default_options(void);
-/* Quantization is "fp8" or "int8"; NULL selects unquantized BF16. Immutable per engine.
+/* Quantization is "fp8" or "int8"; NULL keeps the checkpoint's floating dtype.
+   Immutable per engine.
    Weights use per-output-channel scales; activations use dynamic per-token scales.
-   FlashAttention/KV stay BF16, and the audio encoder/codec stay F32. */
+   Attention/KV retain their model dtype; auxiliary network dtypes are model-defined. */
 tts_engine *tts_create(const char *model_dir, int32_t device, int32_t max_batch, int32_t context,
                        const char *quantization, char *error, size_t error_capacity);
 /* Creation only loads resources. Start explicitly before execution/control calls.
@@ -103,10 +116,11 @@ const char *tts_version(void);
 /* Decode/downmix/resample explicitly, then run the native encoder. The result
    owns CPU codes and transcript and may be reused across engines/requests. */
 tts_reference *tts_reference_from_audio(tts_engine *, const void *encoded, size_t bytes,
-                                        const char *transcript, char *error, size_t error_capacity);
+                                        const char *transcript, const char *language,
+                                        char *error, size_t error_capacity);
 tts_reference *tts_reference_from_pcm(tts_engine *, const float *interleaved, size_t frames,
                                       int32_t sample_rate, int32_t channels, const char *transcript,
-                                      char *error, size_t error_capacity);
+                                      const char *language, char *error, size_t error_capacity);
 /* CPU-only import; dimensions come from tts_get_audio_format or persisted metadata. */
 tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, int32_t codebooks,
                                         int32_t codebook_size, const char *transcript, char *error,

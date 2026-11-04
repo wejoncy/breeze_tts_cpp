@@ -27,12 +27,12 @@ class GraphShapes {
     const std::vector<int> &rows() const {
         return rows_;
     }
-    std::pair<int, int> decoder(int rows, int lanes, int max_branches) const {
+    std::pair<int, int> select(int rows, int lanes, int max_groups) const {
         std::pair<int, int> best{};
         for (int capacity : rows_)
             if (fits(rows, capacity))
-                for (int branches = 1; branches <= max_branches; ++branches) {
-                    int padded_lanes = capacity * branches;
+                for (int groups = 1; groups <= max_groups; ++groups) {
+                    int padded_lanes = capacity * groups;
                     if (fits(lanes, padded_lanes) &&
                         (!best.first || padded_lanes < best.second ||
                          (padded_lanes == best.second && capacity < best.first)))
@@ -40,7 +40,7 @@ class GraphShapes {
                 }
         return best;
     }
-    int codec(int rows) const {
+    int select(int rows) const {
         for (int capacity : rows_)
             if (fits(rows, capacity))
                 return capacity;

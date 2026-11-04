@@ -33,8 +33,8 @@ class PagedKVCache {
           page_size_(page_tokens), type_(type),
           layer_bytes_(size_t(page_tokens) * width * bytes(type)),
           page_bytes_(size_t(layers) * layer_bytes_),
-          key_table_(size_t(lanes) * max_blocks_ * sizeof(void *), &memory),
-          value_table_(key_table_.size(), &memory) {
+          key_table_(size_t(lanes) * max_blocks_ * sizeof(void *)),
+          value_table_(key_table_.size()) {
         keys_.reserve(size_t(lanes) * max_blocks_);
         values_.reserve(keys_.capacity());
         free_.reserve(keys_.capacity());
@@ -62,6 +62,13 @@ class PagedKVCache {
     size_t storage_capacity_bytes() const {
         return size_t(capacity()) * page_bytes_ * 2;
     }
+    size_t runtime_storage_bytes() const {
+        size_t size = 0;
+        for (const auto &chunk : chunks_)
+            if (memory_.owns_runtime(chunk.data()))
+                size += Tensor::aligned(chunk.size());
+        return size;
+    }
     size_t max_storage_bytes() const {
         return size_t(max_lanes_) * max_blocks_ * page_bytes_ * 2;
     }
@@ -84,7 +91,7 @@ class PagedKVCache {
         int old = capacity(), added = n - old;
         if (page_bytes_ > SIZE_MAX / 2 / size_t(added))
             throw std::overflow_error("KV storage byte count");
-        Buffer chunk(2 * page_bytes_ * added, &memory_);
+        Buffer chunk(2 * page_bytes_ * added);
         chunks_.push_back(std::move(chunk));
         auto *base = static_cast<char *>(chunks_.back().data());
         for (int i = 0; i < added; ++i) {
@@ -92,18 +99,20 @@ class PagedKVCache {
             values_.push_back(base + (size_t(i) * 2 + 1) * page_bytes_);
             free_.push_back(old + i);
         }
-        CUDA(cudaMemcpyAsync(key_table_.ptr<void *>() + old, keys_.data() + old,
-                             added * sizeof(void *), cudaMemcpyHostToDevice, memory_.stream));
-        CUDA(cudaMemcpyAsync(value_table_.ptr<void *>() + old, values_.data() + old,
-                             added * sizeof(void *), cudaMemcpyHostToDevice, memory_.stream));
-        CUDA(cudaStreamSynchronize(memory_.stream));
+        memory_.upload(key_table_.ptr<void *>() + old, keys_.data() + old,
+                       added * sizeof(void *));
+        memory_.upload(value_table_.ptr<void *>() + old, values_.data() + old,
+                       added * sizeof(void *));
+        // The host tables reserve their full capacity at construction. Appended
+        // entries remain immutable and live until the pool is destroyed.
     }
     KVCacheView view(const int *table = nullptr) const {
         CacheLayout layout{table, max_blocks_, page_size_};
         layout.key_pages = key_table_.ptr<void *>();
         layout.value_pages = value_table_.ptr<void *>();
         layout.page_layer_bytes = layer_bytes_;
-        return {{nullptr, 0, width_, type_}, {nullptr, 0, width_, type_}, 0, layout};
+        return {{nullptr, 0, width_, type_, 0, memory_.device},
+                {nullptr, 0, width_, type_, 0, memory_.device}, 0, layout};
     }
     // Request-wide credits cover any simultaneously active subset of its inputs.
     // Credits do not own an execution context or a private page pool.
@@ -214,9 +223,11 @@ class PagedKVCache {
                 }
                 counts_[lane] = std::max(counts_[lane], needed);
             }
-            CUDA(cudaMemcpyAsync(table_, mapping_.data(), mapping_.size() * sizeof(int),
-                                 cudaMemcpyHostToDevice, pool_.memory_.stream));
-            CUDA(cudaStreamSynchronize(pool_.memory_.stream));
+            pool_.memory_.upload(table_, mapping_.data(), mapping_.size() * sizeof(int));
+            // Runtime uploads own a pinned snapshot; page IDs and table storage
+            // are reused in stream order without a host completion barrier.
+            if (!pool_.memory_.has_transfer_backing())
+                pool_.memory_.sync();
         }
 
       private:

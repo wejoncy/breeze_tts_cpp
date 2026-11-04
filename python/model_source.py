@@ -1,8 +1,8 @@
 """Checkpoint resolution and metadata, independent of engine lifetime."""
 
 import hashlib
-import json
 from pathlib import Path
+from request_schema import MAX_INPUTS
 
 
 def resolve_model_dir(model, revision=None):
@@ -14,21 +14,10 @@ def resolve_model_dir(model, revision=None):
     return Path(snapshot_download(repo_id=str(model), revision=revision))
 
 
-def model_info(model):
+def model_info(model, description):
     model = Path(model)
-    audio = json.loads((model / "audio_tokenizer/config.json").read_text())
-    names = {
-        "config.json",
-        "audio_tokenizer/config.json",
-        "audio_tokenizer/model.safetensors",
-    }
-    index = model / "model.safetensors.index.json"
-    if index.exists():
-        names.add(index.name)
-        names.update(json.loads(index.read_text())["weight_map"].values())
-    else:
-        names.add("model.safetensors")
-    digest = hashlib.sha256(b"breeze-checkpoint-v1\0")
+    names = description["checkpoint_files"]
+    digest = hashlib.sha256(b"tts-checkpoint-v1\0")
     for name in sorted(names):
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts:
@@ -42,8 +31,9 @@ def model_info(model):
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 digest.update(block)
     return dict(
-        frame_rate=audio["output_sample_rate"] / audio["decode_upsample_rate"],
+        frame_rate=description["frame_rate"],
+        model_type=description["model_type"],
         model_digest=digest.hexdigest(),
-        max_new_tokens=audio["decoder_config"]["max_position_embeddings"],
-        max_batch_texts=128,
+        max_new_tokens=description["max_new_tokens"],
+        max_batch_texts=MAX_INPUTS,
     )

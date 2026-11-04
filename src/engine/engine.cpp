@@ -1,34 +1,20 @@
 #include "tts/engine.h"
-#include "execution/model_runner.h"
 #include "engine/request_scheduler.h"
-#include "execution/request_planner.h"
-#include "models/breeze/model.h"
+#include "execution/model_runtime.h"
 #include <chrono>
 #include "support/log.h"
 namespace tts {
 constexpr double bytes_per_mib = 1024.0 * 1024.0;
 struct Engine::Impl {
     const uint64_t id;
-    Backend gpu;
-    const Model model;
-    RequestPlanner planner;
-    ModelRunner runner;
+    std::unique_ptr<ModelRuntime> model;
     int max_batch;
     std::unique_ptr<RequestScheduler> scheduler;
-    Impl(const std::string &dir, int device, int batch, int context, int page, ModelConfig config,
-         uint64_t engine_id, size_t runtime_memory_bytes, size_t memory_limit_bytes)
-        : id(engine_id), gpu(device, config.backbone.quantization, memory_limit_bytes),
-          model(gpu, dir, std::move(config)),
-          planner(model.tokenizer, model.config, batch, context),
-          runner(model, gpu, batch, context, page, runtime_memory_bytes), max_batch(batch) {
+    Impl(const std::string &dir, const ModelOptions &options, uint64_t engine_id)
+        : id(engine_id), model(load_model(dir, options)), max_batch(options.max_batch) {
         scheduler = std::make_unique<RequestScheduler>(
-            planner, runner, batch,
-            1000. * model.config.samples_per_frame / model.config.sample_rate, id);
-    }
-    ~Impl() {
-        scheduler.reset();
-        cudaSetDevice(gpu.device);
-        cudaStreamSynchronize(gpu.stream);
+            model->planner(), model->runner(), max_batch, model->scheduling_quantum_ms(), id,
+            model->executor_initializer());
     }
 };
 void Engine::run_async() {
@@ -64,14 +50,13 @@ Engine::Engine(const std::string &dir, int device, int batch, int context, int p
     TTS_LOG(TTS_LOG_INFO, "engine",
             "loading device={} batch_capacity={} context={} quantization={}", device, batch,
             context,
-            quantization == Quantization::None  ? "bf16"
+            quantization == Quantization::None  ? "none"
             : quantization == Quantization::FP8 ? "fp8"
                                                 : "int8");
-    impl_ = std::make_unique<Impl>(dir, device, batch, context, page,
-                                   load_model_config(dir, batch, context, quantization), id,
-                                   runtime_memory_bytes, memory_limit_bytes);
+    impl_ = std::make_unique<Impl>(dir, ModelOptions{device, batch, context, page, quantization,
+                                                   runtime_memory_bytes, memory_limit_bytes}, id);
     if (log::enabled(TTS_LOG_INFO)) {
-        auto memory = impl_->gpu.memory.stats();
+        auto memory = impl_->model->memory_stats();
         auto ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
@@ -83,26 +68,28 @@ Engine::Engine(const std::string &dir, int device, int batch, int context, int p
 }
 Engine::~Engine() = default;
 size_t Engine::weight_bytes() const {
-    return impl_->model.weights.size();
+    return impl_->model->info().weight_bytes;
 }
 MemoryStats Engine::memory_stats() const {
     log::check_not_callback();
     MemoryStats result;
-    impl_->scheduler->run_sync([&] {
-        impl_->gpu.memory.sync();
-        result = impl_->gpu.memory.stats();
-    });
+    impl_->scheduler->run_sync([&] { result = impl_->model->memory_stats(); });
     return result;
 }
 AudioFormat Engine::audio_format() const {
-    const auto &c = impl_->model.config;
-    return {c.sample_rate, c.samples_per_frame, c.codebooks, c.codec.codebook_size};
+    return impl_->model->info().audio;
+}
+const ModelInfo &Engine::model_info() const {
+    return impl_->model->info();
+}
+GenerationOptions Engine::default_options() const {
+    return impl_->model->default_options();
 }
 int Engine::batch_capacity() const {
     return impl_->max_batch;
 }
 size_t Engine::max_reference_samples() const {
-    return size_t(impl_->model.config.max_reference_frames) * impl_->model.config.samples_per_frame;
+    return impl_->model->info().max_reference_samples;
 }
 int Engine::generate(const std::vector<Input> &requests, const GenerationOptions &options,
                      AudioCallback callback, Stats &stats) {
@@ -126,11 +113,27 @@ int Engine::generate(const std::vector<Input> &requests, const GenerationOptions
     }
 }
 
+std::shared_ptr<const Reference> Engine::prepare_reference(const std::vector<float> &mono,
+                                                         std::string transcript,
+                                                         const std::string &language) {
+    log::check_not_callback();
+    std::shared_ptr<const Reference> reference;
+    std::unique_ptr<ReferencePlan> plan;
+    impl_->scheduler->run_sync(
+        [&] { reference = impl_->model->runner().prepare_reference(*plan); },
+        [&](const PreparationExecutor &execute) {
+            plan = impl_->model->planner().prepare_reference(mono, std::move(transcript), execute,
+                                                             language);
+        });
+    return reference;
+}
 std::vector<int> Engine::encode_audio(const std::vector<float> &mono) {
     log::check_not_callback();
     std::vector<int> codes;
     impl_->scheduler->run_sync([&] {
-        codes = impl_->runner.encode_audio(mono);
+        if (impl_->model->info().audio.codebooks <= 0)
+            throw std::invalid_argument("loaded model does not expose discrete audio encoding");
+        codes = impl_->model->runner().encode_audio(mono);
         TTS_LOG(TTS_LOG_INFO, "reference", "encoded samples={} code_elements={}", mono.size(),
                 codes.size());
     });
@@ -139,7 +142,11 @@ std::vector<int> Engine::encode_audio(const std::vector<float> &mono) {
 std::vector<float> Engine::decode_codes(const std::vector<int> &codes) {
     log::check_not_callback();
     std::vector<float> pcm;
-    impl_->scheduler->run_sync([&] { pcm = impl_->runner.decode_codes(codes); });
+    impl_->scheduler->run_sync([&] {
+        if (impl_->model->info().audio.codebooks <= 0)
+            throw std::invalid_argument("loaded model does not expose discrete audio decoding");
+        pcm = impl_->model->runner().decode_codes(codes);
+    });
     return pcm;
 }
 } // namespace tts

@@ -2,6 +2,7 @@
 #include "tts/request.h"
 #include "tts/memory_stats.h"
 #include "tts/quantization.h"
+#include "tts/model_info.h"
 #include <memory>
 #include <utility>
 namespace tts {
@@ -24,15 +25,18 @@ class Engine {
     MemoryStats memory_stats() const;
     int batch_capacity() const;
     AudioFormat audio_format() const;
+    const ModelInfo &model_info() const;
+    GenerationOptions default_options() const;
     size_t max_reference_samples() const;
     using Frame = GenerationFrame;
     // New limits apply to future submissions; admitted output buffers keep their bound.
+    // The output bound covers queued PCM; a waiting read receives its frame directly.
     void configure_serving(size_t request_limit, size_t output_buffer_bytes);
     // Snapshot and enqueue without waiting for the scheduler. Full queues reject
     // immediately; validation errors arrive through read_result(). IDs must be unique.
+    // Repeated IDs are ignored and logged while the original ID remains registered.
     void add_request(const Request &);
     // Zero timeout polls; -1 waits. A terminal result/error consumes the request ID.
-    // Duplicate submission errors preserve the original request and its ID.
     Frame read_result(const std::string &request_id, int timeout_ms = -1);
     // Post cancellation without waiting. The scheduler discards unread output,
     // wakes readers and signals execution; unknown/already consumed IDs are ignored.
@@ -40,6 +44,11 @@ class Engine {
     // Cancel outstanding work and join both threads; safe before start and on repeat.
     void shutdown();
     int generate(const std::vector<Input> &, const GenerationOptions &, AudioCallback, Stats &);
+    // Mono samples at audio_format().sample_rate. The loaded model prepares all
+    // conditioning it needs; callers do not reconstruct a reference from codes.
+    std::shared_ptr<const Reference> prepare_reference(const std::vector<float> &mono,
+                                                     std::string transcript,
+                                                     const std::string &language = {});
     std::vector<int> encode_audio(const std::vector<float> &mono);
     std::vector<float> decode_codes(const std::vector<int> &codes);
 };

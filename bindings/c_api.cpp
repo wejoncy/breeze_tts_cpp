@@ -4,6 +4,7 @@
 #include "tts/tts.h"
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 
 struct tts_reference {
     std::shared_ptr<const tts::Reference> impl;
@@ -14,31 +15,46 @@ struct tts_engine {
                tts::Quantization quantization = tts::Quantization::None)
         : impl(path, d, b, c, 128, quantization) {}
 };
-static void set_error(char *dst, size_t cap, const char *text) {
-    TTS_LOG(TTS_LOG_ERROR, "api", "{}", text);
+static void set_error(char *dst, size_t cap, const char *text) noexcept {
+    try {
+        TTS_LOG(TTS_LOG_ERROR, "api", "{}", text);
+    } catch (...) {
+    }
     if (dst && cap) {
         std::strncpy(dst, text, cap - 1);
         dst[cap - 1] = 0;
     }
 }
+template <class Function>
+auto api_call(char *error, size_t capacity, const char *fallback, const Function &function)
+    -> decltype(function()) {
+    try {
+        return function();
+    } catch (const std::exception &exception) {
+        set_error(error, capacity, exception.what());
+    } catch (...) {
+        set_error(error, capacity, fallback);
+    }
+    if constexpr (std::is_pointer_v<decltype(function())>) {
+        return nullptr;
+    } else {
+        return -1;
+    }
+}
 extern "C" {
 const char *tts_version() {
-    return "tts.cpp/0.4.0 abi=3 quantization=fp8,int8";
+    static const std::string version = "tts.cpp/0.4.0 abi=" + std::to_string(TTS_ABI_VERSION) +
+                                       " quantization=fp8,int8";
+    return version.c_str();
 }
 tts_engine *tts_create(const char *path, int32_t device, int32_t batch, int32_t context,
                        const char *quantization, char *error, size_t cap) {
-    try {
+    return api_call(error, cap, "unknown initialization failure", [&] {
         if (!path || !path[0])
             throw std::runtime_error("model path is required");
         return new tts_engine(path, device, batch, context,
                               tts::quantization_from_string(quantization ? quantization : ""));
-    } catch (const std::exception &e) {
-        set_error(error, cap, e.what());
-        return nullptr;
-    } catch (...) {
-        set_error(error, cap, "unknown initialization failure");
-        return nullptr;
-    }
+    });
 }
 void tts_destroy(tts_engine *e) {
     if (tts::log::in_callback())
@@ -46,30 +62,20 @@ void tts_destroy(tts_engine *e) {
     delete e;
 }
 int tts_run_async(tts_engine *e, char *error, size_t cap) {
-    try {
+    return api_call(error, cap, "engine startup failed", [&] {
         if (!e)
             throw std::invalid_argument("null engine");
         e->impl.run_async();
         return 0;
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-    } catch (...) {
-        set_error(error, cap, "engine startup failed");
-    }
-    return -1;
+    });
 }
 int tts_shutdown(tts_engine *e, char *error, size_t cap) {
-    try {
+    return api_call(error, cap, "engine shutdown failed", [&] {
         if (!e)
             throw std::invalid_argument("null engine");
         e->impl.shutdown();
         return 0;
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-    } catch (...) {
-        set_error(error, cap, "engine shutdown failed");
-    }
-    return -1;
+    });
 }
 int tts_get_audio_format(const tts_engine *e, tts_audio_format *out, char *error, size_t cap) {
     if (!e || !out) {
@@ -81,20 +87,14 @@ int tts_get_audio_format(const tts_engine *e, tts_audio_format *out, char *error
     return 0;
 }
 int tts_get_memory_stats(tts_engine *e, tts_memory_stats *out, char *error, size_t cap) {
-    try {
+    return api_call(error, cap, "memory stats failed", [&] {
         if (!e || !out)
             throw std::invalid_argument("null memory stats argument");
         auto stats = e->impl.memory_stats();
         *out = {stats.used_bytes, stats.reserved_bytes, stats.peak_used_bytes,
                 stats.peak_reserved_bytes};
         return 0;
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-        return -1;
-    } catch (...) {
-        set_error(error, cap, "memory stats failed");
-        return -1;
-    }
+    });
 }
 }
 
@@ -128,62 +128,50 @@ tts_options tts_default_options() {
             int(o.depth_do_sample),
             int(o.dual_cfg),
             o.cfg_scale_ref,
-            o.cfg_scale_ins};
+            o.cfg_scale_ins,
+            o.speed_factor,
+            o.sample_steps,
+            o.cfg_rate,
+            int(o.synthesis_mode),
+            o.streaming_chunk_seconds,
+            o.streaming_lookahead_seconds,
+            o.streaming_overlap_seconds,
+            o.semantic_lookahead_seconds};
 }
 tts_reference *tts_reference_from_audio(tts_engine *e, const void *bytes, size_t size,
-                                        const char *text, char *error, size_t cap) {
-    try {
+                                        const char *text, const char *language, char *error, size_t cap) {
+    return api_call(error, cap, "reference encoding failed", [&] {
         if (!e)
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
-        return reference(
-            e->impl.encode_audio(tts::read_audio(bytes, size, e->impl.max_reference_samples(),
-                                                 e->impl.audio_format().sample_rate)),
-            std::move(t), e->impl.audio_format().codebooks, e->impl.audio_format().codebook_size);
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-        return nullptr;
-    } catch (...) {
-        set_error(error, cap, "reference encoding failed");
-        return nullptr;
-    }
+        return new tts_reference{e->impl.prepare_reference(
+            tts::read_audio(bytes, size, e->impl.max_reference_samples(),
+                             e->impl.audio_format().sample_rate), std::move(t), language ? language : "")};
+    });
 }
 tts_reference *tts_reference_from_pcm(tts_engine *e, const float *pcm, size_t frames, int32_t sr,
-                                      int32_t channels, const char *text, char *error, size_t cap) {
-    try {
+                                      int32_t channels, const char *text, const char *language,
+                                      char *error, size_t cap) {
+    return api_call(error, cap, "reference encoding failed", [&] {
         if (!e)
             throw std::invalid_argument("null engine");
         auto t = transcript(text);
-        return reference(e->impl.encode_audio(tts::resample_audio(
-                             pcm, frames, sr, channels, e->impl.max_reference_samples(),
-                             e->impl.audio_format().sample_rate)),
-                         std::move(t), e->impl.audio_format().codebooks,
-                         e->impl.audio_format().codebook_size);
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-        return nullptr;
-    } catch (...) {
-        set_error(error, cap, "reference encoding failed");
-        return nullptr;
-    }
+        return new tts_reference{e->impl.prepare_reference(
+            tts::resample_audio(pcm, frames, sr, channels, e->impl.max_reference_samples(),
+                                e->impl.audio_format().sample_rate), std::move(t), language ? language : "")};
+    });
 }
 tts_reference *tts_reference_from_codes(const int32_t *codes, size_t frames, int32_t codebooks,
                                         int32_t entries, const char *text, char *error,
                                         size_t cap) {
-    try {
+    return api_call(error, cap, "reference code import failed", [&] {
         auto t = transcript(text);
         if (!codes || !frames || codebooks < 1 || entries < 1 ||
             frames > SIZE_MAX / sizeof(int) / size_t(codebooks))
             throw std::invalid_argument("invalid reference code count");
         std::vector<int> c(codes, codes + frames * codebooks);
         return reference(std::move(c), std::move(t), codebooks, entries);
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-        return nullptr;
-    } catch (...) {
-        set_error(error, cap, "reference code import failed");
-        return nullptr;
-    }
+    });
 }
 size_t tts_reference_frames(const tts_reference *r) {
     return r ? r->impl->frames() : 0;
@@ -199,7 +187,7 @@ void tts_reference_destroy(tts_reference *r) {
 }
 int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_options *options,
                  tts_audio_callback cb, void *user, tts_stats *stats, char *error, size_t cap) {
-    try {
+    return api_call(error, cap, "unknown inference failure", [&] {
         if (!e || !req || !n || !cb || !stats)
             throw std::invalid_argument("null argument or empty batch");
         if (options && options->abi_version != TTS_ABI_VERSION)
@@ -225,13 +213,28 @@ int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_opti
         native.dual_cfg = bool(o.dual_cfg);
         native.cfg_scale_ref = o.cfg_scale_ref;
         native.cfg_scale_ins = o.cfg_scale_ins;
+        native.speed_factor = o.speed_factor;
+        native.sample_steps = o.sample_steps;
+        native.cfg_rate = o.cfg_rate;
+        if (o.synthesis_mode < TTS_SYNTHESIS_OFFLINE || o.synthesis_mode > TTS_SYNTHESIS_HYBRID)
+            throw std::invalid_argument("invalid synthesis mode");
+        native.synthesis_mode = static_cast<tts::SynthesisMode>(o.synthesis_mode);
+        native.streaming_chunk_seconds = o.streaming_chunk_seconds;
+        native.streaming_lookahead_seconds = o.streaming_lookahead_seconds;
+        native.streaming_overlap_seconds = o.streaming_overlap_seconds;
+        native.semantic_lookahead_seconds = o.semantic_lookahead_seconds;
+        if (!options)
+            native = e->impl.default_options();
         std::vector<tts::Input> requests;
         for (size_t i = 0; i < n; i++) {
             if (!req[i].text)
                 throw std::invalid_argument("text is required");
             requests.push_back({req[i].text, req[i].instruction ? req[i].instruction : "",
                                 req[i].speaker ? req[i].speaker : "S0",
-                                req[i].reference ? req[i].reference->impl : nullptr});
+                                req[i].reference ? req[i].reference->impl : nullptr,
+                                req[i].language ? req[i].language : "",
+                                req[i].text_split_method ? req[i].text_split_method : "",
+                                req[i].fragment_interval});
         }
         tts::Stats r;
         int status = e->impl.generate(
@@ -241,12 +244,6 @@ int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_opti
         *stats = {r.prefill_ms,    r.first_audio_ms, r.total_ms,
                   r.audio_seconds, r.frames,         r.truncated};
         return status;
-    } catch (const std::exception &ex) {
-        set_error(error, cap, ex.what());
-        return -1;
-    } catch (...) {
-        set_error(error, cap, "unknown inference failure");
-        return -1;
-    }
+    });
 }
 }

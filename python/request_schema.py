@@ -2,6 +2,8 @@
 
 import math
 
+MAX_INPUTS = 128
+
 
 class Overloaded(RuntimeError):
     pass
@@ -11,12 +13,20 @@ def validate(payload, batch, defaults):
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")
     requests = payload.get("requests") if batch else [payload]
-    if not isinstance(requests, list) or not 1 <= len(requests) <= 128:
-        raise ValueError("requests must contain 1..128 entries")
+    if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_INPUTS:
+        raise ValueError(f"requests must contain 1..{MAX_INPUTS} entries")
     for r in requests:
         if not isinstance(r, dict):
             raise ValueError("each request must be an object")
-        for field, limit in [("text", 65536), ("instruction", 16384), ("speaker", 256)]:
+        r.setdefault("language", payload.get("language", ""))
+        r.setdefault("text_split_method", payload.get("text_split_method", ""))
+        r.setdefault("fragment_interval", payload.get("fragment_interval", 0.0))
+        if r["text_split_method"] not in ("", "cut0", "cut1", "cut2", "cut3", "cut4", "cut5"):
+            raise ValueError("invalid text_split_method")
+        pause = r["fragment_interval"]
+        if isinstance(pause, bool) or not isinstance(pause, (float, int)) or not math.isfinite(pause) or not 0 <= pause <= 10:
+            raise ValueError("invalid fragment_interval")
+        for field, limit in [("text", 65536), ("instruction", 16384), ("speaker", 256), ("language", 32)]:
             val = r.get(field, "")
             if field == "speaker" and val is None:
                 continue
@@ -27,6 +37,8 @@ def validate(payload, batch, defaults):
     opts = defaults
     aliases = {
         "max_new_tokens": "max_frames",
+        "streaming_window_mode": "synthesis_mode",
+        "gpt_streaming_lookahead_seconds": "semantic_lookahead_seconds",
         **{
             "depth_decoder_" + k: "depth_" + k
             for k in ("temperature", "top_k", "top_p", "do_sample")
@@ -46,6 +58,11 @@ def validate(payload, batch, defaults):
         value = values[name]
         kind = type(getattr(opts, name))
         flag = kind is bool
+        if issubclass(kind, str):
+            if name != "synthesis_mode" or value not in ("offline", "fixed", "hybrid"):
+                raise ValueError("invalid " + name)
+            setattr(opts, name, value)
+            continue
         if (
             not isinstance(value, (int, float))
             or not math.isfinite(value)
@@ -66,8 +83,10 @@ def validate(payload, batch, defaults):
         raise ValueError("both cfg_scale_ref and cfg_scale_ins are required")
     if "cfg_scale_ref" in values:
         opts.dual_cfg = True
-    if opts.max_frames < 1 or opts.cfg_scale <= 0 or opts.repetition_penalty <= 0:
+    if opts.max_frames < 1 or opts.cfg_scale < 0 or opts.repetition_penalty <= 0:
         raise ValueError("generation option outside supported range")
+    if not 0.1 <= opts.speed_factor <= 4 or opts.sample_steps < 0 or opts.cfg_rate < -1:
+        raise ValueError("invalid synthesis controls")
     for prefix in ("", "depth_"):
         if (
             getattr(opts, prefix + "temperature") < 0
@@ -77,19 +96,11 @@ def validate(payload, batch, defaults):
         ):
             raise ValueError("invalid sampling configuration")
     for field in fields:
-        if not math.isfinite(getattr(opts, field.name)):
+        value = getattr(opts, field.name)
+        if not isinstance(value, str) and not math.isfinite(value):
             raise ValueError("nonfinite " + field.name)
     if opts.use_cuda_graph not in (0, 1) or opts.dual_cfg not in (0, 1):
         raise ValueError("invalid execution flag")
-    if (opts.cfg_scale != 1 or opts.dual_cfg) and any(
-        not r.get("instruction") for r in requests
-    ):
-        raise ValueError("CFG requires instruction")
-    if opts.dual_cfg and any(
-        not (r.get("reference") or r.get("ref_audio_path") or r.get("ref_audio"))
-        for r in requests
-    ):
-        raise ValueError("dual CFG requires reference")
     if "stream" in payload and not isinstance(payload["stream"], bool):
         raise ValueError("stream must be boolean")
     return requests, opts
