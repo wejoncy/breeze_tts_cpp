@@ -2,6 +2,9 @@
 #include "ops/cuda/blas_check.h"
 #include "ops/cuda/lt_linear.h"
 #include "ops/cuda/quantization.h"
+#if TTS_HAVE_CUFFT
+#include <cufft.h>
+#endif
 
 namespace tts {
 CudaContext::CudaContext(int ordinal, Quantization format, size_t limit)
@@ -37,7 +40,9 @@ CudaContext::CudaContext(int ordinal, Quantization format, size_t limit)
 }
 CudaContext::~CudaContext() {
     cudaStreamSynchronize(stream);
+#if TTS_HAVE_CUFFT
     for (const auto &plan : fft_plans) cufftDestroy(plan.second);
+#endif
     quantization.reset(); matmul.reset();
     if (lt) cublasLtDestroy(lt);
     if (blas) cublasDestroy(blas);
