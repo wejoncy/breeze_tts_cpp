@@ -80,6 +80,7 @@ add_library(tts SHARED
   src/engine/request_executor.cpp
   src/engine/request_scheduler.cpp
   src/io/audio_io.cpp
+  src/io/audio_speed.cpp
   src/io/mapped_file.cpp
   src/io/model_loader.cpp
   src/io/weights.cpp
@@ -136,10 +137,14 @@ set_source_files_properties(
   PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr")
 set_target_properties(tts PROPERTIES POSITION_INDEPENDENT_CODE ON WINDOWS_EXPORT_ALL_SYMBOLS ON)
 tts_deploy_runtime(tts)
-add_executable(tts_cli src/cli/main.cpp src/cli/cli_platform.cpp)
+add_executable(tts_cli src/cli/main.cpp src/support/main.cpp)
 set_target_properties(tts_cli PROPERTIES OUTPUT_NAME tts ARCHIVE_OUTPUT_NAME tts_cli)
 target_include_directories(tts_cli PRIVATE src "${PROJECT_SOURCE_DIR}")
 target_link_libraries(tts_cli PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts tts_hf_tokenizer CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+option(TTS_BUILD_SERVER "Build the standalone C++ HTTP server" ON)
+if(TTS_BUILD_SERVER)
+  include(cmake/Server.cmake)
+endif()
 option(TTS_BUILD_PYTHON "Build the TVM FFI Python bridge" OFF)
 if(TTS_BUILD_PYTHON)
   include(cmake/Python.cmake)
