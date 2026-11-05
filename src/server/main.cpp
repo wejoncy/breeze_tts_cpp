@@ -7,6 +7,9 @@
 #include <csignal>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <variant>
+#include <type_traits>
 #include <thread>
 
 namespace {
@@ -22,8 +25,7 @@ template <typename Integer> Integer integer(const std::string &text) {
         throw std::invalid_argument("invalid integer: " + text);
     return result;
 }
-size_t mebibytes(const std::string &text) {
-    auto amount = integer<size_t>(text);
+size_t mebibytes(size_t amount) {
     if (amount > SIZE_MAX / (1 << 20))
         throw std::invalid_argument("memory budget is too large");
     return amount * (1 << 20);
@@ -35,72 +37,63 @@ int run_server(int argc, const char *const *argv) {
         tts::http::Config config;
         std::string model, quantization;
         int device = 0, max_batch = 8, context = 2048;
-        size_t runtime_memory = 0, memory_limit = 0;
-        tts_log_config logging{TTS_LOG_INFO, nullptr, 0, nullptr, nullptr};
+        size_t runtime_memory_mb = 0, memory_limit_mb = 0;
+        size_t stream_buffer_mb = config.stream_buffer_bytes >> 20;
+        std::string log_level = "info";
+        using Argument = std::variant<std::string *, int *, size_t *>;
+        const std::map<std::string, Argument> arguments{
+            {"--model", &model},
+            {"--served-model-name", &config.model_name},
+            {"--host", &config.host},
+            {"--port", &config.port},
+            {"--device", &device},
+            {"--max-batch", &max_batch},
+            {"--context", &context},
+            {"--quantization", &quantization},
+            {"--memory-limit-mb", &memory_limit_mb},
+            {"--runtime-memory-mb", &runtime_memory_mb},
+            {"--http-threads", &config.threads},
+            {"--queue-limit", &config.queue_limit},
+            {"--tts-batch-max-items", &config.batch_max_items},
+            {"--stream-buffer-mb", &stream_buffer_mb},
+            {"--request-timeout-seconds", &config.request_timeout_seconds},
+            {"--log-level", &log_level}};
         for (int index = 1; index < argc; ++index) {
             std::string option = argv[index];
-            auto value = [&]() -> std::string {
-                if (++index >= argc)
-                    throw std::invalid_argument("missing value for " + option);
-                return argv[index];
-            };
             if (option == "--help") {
-                std::cout
-                    << "tts-server --model DIR [--host 127.0.0.1] [--port 8088]\n"
-                       "  [--served-model-name NAME] [--device 0] [--max-batch 8] [--context "
-                       "2048]\n"
-                       "  [--quantization fp8|int8] [--tts-batch-max-items 32]\n"
-                       "  [--memory-limit-mb 0] [--runtime-memory-mb 0]\n"
-                       "  [--http-threads 64] [--queue-limit 32] [--stream-buffer-mb 1]\n"
-                       "  [--request-timeout-seconds 300] [--log-level info]\n"
-                       "POST /v1/audio/speech: {input:..., response_format:wav|pcm, stream:false}\n"
-                       "  stream_format=sse enables SSE; streaming requires response_format=pcm\n"
-                       "POST /v1/audio/speech/batch: {items:[{input:...},...]} -> JSON audio "
-                       "results\n"
-                       "GET /health, /v1/models, /v1/model, /v1/audio/speech/{speech_id}\n";
+                std::cout << "tts-server --model DIR [options]\n";
+                for (const auto &[name, field] : arguments)
+                    std::visit(
+                        [&](auto *value) {
+                            std::cout << "  " << name << " VALUE (current: " << *value << ")\n";
+                        },
+                        field);
                 return 0;
-            } else if (option == "--model")
-                model = value();
-            else if (option == "--served-model-name")
-                config.model_name = value();
-            else if (option == "--host")
-                config.host = value();
-            else if (option == "--port")
-                config.port = integer<int>(value());
-            else if (option == "--device")
-                device = integer<int>(value());
-            else if (option == "--max-batch")
-                max_batch = integer<int>(value());
-            else if (option == "--context")
-                context = integer<int>(value());
-            else if (option == "--quantization")
-                quantization = value();
-            else if (option == "--memory-limit-mb")
-                memory_limit = mebibytes(value());
-            else if (option == "--runtime-memory-mb")
-                runtime_memory = mebibytes(value());
-            else if (option == "--http-threads")
-                config.threads = integer<size_t>(value());
-            else if (option == "--queue-limit")
-                config.queue_limit = integer<size_t>(value());
-            else if (option == "--tts-batch-max-items")
-                config.batch_max_items = integer<size_t>(value());
-            else if (option == "--stream-buffer-mb")
-                config.stream_buffer_bytes = mebibytes(value());
-            else if (option == "--request-timeout-seconds")
-                config.request_timeout_seconds = integer<int>(value());
-            else if (option == "--log-level")
-                logging.level = tts::log::parse_level(value());
-            else
+            }
+            auto found = arguments.find(option);
+            if (found == arguments.end())
                 throw std::invalid_argument("unknown argument: " + option);
+            if (++index >= argc)
+                throw std::invalid_argument("missing value for " + option);
+            std::visit(
+                [&](auto *destination) {
+                    using Value = std::remove_reference_t<decltype(*destination)>;
+                    if constexpr (std::is_same_v<Value, std::string>)
+                        *destination = argv[index];
+                    else
+                        *destination = integer<Value>(argv[index]);
+                },
+                found->second);
         }
+        config.stream_buffer_bytes = mebibytes(stream_buffer_mb);
+        tts_log_config logging{tts::log::parse_level(log_level), nullptr, 0, nullptr, nullptr};
         if (model.empty())
             throw std::invalid_argument("--model is required");
         config.validate();
         tts::log::configure(logging);
         tts::Engine engine(model, device, max_batch, context, 128,
-                           tts::quantization_from_string(quantization), runtime_memory,
-                           memory_limit);
+                           tts::quantization_from_string(quantization),
+                           mebibytes(runtime_memory_mb), mebibytes(memory_limit_mb));
         tts::http::Server server(engine, config);
         server.bind();
         engine.run_async();

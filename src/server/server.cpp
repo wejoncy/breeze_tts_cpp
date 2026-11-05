@@ -73,6 +73,7 @@ struct Server::Impl {
         bool submitted = false, terminal = false;
         Speech speech;
         Stats stats;
+        std::string pcm;
         std::unique_ptr<AudioSpeed> speed;
         explicit Job(Impl &server) : owner(server) {
             deadline = Clock::now() + std::chrono::seconds(owner.config.request_timeout_seconds);
@@ -104,7 +105,7 @@ struct Server::Impl {
             if (Clock::now() >= deadline)
                 throw HttpError(504, "generation deadline exceeded");
         }
-        GenerationFrame poll(int timeout, const std::function<bool()> &disconnected) {
+        bool poll(int timeout, const std::function<bool()> &disconnected) {
             check(disconnected);
             GenerationFrame frame;
             try {
@@ -113,20 +114,31 @@ struct Server::Impl {
                 terminal = true;
                 throw;
             } // Native terminal errors consume the ID.
-            if (frame.ready) {
-                terminal = frame.done;
-                stats = frame.stats;
-                if (frame.cancelled)
-                    throw HttpError(422, "generation cancelled");
+            if (!frame.ready)
+                return false;
+            terminal = frame.done;
+            stats = frame.stats;
+            if (frame.cancelled)
+                throw HttpError(422, "generation cancelled");
+            std::string chunk;
+            for (const auto &[lane, samples] : frame.chunks) {
+                if (lane != 0)
+                    throw std::runtime_error("invalid engine output lane");
+                chunk += pcm_bytes(samples);
             }
-            return frame;
+            pcm += speed->process(std::move(chunk), terminal);
+            return true;
         }
-        GenerationFrame next(const std::function<bool()> &disconnected) {
-            for (;;) {
-                auto frame = poll(100, disconnected);
-                if (frame.ready)
-                    return frame;
+        void next(const std::function<bool()> &disconnected) {
+            while (!poll(100, disconnected)) {
             }
+        }
+        std::string audio() {
+            return speech.format == "wav" ? wav_bytes(pcm, owner.audio.sample_rate)
+                                          : std::move(pcm);
+        }
+        const char *media_type() const {
+            return speech.format == "wav" ? "audio/wav" : "audio/pcm";
         }
     };
 
@@ -169,23 +181,23 @@ struct Server::Impl {
                         {"max_batch", engine.batch_capacity()}});
         });
         const auto &info = engine.model_info();
-        Json metadata{{"id", config.model_name},
-                      {"model_type", info.model_type},
-                      {"sample_rate", audio.sample_rate},
-                      {"frame_rate", double(audio.sample_rate) / audio.samples_per_frame},
-                      {"max_new_tokens", info.max_output_frames},
-                      {"max_batch_texts", config.batch_max_items}};
-        http.Get("/v1/model", [metadata](const httplib::Request &, httplib::Response &response) {
-            json_reply(response, 200, metadata);
-        });
-        Json models{{"object", "list"},
-                    {"data", Json::array({{{"id", config.model_name},
-                                           {"object", "model"},
-                                           {"created", 0},
-                                           {"owned_by", "local"}}})}};
-        http.Get("/v1/models", [models](const httplib::Request &, httplib::Response &response) {
-            json_reply(response, 200, models);
-        });
+        auto metadata = [&](const char *route, Json value) {
+            http.Get(route, [value = std::move(value)](const httplib::Request &,
+                                                       httplib::Response &response) {
+                json_reply(response, 200, value);
+            });
+        };
+        metadata("/v1/model", {{"id", config.model_name},
+                               {"model_type", info.model_type},
+                               {"sample_rate", audio.sample_rate},
+                               {"frame_rate", double(audio.sample_rate) / audio.samples_per_frame},
+                               {"max_new_tokens", info.max_output_frames},
+                               {"max_batch_texts", config.batch_max_items}});
+        metadata("/v1/models", {{"object", "list"},
+                                {"data", Json::array({{{"id", config.model_name},
+                                                       {"object", "model"},
+                                                       {"created", 0},
+                                                       {"owned_by", "local"}}})}});
         http.Get(R"(/v1/audio/speech/([A-Za-z0-9._:-]+))",
                  [this](const httplib::Request &request, httplib::Response &response) {
                      Json result;
@@ -302,25 +314,18 @@ struct Server::Impl {
                           const std::string &id) const {
         response.set_header("X-Request-Id", request.get_header_value("X-Request-Id", id.c_str()));
     }
-    static void append(const GenerationFrame &frame, std::string &pcm) {
-        for (const auto &chunk : frame.chunks) {
-            if (chunk.first != 0)
-                throw std::runtime_error("invalid engine output lane");
-            pcm += pcm_bytes(chunk.second);
-        }
-    }
     void speech(const httplib::Request &request, httplib::Response &response,
                 const Payload &payload) {
         auto job = prepare(payload.value, payload.uploaded_audio, request.is_connection_closed);
         start(*job, request.is_connection_closed);
-        auto frame = job->next(request.is_connection_closed);
+        job->next(request.is_connection_closed);
         identity_headers(request, response, job->request.request_id);
         audio_headers(response);
         if (job->speech.stream) {
             response.set_header("X-SGLang-Omni-Speech-Id", job->request.request_id);
             response.set_chunked_content_provider(
                 job->speech.sse ? "text/event-stream" : "audio/pcm",
-                [this, job, pending = std::move(frame)](size_t, httplib::DataSink &sink) mutable {
+                [this, job](size_t, httplib::DataSink &sink) {
                     auto event = [&](const Json &value) {
                         auto bytes = "data: " + value.dump() + "\n\n";
                         return sink.write(bytes.data(), bytes.size());
@@ -328,19 +333,18 @@ struct Server::Impl {
                     try {
                         for (;;) {
                             job->check([&] { return !sink.is_writable(); });
-                            std::string pcm;
-                            append(pending, pcm);
-                            pcm = job->speed->process(std::move(pcm), pending.done);
-                            if (!pcm.empty()) {
+                            if (!job->pcm.empty()) {
                                 bool written =
                                     job->speech.sse
-                                        ? event({{"type", "speech.audio.delta"},
-                                                 {"audio", httplib::detail::base64_encode(pcm)}})
-                                        : sink.write(pcm.data(), pcm.size());
+                                        ? event(
+                                              {{"type", "speech.audio.delta"},
+                                               {"audio", httplib::detail::base64_encode(job->pcm)}})
+                                        : sink.write(job->pcm.data(), job->pcm.size());
                                 if (!written)
                                     return false;
                             }
-                            if (pending.done) {
+                            job->pcm.clear();
+                            if (job->terminal) {
                                 record(*job);
                                 if (job->speech.sse &&
                                     !event({{"type", "speech.audio.done"},
@@ -350,7 +354,7 @@ struct Server::Impl {
                                 sink.done();
                                 return true;
                             }
-                            pending = job->next([&] { return !sink.is_writable(); });
+                            job->next([&] { return !sink.is_writable(); });
                         }
                     } catch (...) {
                         auto error = api_error(std::current_exception());
@@ -367,21 +371,13 @@ struct Server::Impl {
                 [job](bool) {});
             return;
         }
-        std::string pcm;
-        for (;;) {
-            append(frame, pcm);
-            if (frame.done)
-                break;
-            frame = job->next(request.is_connection_closed);
-        }
+        while (!job->terminal)
+            job->next(request.is_connection_closed);
         response.set_header("X-Finish-Reason", finish_reason(job->stats));
         response.set_header("X-Engine-Time", std::to_string(job->stats.total_ms / 1000));
         response.set_header("Content-Disposition",
                             "attachment; filename=\"speech." + job->speech.format + "\"");
-        pcm = job->speed->process(std::move(pcm), true);
-        response.set_content(job->speech.format == "wav" ? wav_bytes(pcm, audio.sample_rate)
-                                                         : std::move(pcm),
-                             job->speech.format == "wav" ? "audio/wav" : "audio/pcm");
+        response.set_content(job->audio(), job->media_type());
     }
     void batch(const httplib::Request &request, httplib::Response &response,
                const Payload &payload) {
@@ -393,10 +389,7 @@ struct Server::Impl {
         defaults.erase("items");
         auto envelope = defaults;
         envelope["input"] = "batch";
-        parse_speech(envelope, engine.default_options());
-        if ((defaults.contains("stream") &&
-             (!defaults.at("stream").is_boolean() || defaults.at("stream").get<bool>())) ||
-            text_field(defaults, "stream_format", 16, "audio") != "audio")
+        if (parse_speech(envelope, engine.default_options()).stream)
             throw std::invalid_argument("batch speech does not support streaming");
         std::string batch_id;
         {
@@ -404,18 +397,23 @@ struct Server::Impl {
             batch_id = "speech-batch-" + std::to_string(++sequence);
         }
         std::vector<std::shared_ptr<Job>> jobs(items.size());
-        std::vector<std::string> pcm(items.size());
         Json results = Json::array();
         for (size_t index = 0; index < items.size(); ++index)
             results.push_back({{"index", index}});
-        auto failed = [&](size_t index, std::exception_ptr error) {
-            results[index]["status"] = "error";
-            results[index]["error"] = api_error(error).at("error");
-            jobs[index].reset();
-        };
-        // Prepare all references before synthesis starts, then submit every valid item.
-        for (size_t index = 0; index < items.size(); ++index) {
+        size_t remaining = items.size(), succeeded = 0;
+        auto attempt = [&](size_t index, auto work) {
             try {
+                work();
+            } catch (...) {
+                results[index]["status"] = "error";
+                results[index]["error"] = api_error(std::current_exception()).at("error");
+                jobs[index].reset();
+                --remaining;
+            }
+        };
+        // Prepare references before synthesis starts, then submit every valid item.
+        for (size_t index = 0; index < items.size(); ++index)
+            attempt(index, [&] {
                 if (!items[index].is_object())
                     throw std::invalid_argument("batch item must be an object");
                 auto merged = defaults;
@@ -424,49 +422,27 @@ struct Server::Impl {
                                       request.is_connection_closed);
                 if (jobs[index]->speech.stream)
                     throw std::invalid_argument("batch speech does not support streaming");
-            } catch (...) {
-                failed(index, std::current_exception());
-            }
-        }
-        size_t remaining = 0, succeeded = 0;
-        for (size_t index = 0; index < jobs.size(); ++index) {
-            if (!jobs[index])
-                continue;
-            try {
-                start(*jobs[index], request.is_connection_closed);
-                ++remaining;
-            } catch (...) {
-                failed(index, std::current_exception());
-            }
-        }
+            });
+        for (size_t index = 0; index < jobs.size(); ++index)
+            if (jobs[index])
+                attempt(index, [&] { start(*jobs[index], request.is_connection_closed); });
         auto consume = [&](size_t index, int timeout) {
-            try {
-                auto frame = jobs[index]->poll(timeout, request.is_connection_closed);
-                if (!frame.ready)
-                    return false;
-                append(frame, pcm[index]);
-                if (frame.done) {
-                    const auto &job = *jobs[index];
-                    auto adjusted = job.speed->process(std::move(pcm[index]), true);
-                    auto bytes = job.speech.format == "wav" ? wav_bytes(adjusted, audio.sample_rate)
-                                                            : std::move(adjusted);
-                    results[index].update(
-                        {{"status", "success"},
-                         {"audio_data", httplib::detail::base64_encode(bytes)},
-                         {"format", job.speech.format},
-                         {"media_type", job.speech.format == "wav" ? "audio/wav" : "audio/pcm"},
-                         {"finish_reason", finish_reason(job.stats)}});
-                    jobs[index].reset();
-                    --remaining;
-                    ++succeeded;
-                    pcm[index].clear();
-                }
-                return true;
-            } catch (...) {
-                failed(index, std::current_exception());
+            bool ready = true;
+            attempt(index, [&] {
+                auto &job = *jobs[index];
+                ready = job.poll(timeout, request.is_connection_closed);
+                if (!ready || !job.terminal)
+                    return;
+                results[index].update({{"status", "success"},
+                                       {"audio_data", httplib::detail::base64_encode(job.audio())},
+                                       {"format", job.speech.format},
+                                       {"media_type", job.media_type()},
+                                       {"finish_reason", finish_reason(job.stats)}});
+                jobs[index].reset();
                 --remaining;
-                return true;
-            }
+                ++succeeded;
+            });
+            return ready;
         };
         // Drain every item fairly so independent generation never waits for the first item to
         // finish.
