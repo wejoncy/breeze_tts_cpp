@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
-#include <cufft.h>
 
 namespace tts {
 __device__ inline void dependency_wait() {
@@ -118,10 +117,16 @@ static bool compiled_pdl_support() {
     return compiled.ptxVersion >= 90;
 }
 void initialize_cuda_kernels(CudaContext &cuda) {
+#if TTS_HAVE_PRONUNCIATION
     cuda_kernels::initialize_pronunciation();
+#endif
     cuda_kernels::initialize_vector_quantization();
+#if TTS_HAVE_CUFFT
     cuda_kernels::initialize_spectral();
+#endif
+#if TTS_HAVE_RELATIVE_ATTENTION
     cuda_kernels::initialize_relative_attention();
+#endif
     cuda_kernels::initialize_audio();
     initialize_flash_attention();
     for (auto type : {Type::BF16, Type::F16})

@@ -5,7 +5,6 @@
 #include <array>
 #include <map>
 #include <cublasLt.h>
-#include <cufft.h>
 
 namespace tts {
 class LtLinear;
@@ -17,7 +16,7 @@ struct CudaContext {
     const int device;
     const cudaStream_t stream;
     Buffer gemm_workspace, attention_lse, decode_output, decode_lse, fft_workspace;
-    std::map<std::pair<int, int>, cufftHandle> fft_plans;
+    std::map<std::pair<int, int>, int> fft_plans; // Opaque cuFFT plan identifiers.
     std::array<int, 4> gemv_slots{};
     std::array<int, 8> flash_decode_slots{};
     int qkv_gemv_capacity = 0;

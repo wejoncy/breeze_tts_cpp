@@ -18,6 +18,13 @@ cmake -S . -B build -DTTS_BUILD_PYTHON=OFF
 cmake --build build --config Release --parallel
 ```
 
+For a Breeze-only build, add `-DTTS_ENABLE_GPT_SOVITS=OFF`. This excludes
+GPT-SoVITS and its auxiliary models, phoneme frontend, cppjieba, fastText,
+Open JTalk/MeCab-Ko and cuFFT. Breeze voice cloning and streaming remain available.
+The option defaults to `ON`.
+Compiled factory units register themselves by `model_type`; disabled models are
+absent from the registry without model-specific branches in the loader.
+
 GPU targets default to CMake's `native` detection. For cross-compilation or a
 machine without a visible GPU, select the deployment architectures explicitly
 with `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS`. BF16 is the default.
