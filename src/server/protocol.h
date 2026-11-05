@@ -12,7 +12,7 @@ struct Payload {
     std::string uploaded_audio;
 };
 Payload parse_body(const httplib::Request &);
-GenerationOptions parse_options(Json, GenerationOptions);
+GenerationOptions parse_options(const Json &, GenerationOptions);
 struct Speech {
     Input input;
     GenerationOptions options;

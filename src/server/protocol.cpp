@@ -7,8 +7,42 @@
 #include <sstream>
 #include <type_traits>
 
+namespace tts {
+void to_json(Json &value, SynthesisMode mode) {
+    value = synthesis_mode_name(mode);
+}
+void from_json(const Json &value, SynthesisMode &mode) {
+    mode = parse_synthesis_mode(value.get<std::string>());
+}
+// HTTP serialization stays at the adapter boundary, outside the Engine API.
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GenerationOptions, max_frames, top_k, temperature, cfg_scale,
+                                   seed, use_cuda_graph, top_p, repetition_penalty, do_sample,
+                                   depth_top_k, depth_temperature, depth_top_p, depth_do_sample,
+                                   dual_cfg, cfg_scale_ref, cfg_scale_ins, speed_factor,
+                                   sample_steps, cfg_rate, synthesis_mode, streaming_chunk_seconds,
+                                   streaming_lookahead_seconds, streaming_overlap_seconds,
+                                   semantic_lookahead_seconds)
+} // namespace tts
+
 namespace tts::http {
 namespace {
+std::string option_name(const std::string &name) {
+    for (const auto &alias : {std::pair{"max_new_tokens", "max_frames"},
+                              {"streaming_window_mode", "synthesis_mode"},
+                              {"gpt_streaming_lookahead_seconds", "semantic_lookahead_seconds"},
+                              {"depth_decoder_temperature", "depth_temperature"},
+                              {"depth_decoder_top_k", "depth_top_k"},
+                              {"depth_decoder_top_p", "depth_top_p"},
+                              {"depth_decoder_do_sample", "depth_do_sample"}})
+        if (name == alias.first)
+            return alias.second;
+    return name;
+}
+std::string lowercase(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return char(std::tolower(ch)); });
+    return text;
+}
 template <typename Value> Value number(const Json &value, const std::string &name) {
     bool valid = value.is_number() && !value.is_boolean();
     if constexpr (std::is_integral_v<Value>) {
@@ -50,141 +84,97 @@ Payload parse_body(const httplib::Request &request) {
         throw std::invalid_argument("request body is empty");
     Payload payload{Json::object(), {}};
     auto &value = payload.value;
-    auto insert = [&](const std::string &name, const std::string &content) {
-        if (name.empty() || value.contains(name))
-            throw std::invalid_argument("invalid or duplicate form field");
-        value[name] = content;
-    };
-    const auto type = request.get_header_value("Content-Type");
-    if (request.is_multipart_form_data()) {
-        auto upload = [&](const std::string &name, const std::string &content) {
-            if (name != "ref_audio" || value.contains(name))
-                throw std::invalid_argument("only one ref_audio upload is supported");
-            insert(name, "");
-            payload.uploaded_audio = content;
-            if (payload.uploaded_audio.empty())
-                throw std::invalid_argument("empty ref_audio upload");
-        };
-        for (const auto &[name, field] : request.form.fields) {
-            if (name == "ref_audio")
-                upload(name, field.content);
-            else
-                insert(name, field.content);
-        }
-        for (const auto &[name, file] : request.form.files)
-            upload(name, file.content);
-    } else if (type.find("application/x-www-form-urlencoded") == 0) {
-        // httplib params also include the URL query; keep speech bodies unambiguous.
-        if (request.target.find('?') != std::string::npos)
-            throw std::invalid_argument("form parameters must be in the body");
-        for (const auto &field : request.params)
-            insert(field.first, field.second);
-    } else {
+    const bool multipart = request.is_multipart_form_data();
+    const bool form =
+        request.get_header_value("Content-Type").find("application/x-www-form-urlencoded") == 0;
+    if (!multipart && !form) {
         value = parse_json(request.body);
         if (!value.is_object())
             throw std::invalid_argument("JSON object required");
         return payload;
     }
-    for (const auto *name : {"items",
-                             "references",
-                             "speed",
-                             "max_frames",
-                             "max_new_tokens",
-                             "seed",
-                             "top_k",
-                             "sample_steps",
-                             "depth_top_k",
-                             "depth_decoder_top_k",
-                             "temperature",
-                             "speed_factor",
-                             "streaming_chunk_seconds",
-                             "streaming_lookahead_seconds",
-                             "streaming_overlap_seconds",
-                             "semantic_lookahead_seconds",
-                             "gpt_streaming_lookahead_seconds",
-                             "fragment_interval",
-                             "cfg_rate",
-                             "top_p",
-                             "cfg_scale",
-                             "cfg_scale_ref",
-                             "cfg_scale_ins",
-                             "repetition_penalty",
-                             "depth_temperature",
-                             "depth_top_p",
-                             "depth_decoder_temperature",
-                             "depth_decoder_top_p"})
-        if (value.contains(name))
-            value[name] = parse_json(value.at(name).get<std::string>());
-    for (const auto *name : {"stream", "do_sample", "depth_do_sample", "depth_decoder_do_sample",
-                             "use_cuda_graph", "dual_cfg"}) {
-        if (!value.contains(name))
-            continue;
-        auto text = value.at(name).get<std::string>();
-        std::transform(text.begin(), text.end(), text.begin(),
-                       [](unsigned char ch) { return char(std::tolower(ch)); });
-        if (text != "true" && text != "false" && text != "1" && text != "0")
-            throw std::invalid_argument(std::string("invalid ") + name);
-        value[name] = text == "true" || text == "1";
+    Json fields = GenerationOptions{};
+    fields.update({{"items", Json::array()},
+                   {"references", Json::array()},
+                   {"speed", 1.0},
+                   {"fragment_interval", 0.0},
+                   {"stream", false}});
+    auto insert = [&](const std::string &name, const std::string &content, bool file = false) {
+        if (name.empty() || value.contains(name) || (file && name != "ref_audio"))
+            throw std::invalid_argument("invalid or duplicate form field");
+        auto &field = value[name];
+        if (multipart && name == "ref_audio") {
+            if (content.empty())
+                throw std::invalid_argument("empty ref_audio upload");
+            payload.uploaded_audio = content;
+            field = "";
+            return;
+        }
+        auto type = fields.find(option_name(name));
+        if (type == fields.end() || type->is_string())
+            field = content;
+        else if (!type->is_boolean())
+            field = parse_json(content);
+        else {
+            auto text = lowercase(content);
+            if (text != "true" && text != "false" && text != "1" && text != "0")
+                throw std::invalid_argument("invalid " + name);
+            field = text == "true" || text == "1";
+        }
+    };
+    if (multipart) {
+        for (const auto &[name, field] : request.form.fields)
+            insert(name, field.content);
+        for (const auto &[name, file] : request.form.files)
+            insert(name, file.content, true);
+    } else {
+        // httplib merges query parameters with form fields.
+        if (request.target.find('?') != std::string::npos)
+            throw std::invalid_argument("form parameters must be in the body");
+        for (const auto &[name, content] : request.params)
+            insert(name, content);
     }
     return payload;
 }
 
-GenerationOptions parse_options(Json values, GenerationOptions options) {
-    for (const auto &alias : {std::pair{"max_new_tokens", "max_frames"},
-                              {"streaming_window_mode", "synthesis_mode"},
-                              {"gpt_streaming_lookahead_seconds", "semantic_lookahead_seconds"},
-                              {"depth_decoder_temperature", "depth_temperature"},
-                              {"depth_decoder_top_k", "depth_top_k"},
-                              {"depth_decoder_top_p", "depth_top_p"},
-                              {"depth_decoder_do_sample", "depth_do_sample"}}) {
-        if (!values.contains(alias.first))
+GenerationOptions parse_options(const Json &values, GenerationOptions options) {
+    Json fields = options, supplied = Json::object();
+    for (const auto &[name, field] : values.items()) {
+        auto canonical = option_name(name);
+        if (!fields.contains(canonical))
             continue;
-        if (values.contains(alias.second))
-            throw std::invalid_argument(std::string("conflicting option aliases: ") + alias.second);
-        values[alias.second] = values.at(alias.first);
+        if (supplied.contains(canonical))
+            throw std::invalid_argument("conflicting option aliases: " + canonical);
+        supplied[canonical] = field;
     }
     for (const auto *name : {"temperature", "top_k", "top_p", "do_sample"}) {
         auto depth = std::string("depth_") + name;
-        if (values.contains(name) && !values.contains(depth))
-            values[depth] = values.at(name);
+        if (supplied.contains(name) && !supplied.contains(depth))
+            supplied[depth] = supplied.at(name);
     }
-    auto set = [&](const char *name, auto &destination) {
-        if (!values.contains(name) || values.at(name).is_null())
-            return;
-        using Value = std::decay_t<decltype(destination)>;
-        if constexpr (std::is_same_v<Value, bool>)
-            destination = flag(values.at(name), name);
+    for (const auto &[name, field] : supplied.items()) {
+        auto &target = fields.at(name);
+        if (field.is_null() && !target.is_string())
+            continue;
+        if (target.is_boolean())
+            target = flag(field, name);
+        else if (target.is_number_unsigned())
+            target = number<uint64_t>(field, name);
+        else if (target.is_number_integer())
+            target = number<int>(field, name);
+        else if (target.is_number())
+            target = number<double>(field, name);
         else
-            destination = number<Value>(values.at(name), name);
-    };
-    set("max_frames", options.max_frames);
-    set("top_k", options.top_k);
-    set("temperature", options.temperature);
-    set("cfg_scale", options.cfg_scale);
-    set("seed", options.seed);
-    set("use_cuda_graph", options.use_cuda_graph);
-    set("top_p", options.top_p);
-    set("repetition_penalty", options.repetition_penalty);
-    set("do_sample", options.do_sample);
-    set("depth_top_k", options.depth_top_k);
-    set("depth_temperature", options.depth_temperature);
-    set("depth_top_p", options.depth_top_p);
-    set("depth_do_sample", options.depth_do_sample);
-    set("dual_cfg", options.dual_cfg);
-    set("cfg_scale_ref", options.cfg_scale_ref);
-    set("cfg_scale_ins", options.cfg_scale_ins);
-    set("speed_factor", options.speed_factor);
-    set("sample_steps", options.sample_steps);
-    set("cfg_rate", options.cfg_rate);
-    set("streaming_chunk_seconds", options.streaming_chunk_seconds);
-    set("streaming_lookahead_seconds", options.streaming_lookahead_seconds);
-    set("streaming_overlap_seconds", options.streaming_overlap_seconds);
-    set("semantic_lookahead_seconds", options.semantic_lookahead_seconds);
-    if (values.contains("synthesis_mode"))
-        options.synthesis_mode = parse_synthesis_mode(text_field(values, "synthesis_mode", 16));
-    if (values.contains("cfg_scale_ref") != values.contains("cfg_scale_ins"))
+            target = parse_synthesis_mode(text_field(supplied, name.c_str(), 16));
+    }
+    fields.get_to(options);
+    fields = options;
+    for (const auto &[name, field] : fields.items())
+        if (field.is_number() && !std::isfinite(field.get<double>()))
+            throw std::invalid_argument("out of range " + name);
+    if (supplied.contains("cfg_scale_ref") != supplied.contains("cfg_scale_ins"))
         throw std::invalid_argument("both cfg_scale_ref and cfg_scale_ins are required");
-    if (values.contains("cfg_scale_ref"))
+    if (supplied.contains("cfg_scale_ref"))
         options.dual_cfg = true;
     auto sampling_valid = [](float temperature, int top_k, float top_p) {
         return temperature >= 0 && top_k >= 0 && top_p > 0 && top_p <= 1;
@@ -240,8 +230,7 @@ Speech parse_speech(Json &value, GenerationOptions defaults) {
         if (!value.contains(name))
             continue;
         auto language = text_field(value, name, 32);
-        std::transform(language.begin(), language.end(), language.begin(),
-                       [](unsigned char ch) { return char(std::tolower(ch)); });
+        language = lowercase(std::move(language));
         for (const auto &label : {std::pair{"chinese", "zh"},
                                   {"english", "en"},
                                   {"japanese", "ja"},
