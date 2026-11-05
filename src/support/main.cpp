@@ -1,6 +1,9 @@
 #include "support/log.h"
 
-int run_cli(int argc, const char *const *argv);
+#ifndef TTS_ENTRY_POINT
+#define TTS_ENTRY_POINT run_cli
+#endif
+int TTS_ENTRY_POINT(int argc, const char *const *argv);
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -33,14 +36,14 @@ int wmain(int argc, wchar_t **argv) {
         std::vector<const char *> pointers;
         for (const auto &text : arguments)
             pointers.push_back(text.c_str());
-        return run_cli(argc, pointers.data());
+        return TTS_ENTRY_POINT(argc, pointers.data());
     } catch (const std::exception &error) {
-        TTS_LOG(TTS_LOG_ERROR, "cli", "{}", error.what());
+        TTS_LOG(TTS_LOG_ERROR, "main", "{}", error.what());
         return 1;
     }
 }
 #else
 int main(int argc, char **argv) {
-    return run_cli(argc, argv);
+    return TTS_ENTRY_POINT(argc, argv);
 }
 #endif

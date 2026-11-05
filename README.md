@@ -10,7 +10,8 @@ Requires CMake 3.28+, a C++17 compiler, CUDA 13+, Rust/Cargo, Git, libsndfile an
 libsoxr. Rust is a build dependency only. CUDA/cuBLAS and audio libraries are
 found locally; [FetchContent](cmake/Dependencies.cmake) fetches pinned JSON,
 spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention, cppjieba, fastText,
-Open JTalk/MeCab-Ko and missing audio headers.
+Open JTalk/MeCab-Ko and missing audio headers. The native HTTP server also fetches
+cpp-httplib.
 
 ```sh
 cmake -S . -B build -DTTS_BUILD_PYTHON=OFF
@@ -103,7 +104,7 @@ build/tts --model models/Breeze-TTS-2 --batch requests.jsonl --output batch
 
 # Streaming: signed PCM16, 24 kHz, mono. ffplay is an optional external player.
 build/tts --model models/Breeze-TTS-2 --text 'Hello.' --stream - --output speech.wav \
-  | ffplay -f s16le -ar 24000 -ac 1 -
+  | ffplay -f s16le -ar 24000 -ch_layout mono -i pipe:0
 ```
 
 Batch output is `batch.0.wav`, `batch.1.wav`, etc.; lanes have independent EOS.
@@ -113,7 +114,77 @@ Add `--instruction TEXT --cfg-scale 3` for instruction guidance, or
 context and quantization options. `--repeat 3` separates cold and warm requests;
 metrics go to stderr. Keep an engine process alive to reuse weights, memory and graphs.
 
-## Python and HTTP
+## HTTP
+
+The standalone C++ server builds by default and needs no Python. Its speech
+protocol follows [SGLang-Omni](https://sgl-project.github.io/sglang-omni/basic_usage/tts.html):
+
+```sh
+build/tts-server --model models/Breeze-TTS-2 --served-model-name breeze --port 8088
+
+curl http://127.0.0.1:8088/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"breeze","input":"你好，欢迎使用语音合成。","voice":"default"}' -o speech.wav
+
+curl -N http://127.0.0.1:8088/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"你好。","stream":true,"response_format":"pcm"}' \
+  | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0
+
+curl http://127.0.0.1:8088/v1/audio/speech \
+  -F 'input=你好。' -F 'ref_audio=@reference.wav' -F 'ref_text=参考音频的准确文字。' \
+  -o clone.wav
+```
+
+PowerShell (including 5.1): send UTF-8 JSON through stdin and keep the binary
+audio pipe inside `cmd.exe`. Neither the request nor the audio is written to disk.
+`curl.exe` and `ffplay.exe` must be on `PATH`; 24000 Hz is Breeze's sample rate.
+
+```powershell
+$previousEncoding = $OutputEncoding
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    '{"model":"breeze","input":"你好，这是实时流式语音。","stream":true,"response_format":"pcm"}' |
+        cmd.exe /d /c 'curl.exe -sS -N http://127.0.0.1:8088/v1/audio/speech -H "Content-Type: application/json" --data-binary @- | ffplay.exe -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0'
+} finally {
+    $OutputEncoding = $previousEncoding
+}
+```
+
+| HTTP endpoint | Result |
+|---|---|
+| `POST /v1/audio/speech` | WAV by default; `response_format: "pcm"` for raw PCM |
+| `POST /v1/audio/speech/batch` | `{"items": [{"input":"..."}, ...]}` to ordered JSON results with base64 `audio_data` or per-item errors |
+| `GET /v1/audio/speech/{speech_id}` | Recent completed stream's `finish_reason` and nullable `usage` |
+| `GET /health`, `GET /v1/models`, `GET /v1/model` | Readiness, served model list and native metadata |
+
+Use `speed` (0.25–4), `instructions`, `language`, `max_new_tokens` and sampling
+controls in speech requests. Playback speed uses stateful audio resampling;
+it does not require model-specific acoustic controls. Batch defaults merge with each item's overrides;
+batch streaming is rejected. For SSE, set `stream_format: "sse"` and
+`response_format: "pcm"`; events carry `speech.audio.delta` with base64 PCM,
+then `speech.audio.done` or `error`. Raw PCM streams have no in-band events.
+`X-Sample-Rate`, `X-Channels` and `X-Bit-Depth` describe the audio; the raw stream's
+`X-SGLang-Omni-Speech-Id` identifies its completed outcome. Token usage is `null`
+because the native Engine does not report model-specific token counts.
+
+Reference input accepts base64 `ref_audio` plus `ref_text`, a multipart upload,
+or one `references: [{"audio_path":"data:audio/wav;base64,...","text":"..."}]`.
+Server-side paths and remote reference URLs are unsupported. Output formats
+are WAV and PCM; other formats and unsupported model-specific controls return
+OpenAI-style errors. This server does not implement SGLang-Omni's uploaded-voice
+registry or text-input WebSocket sessions.
+
+Concurrent HTTP requests share one native Engine and its continuous batching.
+Disconnects, generation deadlines and shutdown cancel outstanding requests.
+`--queue-limit` bounds admitted requests, `--stream-buffer-mb` bounds each native
+output queue, and `--http-threads` sets the HTTP worker limit. Bodies are limited
+to 64 MiB. `--tts-batch-max-items` defaults to 32. `--served-model-name` defaults
+to the loaded model's type; discover it with `/v1/models`. `--help` lists memory,
+quantization and timeout controls. Disable the executable with
+`-DTTS_BUILD_SERVER=OFF`. Windows builds produce `Release/tts-server.exe`.
+
+## Python
 
 Install dependencies into your Python environment and enable the bridge:
 
@@ -145,15 +216,8 @@ with Engine(model="models/Breeze-TTS-2", max_batch=8) as engine:
 receive `(batch_index, pcm_bytes)` incrementally; returning `False` cancels generation.
 Prepared references can be reused; `codes()` / `reference_from_codes()` support persistence.
 
-| HTTP endpoint | Result |
-|---|---|
-| `POST /v1/audio/speech` | Streaming PCM, or WAV with `"stream": false` |
-| `POST /v1/audio/batch` | `{"requests": [...]}` to a ZIP of WAVs and metrics |
-| `GET /health` | Readiness |
-
-Speech requests accept JSON text/instruction/sampling fields; reference input is
-base64 `ref_audio` plus `ref_text`, or a multipart audio upload. Larger HTTP batches
-use bounded GPU microbatches. Disconnects cancel generation.
+The optional Python HTTP example retains its own `text` and ZIP-batch protocol.
+Use the native server for the SGLang-Omni speech API.
 
 The C++ engine continuously batches active requests, admitting new work at audio-frame
 boundaries and reusing slots as individual requests finish. It shares model weights and GPU
