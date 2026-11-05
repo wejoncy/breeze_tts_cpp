@@ -27,7 +27,6 @@ add_library(tts SHARED
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
-  src/ops/kernels/sequence/sequence_conditioning.cu
   src/layers/convolution.cpp
   src/layers/transformer.cpp
   src/execution/model_registry.cpp

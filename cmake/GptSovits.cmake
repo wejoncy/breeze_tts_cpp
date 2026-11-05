@@ -25,6 +25,7 @@ set_target_properties(tts_text PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tts_text PRIVATE include src "${PROJECT_SOURCE_DIR}")
 target_link_libraries(tts_text PRIVATE nlohmann_json::nlohmann_json tts_cppjieba tts_fasttext openjtalk tts_mecab)
 target_sources(tts PRIVATE
+  src/ops/kernels/sequence/sequence_conditioning.cu
   src/execution/model_factories/gpt_sovits.cpp
   src/ops/cuda/relative_attention.cpp
   src/ops/cuda/fft.cpp
