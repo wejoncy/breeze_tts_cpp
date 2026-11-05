@@ -28,7 +28,6 @@ add_library(tts SHARED
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
   src/layers/convolution.cpp
-  src/layers/transformer.cpp
   src/execution/model_registry.cpp
   src/execution/model_factories/breeze.cpp
   src/execution/model_runtime.cpp
@@ -43,7 +42,6 @@ add_library(tts SHARED
   src/io/audio_speed.cpp
   src/io/mapped_file.cpp
   src/io/model_loader.cpp
-  src/io/weights.cpp
   src/io/safetensors.cpp
   src/ops/kernels/attention/flash_attention.cu
   src/ops/kernels/attention/flash_decoding.cu
