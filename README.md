@@ -124,15 +124,15 @@ build/tts-server --model models/Breeze-TTS-2 --served-model-name breeze --port 8
 
 curl http://127.0.0.1:8088/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model":"breeze","input":"你好，欢迎使用语音合成。","voice":"default"}' -o speech.wav
+  -d '{"model":"breeze","input":"Hello, welcome to speech synthesis.","voice":"default"}' -o speech.wav
 
 curl -N http://127.0.0.1:8088/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"你好。","stream":true,"response_format":"pcm"}' \
+  -d '{"input":"Hello.","stream":true,"response_format":"pcm"}' \
   | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0
 
 curl http://127.0.0.1:8088/v1/audio/speech \
-  -F 'input=你好。' -F 'ref_audio=@reference.wav' -F 'ref_text=参考音频的准确文字。' \
+  -F 'input=Hello.' -F 'ref_audio=@reference.wav' -F 'ref_text=Exact transcript of the reference audio.' \
   -o clone.wav
 ```
 
@@ -144,7 +144,7 @@ audio pipe inside `cmd.exe`. Neither the request nor the audio is written to dis
 $previousEncoding = $OutputEncoding
 try {
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    '{"model":"breeze","input":"你好，这是实时流式语音。","stream":true,"response_format":"pcm"}' |
+    '{"model":"breeze","input":"Hello, this is streaming speech.","stream":true,"response_format":"pcm"}' |
         cmd.exe /d /c 'curl.exe -sS -N http://127.0.0.1:8088/v1/audio/speech -H "Content-Type: application/json" --data-binary @- | ffplay.exe -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0'
 } finally {
     $OutputEncoding = $previousEncoding
