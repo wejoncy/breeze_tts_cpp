@@ -441,7 +441,7 @@
       source.start(job.nextTime);
       job.nextTime += audio.duration;
       job.samples += samples;
-      setStatus(`正在生成并播放 · 已生成 ${(job.samples / format.rate).toFixed(1)} 秒`, true);
+      setStatus(`正在生成并播放 · 已生成 ${(job.samples / format.rate).toFixed(1)} 秒 · 用时 ${((performance.now() - job.startedAt) / 1000).toFixed(1)} 秒`, true);
       return data.slice(size);
     }
 
@@ -475,7 +475,7 @@
       let context;
       try { context = new AudioContext({latencyHint: "interactive"}); }
       catch { setStatus("无法打开音频设备，请检查浏览器的声音设置。", false, true); return; }
-      const job = {controller: new AbortController(), context,
+      const job = {controller: new AbortController(), context, startedAt: performance.now(),
         sources: new Set(), nextTime: 0, samples: 0, received: false, completion: "播放完成"};
       current = job;
       $("generate").disabled = true;
@@ -521,6 +521,7 @@
           pending = schedulePcm(job, data, format);
         }
         if (pending.byteLength || !job.samples) throw new Error("未收到完整音频，请重试。");
+        const elapsed = ((performance.now() - job.startedAt) / 1000).toFixed(1);
         const speechId = response.headers.get("X-SGLang-Omni-Speech-Id");
         if (speechId) {
           const outcome = await fetch(`/v1/audio/speech/${encodeURIComponent(speechId)}`, {cache: "no-store", signal: job.controller.signal});
@@ -529,9 +530,9 @@
         }
         if (job.controller.signal.aborted) return;
         job.received = true;
-        setStatus(`合成完成 · ${(job.samples / format.rate).toFixed(1)} 秒，正在播放`, true);
+        job.completion += ` · ${(job.samples / format.rate).toFixed(1)} 秒 · 用时 ${elapsed} 秒`;
+        setStatus(`合成完成 · ${(job.samples / format.rate).toFixed(1)} 秒 · 用时 ${elapsed} 秒，正在播放`, true);
         if (job.sources.size === 0) finish(job, job.completion);
-        else job.completion += ` · ${(job.samples / format.rate).toFixed(1)} 秒`;
       } catch (error) {
         if (current !== job) return;
         releasePlayback(job);
