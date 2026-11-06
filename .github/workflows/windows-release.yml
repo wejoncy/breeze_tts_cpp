@@ -45,7 +45,7 @@ jobs:
       - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: ${{ inputs.cuda_version }}
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cuobjdump"]'
+          sub-packages: '["nvcc", "crt", "nvvm", "thrust", "cudart", "cublas", "cublas_dev", "cuobjdump"]'
           use-github-cache: false
 
       - name: Fetch pinned audio build tools
@@ -54,7 +54,8 @@ jobs:
           repository: microsoft/vcpkg
           ref: 054bd01bec7f31492ec9ac063740cc984a0fe59e
           path: build/ci/vcpkg
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: audio-cache
         with:
           path: build/cache/vcpkg
           key: windows-x64-audio-${{ hashFiles('.github/windows/vcpkg.json') }}
@@ -66,6 +67,12 @@ jobs:
           & ./build/ci/vcpkg/vcpkg.exe install --triplet x64-windows `
             --x-manifest-root=.github/windows --x-install-root=build/ci/audio
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Save audio binary cache
+        if: steps.audio-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build/cache/vcpkg
+          key: ${{ steps.audio-cache.outputs.cache-primary-key }}
 
       - name: Configure and build Release
         run: |
