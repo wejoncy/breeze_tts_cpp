@@ -1,5 +1,6 @@
 """Locate the native artifact from build metadata, then load its dependencies locally."""
 
+import ctypes
 import json
 import os
 import threading
@@ -79,6 +80,10 @@ def _load(path):
                 directory.close()
             raise
     try:
+        if os.name == "nt":
+            # Use Python's DLL loader so scoped search directories apply to
+            # dependencies. Keep this reference until TVM acquires its own.
+            _preloaded_library = ctypes.WinDLL(str(path))
         library = tvm_ffi.load_module(str(path))
     except BaseException:
         for directory in directories:
