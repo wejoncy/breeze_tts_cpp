@@ -1,0 +1,6 @@
+{
+  "name": "tts-windows-audio",
+  "version-string": "1",
+  "builtin-baseline": "054bd01bec7f31492ec9ac063740cc984a0fe59e",
+  "dependencies": ["libsndfile", "soxr"]
+}
