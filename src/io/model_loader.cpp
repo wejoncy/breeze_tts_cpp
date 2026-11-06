@@ -1,4 +1,6 @@
 #include "io/model_loader.h"
+#include "support/init_log.h"
+#include "support/log.h"
 #include <filesystem>
 #include <set>
 
@@ -18,6 +20,7 @@ std::string ModelLoader::path(const std::string &relative) const {
 ModelLoader::Checkpoint ModelLoader::open(std::initializer_list<Source> sources,
                                           std::initializer_list<const char *> assets) const {
     if (!sources.size()) throw std::invalid_argument("model has no weight sources");
+    log::InitPhase phase("checkpoint mapping");
     Checkpoint checkpoint;
     std::set<std::string> files;
     auto asset = [&](const std::string &relative) {
@@ -33,6 +36,7 @@ ModelLoader::Checkpoint ModelLoader::open(std::initializer_list<Source> sources,
             asset((std::filesystem::u8path(source.subdirectory) /
                    std::filesystem::u8path(file)).generic_u8string());
     checkpoint.files.assign(files.begin(), files.end());
+    TTS_LOG(TTS_LOG_DEBUG, "engine.init", "checkpoint assets={}", checkpoint.files.size());
     return checkpoint;
 }
 } // namespace tts

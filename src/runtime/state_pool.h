@@ -81,6 +81,7 @@ class StatePool {
             rows_.push_back(std::make_unique<Row>(layout));
     }
     const std::vector<std::unique_ptr<Row>> &rows() const { return rows_; }
+    const Layout &layout() const { return layout_; }
     const SequenceStateSpec &history_spec(std::string_view name) const {
         for (const auto &field : layout_.histories)
             if (field.first == name) return field.second;

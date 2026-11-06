@@ -44,7 +44,7 @@ auto api_call(char *error, size_t capacity, const char *fallback, const Function
 extern "C" {
 const char *tts_version() {
     static const std::string version = "tts.cpp/0.4.0 abi=" + std::to_string(TTS_ABI_VERSION) +
-                                       " quantization=fp8,int8";
+                                       " quantization=int8,fp8,group_int8,group_fp8";
     return version.c_str();
 }
 tts_engine *tts_create(const char *path, int32_t device, int32_t batch, int32_t context,

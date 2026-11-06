@@ -21,10 +21,16 @@ struct RequestExecutor::Impl {
     ModelRunner &runner;
     uint64_t engine_id;
     Mailbox<Command> ready;
-    std::unordered_map<uint64_t, std::unique_ptr<ModelRunner::RequestState>> states;
+    struct State {
+        uint64_t request;
+        std::unique_ptr<ModelRunner::RequestState> value;
+    };
+    std::unordered_map<uint64_t, State> states;
     struct Request {
         std::unique_ptr<RequestPlan> plan;
         std::unique_ptr<ModelRunner::RequestAdmission> admission;
+        size_t cache_pages = 0, cache_rows = 0, peak_cache_bytes = 0;
+        bool cache_reported = false;
     };
     std::unordered_map<uint64_t, Request> requests;
     std::function<void(Completion)> completed;
@@ -33,13 +39,82 @@ struct RequestExecutor::Impl {
     std::vector<const ExecutionRow *> rows;
     std::vector<ModelRunner::RequestState *> prefill, batch_states;
     std::vector<AudioCallback> callbacks;
+    std::chrono::steady_clock::time_point next_cache_log{};
+    void log_cache_usage(bool changed) {
+        if (!log::enabled(TTS_LOG_INFO))
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const bool periodic = now >= next_cache_log;
+        if (!periodic && !changed)
+            return;
+        const auto usage = runner.cache_usage();
+        constexpr double mib = 1024.0 * 1024.0;
+        const auto percent = [](size_t used, size_t total) {
+            return total ? 100.0 * double(used) / double(total) : 0.0;
+        };
+        for (auto &entry : requests) {
+            entry.second.cache_pages = 0;
+            entry.second.cache_rows = 0;
+        }
+        for (const auto &entry : states) {
+            auto &request = requests.at(entry.second.request);
+            ++request.cache_rows;
+            if (const auto &cache = entry.second.value->cache)
+                request.cache_pages += cache->pages().size();
+        }
+        bool admitted = false;
+        for (auto &entry : requests) {
+            auto &request = entry.second;
+            const size_t used = request.cache_pages * usage.page_bytes +
+                request.cache_rows * usage.state_kv_bytes_per_row;
+            request.peak_cache_bytes = std::max(request.peak_cache_bytes, used);
+            if (!request.admission)
+                continue;
+            const bool first = !request.cache_reported;
+            admitted |= first;
+            if ((first || periodic) && log::enabled(TTS_LOG_DEBUG)) {
+                log::Scope scope(engine_id, entry.first);
+                TTS_LOG(TTS_LOG_DEBUG, "request.kv",
+                        "{} used={:.0f} MiB paged_pages={} observed_peak={:.0f} MiB device_used={:.2f}%",
+                        first ? "admitted" : "active", used / mib, request.cache_pages,
+                        request.peak_cache_bytes / mib,
+                        percent(used, usage.device_bytes));
+            }
+            request.cache_reported = true;
+        }
+        if (periodic || admitted || changed) {
+            const size_t used = size_t(usage.used_pages) * usage.page_bytes +
+                states.size() * usage.state_kv_bytes_per_row;
+            const size_t paged_backed = size_t(usage.backed_pages) * usage.page_bytes;
+            const size_t backed = paged_backed + size_t(usage.state_rows) * usage.state_kv_bytes_per_row;
+            TTS_LOG(TTS_LOG_INFO, "engine.kv", "KV cache usage={:.1f}%", percent(used, backed));
+            next_cache_log = now + std::chrono::seconds(1);
+        }
+    }
+    void release_request(uint64_t id) {
+        const auto found = requests.find(id);
+        if (found == requests.end())
+            return;
+        log::Scope scope(engine_id, id);
+        TTS_LOG(TTS_LOG_DEBUG, "request.kv", "released observed_peak={:.0f} MiB",
+                found->second.peak_cache_bytes / (1024.0 * 1024.0));
+        requests.erase(found);
+    }
+    void clear_requests() {
+        const bool changed = !states.empty() || !requests.empty();
+        states.clear();
+        requests.clear();
+        if (changed)
+            log_cache_usage(true);
+    }
     void execute(ExecutionBatch &batch, Completion &result) {
         Range trace("tts.engine.execute");
         result.resources_released = !batch.release.empty() || !batch.release_requests.empty();
+        bool cache_changed = result.resources_released;
         for (auto id : batch.release)
             states.erase(id);
         for (auto id : batch.release_requests)
-            requests.erase(id);
+            release_request(id);
         for (auto &request : batch.requests)
             requests.emplace(request.id, Request{std::move(request.plan), {}});
         std::unordered_map<uint64_t, std::exception_ptr> rejected;
@@ -65,8 +140,10 @@ struct RequestExecutor::Impl {
                 try {
                     log::Scope scope(engine_id, row.request);
                     auto &request = requests.at(row.request);
-                    if (!request.admission)
+                    if (!request.admission) {
                         request.admission = runner.admit(*request.plan);
+                        cache_changed |= bool(request.admission);
+                    }
                     if (!request.admission) {
                         deferred.insert(row.request);
                         continue;
@@ -76,7 +153,7 @@ struct RequestExecutor::Impl {
                         out.deferred = true;
                         continue;
                     }
-                    states.emplace(row.id, std::move(state));
+                    states.emplace(row.id, State{row.request, std::move(state)});
                 } catch (const DeviceError &) {
                     throw;
                 } catch (...) {
@@ -89,9 +166,9 @@ struct RequestExecutor::Impl {
         // queued step. Use executor-owned progress rather than stale metadata.
         for (const auto *row : rows) {
             auto found = states.find(row->id);
-            if (found != states.end() && !found->second->prefilled() &&
-                !found->second->done() && !rejected.count(row->request))
-                prefill.push_back(found->second.get());
+            if (found != states.end() && !found->second.value->prefilled() &&
+                !found->second.value->done() && !rejected.count(row->request))
+                prefill.push_back(found->second.value.get());
         }
         if (!prefill.empty()) {
             auto deadline = std::chrono::steady_clock::now() +
@@ -117,9 +194,9 @@ struct RequestExecutor::Impl {
                 out.error = error->second;
                 out.done = true;
             }
-            if (out.done || states.at(row.id)->done() || !states.at(row.id)->prefilled())
+            if (out.done || states.at(row.id).value->done() || !states.at(row.id).value->prefilled())
                 continue;
-            batch_states.push_back(states.at(row.id).get());
+            batch_states.push_back(states.at(row.id).value.get());
             callbacks.push_back([output = &result.rows[i].pcm](int, const int16_t *pcm, size_t count) {
                 if (count > output->capacity() - output->size())
                     throw std::logic_error("audio step exceeds initialized output capacity");
@@ -134,12 +211,13 @@ struct RequestExecutor::Impl {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
         result.decoded_rows = int(batch_states.size());
+        log_cache_usage(cache_changed);
         for (size_t i = 0; i < result.valid_rows; ++i) {
             auto &out = result.rows[i];
             auto found = states.find(out.id);
             if (found == states.end())
                 continue;
-            auto &state = *found->second;
+            auto &state = *found->second.value;
             out.stats = state.stats();
             out.prefilled = state.prefilled();
             out.done |= state.done();
@@ -166,8 +244,7 @@ struct RequestExecutor::Impl {
                     runner.prepare_tasks(command.preparation);
                 } catch (...) {
                     fatal = std::current_exception();
-                    states.clear();
-                    requests.clear();
+                    clear_requests();
                     Completion result;
                     result.fatal = fatal;
                     completed(std::move(result));
@@ -196,13 +273,11 @@ struct RequestExecutor::Impl {
                 execute(command.batch, result);
             } catch (...) {
                 result.fatal = fatal = std::current_exception();
-                states.clear();
-                requests.clear();
+                clear_requests();
             }
             completed(std::move(result));
         }
-        states.clear();
-        requests.clear();
+        clear_requests();
     }
 
   public:

@@ -3,6 +3,9 @@
 #include "ops/storage.h"
 #include "ops/sequence.h"
 #include "ops/sampling.h"
+#include "ops/kernels/quant/row_quantize.h"
+#include "ops/kernels/quant/quant_norm.h"
+#include "ops/kernels/quant/quant_gated.h"
 #include "runtime/cuda_context.h"
 
 namespace tts::ops {
@@ -43,20 +46,24 @@ void zero(TensorView tensor) {
     CUDA(cudaMemsetAsync(tensor.data, 0, tensor.size(), execution_context(tensor).stream));
 }
 void prepare_quantized(TensorView weight, int rows, int output_channels, int input_channels,
-                        Type type, const Epilogue &epilogue) {
+                        Type type, const Epilogue &epilogue, QuantizationGroups groups) {
     auto &quantized = *execution_context(weight).quantization;
-    quantized.prepare(rows, output_channels, input_channels, type);
-    quantized.prepare_finish(rows, output_channels, input_channels, type, epilogue);
+    quantized.prepare(rows, output_channels, input_channels, type, groups);
+    quantized.prepare_finish(rows, output_channels, input_channels, type, epilogue, groups);
 }
 void quantized_norm(TensorView input, TensorView update, TensorView weight, RowScaledView output,
                       float epsilon, bool gemma, TensorView scale) {
-    execution_context(input).quantization->norm(input, update, weight, output, epsilon, gemma, scale);
+    const auto stream = execution_context(input, {update, weight, output.values, output.scales, scale}).stream;
+    launch_quantized_norm(input, update, weight, output, epsilon, gemma, scale, stream);
 }
 void quantized_gated(TensorView input, RowScaledView output, int kind) {
-    execution_context(input).quantization->gated(input, output, kind);
+    const auto &context = execution_context(input, {output.values, output.scales});
+    launch_quantized_gated(input, output, kind, context.stream, context.multiprocessors,
+                           context.quant_gated_clusters);
 }
 void matmul(RowScaledView input, RowScaledView weight, TensorView output) {
-    execution_context(output).quantization->linear(input, weight, output);
+    execution_context(output, {input.values, input.scales, weight.values, weight.scales})
+        .quantization->linear(input, weight, output);
 }
 void upload_bytes(TensorView destination, const void *source, size_t bytes) {
     if (!destination.dense() || bytes > destination.size() || (bytes && (!source || !destination.data)))
@@ -69,6 +76,13 @@ void download_bytes(TensorView source, void *destination, size_t bytes) {
     execution_context(source).memory.download(destination, source.data, bytes);
 }
 void quantize_rows(TensorView input, RowScaledView output) {
-    execution_context(input).quantization->quantize(input, output);
+    output.validate();
+    if ((input.type != Type::BF16 && input.type != Type::F16) ||
+        input.rows < 1 || input.cols < 1 || !input.data ||
+        !output.values.data || !output.scales.data ||
+        input.rows != output.values.rows || input.cols != output.values.cols)
+        throw std::invalid_argument("quantization source/destination shape/type mismatch");
+    const auto stream = execution_context(input, {output.values, output.scales}).stream;
+    launch_row_quantize(input, output, stream);
 }
 } // namespace tts::ops

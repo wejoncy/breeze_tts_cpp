@@ -5,6 +5,7 @@
 #include "tts/memory_stats.h"
 #include "runtime/block_pool.h"
 #include "runtime/error.h"
+#include "ops/cuda/cuda_check.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -14,11 +15,6 @@
 #include <cstring>
 
 namespace tts {
-inline void check(cudaError_t s, const char *expr) {
-    if (s != cudaSuccess)
-        throw DeviceError(std::string(expr) + ": " + cudaGetErrorString(s));
-}
-#define CUDA(x) ::tts::check((x), #x)
 // One execution stream and its pool. Model, KV, workspaces and tuning buffers
 // share this resource. Owning tensors retain it until their storage is released.
 class DeviceContext final : public BufferAllocator, public std::enable_shared_from_this<DeviceContext> {

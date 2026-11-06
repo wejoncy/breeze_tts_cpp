@@ -1,11 +1,20 @@
 #include "ops/linear.h"
 #include "ops/basic.h"
+#include "ops/storage.h"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/norm_projection.h"
 #include <type_traits>
 
 namespace tts::ops {
 namespace {
+void check_operand_device(TensorView anchor, const LinearOperand &operand) {
+    std::visit([&](auto matrix) {
+        if constexpr (std::is_same_v<decltype(matrix), TensorView>)
+            execution_context(anchor, {matrix});
+        else
+            execution_context(anchor, {matrix.values, matrix.scales});
+    }, operand);
+}
 void check_linear_output(TensorView output, TensorView bias, const Epilogue &e) {
     if (e.bias.data)
         throw std::invalid_argument("linear already owns its bias");
@@ -19,16 +28,8 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
     auto &gpu = execution_context(output, {bias, e.residual, e.gate, e.condition, e.raw,
                                     scratch.values, scratch.scales,
                                     quantized_output.values, quantized_output.scales});
-    auto device = [&](const LinearOperand &operand) {
-        std::visit([&](auto matrix) {
-            if constexpr (std::is_same_v<decltype(matrix), TensorView>)
-                execution_context(output, {matrix});
-            else
-                execution_context(output, {matrix.values, matrix.scales});
-        }, operand);
-    };
-    device(input);
-    device(weight);
+    check_operand_device(output, input);
+    check_operand_device(output, weight);
     check_linear_output(output, bias, e);
     e.bias = bias;
     if (quantized_output.values.data)
@@ -51,7 +52,7 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
             matrix.validate();
             RowScaledView activation;
             if (const auto *dense = std::get_if<TensorView>(&input)) {
-                gpu.quantization->quantize(*dense, scratch);
+                quantize_rows(*dense, scratch);
                 activation = scratch;
             } else {
                 activation = std::get<RowScaledView>(input);
@@ -63,7 +64,7 @@ void linear(const LinearOperand &input, const LinearOperand &weight, TensorView 
             if (!e.packed && !e.condition_sources && !e.output_rows && quantized_output.values.data &&
                 quantized_output.values.type == matrix.values.type &&
                 gpu.quantization->linear_finish(activation, matrix, output, e)) {
-                gpu.quantization->quantize(output, quantized_output);
+                quantize_rows(output, quantized_output);
                 return true;
             }
             gpu.quantization->linear(activation, matrix, output);
@@ -87,7 +88,10 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
                        RowScaledView quantized_output) {
     auto &gpu = execution_context(input, {bias, normalized, output, norm_weight, norm_bias,
                                    fusion.residual, fusion.projection_bias,
+                                   fusion.raw, fusion.gate, fusion.shift, fusion.scale,
+                                   e.residual, e.gate, e.condition, e.raw,
                                    quantized_output.values, quantized_output.scales});
+    check_operand_device(input, weight);
     check_linear_output(output, bias, e);
     if (writeback && writeback->bias.data != bias.data)
         throw std::invalid_argument("linear already owns its bias");
@@ -103,7 +107,7 @@ bool normalized_linear(TensorView input, const LinearOperand &weight, TensorView
             e.bias = bias;
             validate_pointwise_quantize(output, quantized_output, e);
             if (quantized_output.values.type == quantized->values.type && project(e)) {
-                gpu.quantization->quantize(output, quantized_output);
+                quantize_rows(output, quantized_output);
             } else {
                 if (!project({})) return false;
                 pointwise_quantize( output, quantized_output, e, {},

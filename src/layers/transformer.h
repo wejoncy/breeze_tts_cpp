@@ -17,7 +17,8 @@ struct EncoderBlock {
 // dense post-norm attention/MLP execution without checkpoint-family branches.
 class TransformerEncoder {
     std::vector<EncoderBlock> blocks_;
-    int hidden_, heads_, quant_input_channels_ = 0;
+    int hidden_, heads_;
+    Linear::Workspace::Capacity quantization_capacity_;
     Type type_;
 
     struct Workspace {

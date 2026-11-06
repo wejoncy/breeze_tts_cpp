@@ -43,6 +43,12 @@ class ModelRunner {
         std::exception_ptr error() const { return failure; }
     };
     ~ModelRunner();
+    struct CacheUsage {
+        size_t page_bytes, device_bytes, state_kv_bytes_per_row;
+        int used_pages, backed_pages, state_rows;
+    };
+    // Executor-owned counters only: no CUDA query, synchronization or allocation.
+    CacheUsage cache_usage() const;
     // Init-time host staging bound for all audio callbacks of one input in one
     // step(), including any pending tail and inter-segment silence.
     size_t max_step_samples() const;

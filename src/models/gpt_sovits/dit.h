@@ -27,7 +27,7 @@ class DiT {
     TensorView text_positions_, rotary_;
     Tensor final_time_modulation_;
     std::map<int, int> sampling_offsets_;
-    int quant_input_channels_ = 0;
+    Linear::Workspace::Capacity quantization_capacity_;
 
   public:
     struct Condition {

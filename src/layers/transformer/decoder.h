@@ -7,6 +7,7 @@
 #include "core/row_capacity.h"
 #include "core/forward_batch.h"
 #include "core/forward_context.h"
+#include "layers/quantization.h"
 
 namespace tts {
 struct TransformerLayer {
@@ -17,7 +18,7 @@ struct TransformerLayer {
 class Transformer {
     struct Workspace {
         Buffer normed, projected, query, attended, update, gateup, gated;
-        Buffer quant_values, quant_scales;
+        QuantizationWorkspace quantization;
         int batch, capacity, max_rows;
         Workspace(const TransformerConfig &c, int b, int cap, int rows)
             : normed(c.quantization != Quantization::None ? 0 : size_t(rows) * c.hidden * bytes(c.type)),
@@ -26,10 +27,10 @@ class Transformer {
               attended(query.size()), update(size_t(rows) * c.hidden * bytes(c.type)),
               gateup(size_t(rows) * c.intermediate * 2 * bytes(c.type)),
               gated(c.quantization != Quantization::None ? 0 : gateup.size() / 2),
-              quant_values(c.quantization != Quantization::None
-                               ? size_t(rows) * std::max(c.hidden, c.intermediate)
-                               : 0),
-              quant_scales(c.quantization != Quantization::None ? size_t(rows) * sizeof(float) : 0),
+              quantization(rows, c.quantization != Quantization::None
+                  ? QuantizationWorkspace::Capacity::matrix(std::max(c.hidden, c.intermediate),
+                                                           quantization_groups(c.quantization).activation)
+                  : QuantizationWorkspace::Capacity{}),
               batch(b), capacity(cap), max_rows(rows) {}
     };
 
@@ -179,7 +180,8 @@ class Transformer {
         for (auto shape :
              {std::pair{(c.heads + 2 * c.kvheads) * c.dim, c.hidden},
               std::pair{2 * c.intermediate, c.hidden}, std::pair{c.hidden, c.intermediate}})
-            ops::prepare_quantized(layers.front().pre, rows, shape.first, shape.second, config.type);
+            ops::prepare_quantized(layers.front().pre, rows, shape.first, shape.second, config.type,
+                                   {}, quantization_groups(c.quantization));
     }
     void prepare(Workspace &workspace, int max_rows) const {
         prepare_range(max_rows);
@@ -233,8 +235,8 @@ class Transformer {
         auto gu = s.gateup.view(n, 2 * c.intermediate, c.type),
              g = quantized ? TensorView{} : s.gated.view(n, c.intermediate, c.type);
         auto quant_view = [&](int cols) -> RowScaledView {
-            return {s.quant_values.view(n, cols, quantized_type(c.quantization)),
-                    s.quant_scales.view(n, 1, Type::F32)};
+            return s.quantization.view(n, cols, quantized_type(c.quantization),
+                                       quantization_groups(c.quantization));
         };
         if (quantized)
             ops::quantized_norm(x, {}, layers[0].pre, quant_view(c.hidden), c.eps, c.gemma);

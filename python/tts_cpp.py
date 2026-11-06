@@ -11,6 +11,8 @@ from native_library import load_library
 from native_types import Options
 from tts_logging import check_not_in_callback, configure_logging  # noqa: F401 -- public API
 
+QUANTIZATIONS = ("int8", "fp8", "group_int8", "group_fp8")
+
 
 class Reference:
     def __init__(self, module, handle):
@@ -53,8 +55,8 @@ class Engine:
         memory_limit_mb=0,
     ):
         check_not_in_callback()
-        if quantization not in (None, "fp8", "int8"):
-            raise ValueError("quantization must be fp8 or int8")
+        if quantization is not None and quantization not in QUANTIZATIONS:
+            raise ValueError("quantization must be " + ", ".join(QUANTIZATIONS))
         if type(runtime_memory_mb) is not int or not 0 <= runtime_memory_mb < 2**43:
             raise ValueError("runtime_memory_mb must be a nonnegative integer")
         if type(memory_limit_mb) is not int or not 0 <= memory_limit_mb < 2**43:

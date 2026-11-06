@@ -96,7 +96,7 @@ void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs
         }
         auto head_context = context;
         head_context.max_rows = context.max_batch;
-        // Preserve FP32 head output through CFG and sampling.
+        // Keep the FP32 accumulator through CFG and sampling, as in the official runtime.
         auto logits = head_context.tensor({head_context.max_rows, lm_head.rows}, Type::F32)
                           .slice(0, hidden_states.rows);
         Linear(lm_head).forward(hidden_states, logits, head_context);

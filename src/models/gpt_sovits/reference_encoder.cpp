@@ -1,6 +1,7 @@
 #include "ops/basic.h"
 #include "models/gpt_sovits/reference_encoder.h"
 #include "ops/vector_quantization.h"
+#include "ops/storage.h"
 #include <cmath>
 
 namespace tts {

@@ -1,5 +1,6 @@
 #pragma once
 #include "layers/transformer.h"
+#include "core/forward_context.h"
 #include "io/json.h"
 
 namespace tts {

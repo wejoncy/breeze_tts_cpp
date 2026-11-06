@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "layers/audio/wavenet.h"
+#include "core/forward_context.h"
 namespace tts {
 WaveNet::WaveNet(Weights &w, const std::string &prefix, int layers, int dilation_rate)
     : pre_(w, prefix + ".pre"), conditioning_(w, prefix + ".enc.cond_layer"),

@@ -1,5 +1,6 @@
 #include "execution/model_registry.h"
 #include "io/model_loader.h"
+#include "support/init_log.h"
 
 namespace tts {
 const ModelRegistration *&ModelRegistration::head() {
@@ -30,8 +31,10 @@ std::unique_ptr<ModelRuntime> load_model(const std::string &directory,
     if (options.device < 0 || options.max_batch < 1 || options.context < 1 ||
         options.kv_page_tokens < 1)
         throw std::invalid_argument("invalid model runtime limits");
+    log::InitPhase phase("model configuration");
     const ModelLoader loader(directory);
     auto factory = ModelRegistration::resolve(loader.config().at("model_type").get<std::string>());
+    phase.next("model runtime");
     return std::make_unique<ModelRuntime>(loader, options, factory);
 }
 } // namespace tts

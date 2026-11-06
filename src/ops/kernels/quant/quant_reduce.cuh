@@ -4,7 +4,8 @@
 #include <cuda_runtime.h>
 #include "core/tensor.h"
 namespace tts {
-// Split-K partials remain in the accumulator type until the final scaled store.
+// Split-K partials remain in the accumulator type until the final store.
+// Null outer scales mean each partial already includes its K-group scales.
 template <class Acc, class D>
 static __global__ void quant_split_reduce_scale(const Acc *partial, const float *sx,
                                                 const float *sw, D *y, int m, int n, int splits) {
@@ -13,7 +14,7 @@ static __global__ void quant_split_reduce_scale(const Acc *partial, const float 
         Acc v = 0;
         for (int s = 0; s < splits; ++s)
             v += partial[size_t(s) * m * n + i];
-        y[i] = D(v * sx[i / n] * sw[i % n]);
+        y[i] = D(sx ? v * sx[i / n] * sw[i % n] : v);
     }
 }
 template <class Acc>

@@ -1,6 +1,7 @@
 #include "ops/kernels/common/storage_dispatch.cuh"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
+#include "ops/kernels/quant/quant_output.cuh"
 #include <cstring>
 
 namespace tts::ops {
@@ -147,7 +148,7 @@ conv_finish_row_kernel(View x, View y, int rows, int input_length, ConvGeometry 
 template <class T, Type Storage>
 __global__ void pointwise_quantize_kernel(View x, View y, int cols, Finish f,
                                           cutlass::FastDivmod repeat, cutlass::FastDivmod sequence,
-                                          QuantizedRowOutput<Storage> output, bool cached) {
+                                          quant_device::RowOutput<Storage> output, bool cached) {
     using Pack = quant_device::ValuePack<T, 4>;
     using Math = quant_device::Packed16<T>;
     using Pair = typename Math::Pair;
@@ -171,6 +172,14 @@ __global__ void pointwise_quantize_kernel(View x, View y, int cols, Finish f,
         }
         return value;
     };
+    if (output.group_size) {
+        for (int column = threadIdx.x * 4; column < cols; column += blockDim.x * 4) {
+            Pack value = transform(quant_device::load_pack<Pack>(input + column, cols - column), column, f);
+            if (retained) quant_device::store_pack(retained + column, value, cols - column);
+            output.store_group(value, row, column, cols);
+        }
+        return;
+    }
     constexpr int packets = 4;
     uint2 registers[packets]{};
     bool register_cached = cols <= int(blockDim.x) * 4 * packets;
@@ -329,7 +338,7 @@ void pointwise_quantize( TensorView x, RowScaledView q,
     int threads = 256;
     if (shape.rows < multiprocessors)
         while (threads < 1024 && threads * 4 < shape.cols) threads *= 2;
-    if (shape.cols <= threads * 4 * 4) shared = 0;
+    if (shape.cols <= threads * 4 * 4 || q.group_size) shared = 0;
 
     auto launch = [&](auto type, auto output) {
         pointwise_quantize_kernel<decltype(type), decltype(output)::storage_type>
@@ -338,11 +347,11 @@ void pointwise_quantize( TensorView x, RowScaledView q,
                 cutlass::FastDivmod(e.rows_per_sequence), output, cached);
     };
     if (x.type == Type::F16) {
-        if (q.values.type == Type::I8) launch(__half{}, QuantizedRowOutput<Type::I8>(q));
-        else launch(__half{}, QuantizedRowOutput<Type::FP8>(q));
+        if (q.values.type == Type::I8) launch(__half{}, quant_device::RowOutput<Type::I8>(q));
+        else launch(__half{}, quant_device::RowOutput<Type::FP8>(q));
     } else {
-        if (q.values.type == Type::I8) launch(bf16{}, QuantizedRowOutput<Type::I8>(q));
-        else launch(bf16{}, QuantizedRowOutput<Type::FP8>(q));
+        if (q.values.type == Type::I8) launch(bf16{}, quant_device::RowOutput<Type::I8>(q));
+        else launch(bf16{}, quant_device::RowOutput<Type::FP8>(q));
     }
     CUDA(cudaGetLastError());
 }

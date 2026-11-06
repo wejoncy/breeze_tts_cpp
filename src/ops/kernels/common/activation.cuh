@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/sequence.h"
+#include "ops/activation.h"
 #include <cutlass/fast_math.h>
 namespace tts::ops {
 __device__ __forceinline__ float activate(float x, Activation kind, float alpha) {

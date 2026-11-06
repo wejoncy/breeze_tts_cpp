@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "models/g2pw/model.h"
+#include "io/weights.h"
 #include "ops/pronunciation.h"
 #include <cstdint>
 

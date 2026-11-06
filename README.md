@@ -31,6 +31,8 @@ with `CMAKE_CUDA_ARCHITECTURES` or `CUDAARCHS`. BF16 is the default.
 `--quantization int8` supports SM80+;
 `--quantization fp8` supports SM90+. Both use per-channel weights and dynamic
 per-token activations; FlashAttention and its Q/K/V/KV storage keep the checkpoint's 16-bit dtype.
+`group_int8` (SM80+) and `group_fp8` (SM90+) add matched H128 rotation followed by
+K128 group scales for both weights and dynamic activations, using the same shared layers and ops.
 Quantization speed and accuracy depend on the workload; FP8 is not always faster.
 
 On Windows, use an x64 MSVC developer shell, CUDA and the MSVC Rust toolchain.

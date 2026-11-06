@@ -1,5 +1,5 @@
 #pragma once
-#include "runtime/device.h"
+#include "core/buffer.h"
 #include "core/quantization.h"
 #include "core/kernel_problem.h"
 #include <memory>
@@ -17,19 +17,18 @@ class QuantizedGemm {
     std::unique_ptr<Impl> impl;
 
   public:
-    QuantizedGemm(DeviceContext &memory, cublasLtHandle_t handle, Buffer &workspace,
+    QuantizedGemm(cudaStream_t stream, cublasLtHandle_t handle, Buffer &workspace,
                  Type format = Type::FP8);
     ~QuantizedGemm();
     QuantizedGemm(const QuantizedGemm &) = delete;
-    Type type() const;
     void seal();
     QuantCacheStats cache_stats() const;
     // Output dtype is part of the prepared execution contract. Inputs/weights
-    // retain quantized storage; quantize() explicitly accepts F16 or BF16.
-    void prepare(int rows, int output_channels, int input_channels, Type output_type = Type::BF16);
+    // retain quantized storage; encoding belongs to the standalone quantization op.
+    void prepare(int rows, int output_channels, int input_channels, Type output_type = Type::BF16,
+                 QuantizationGroups groups = {});
     void prepare_finish(int rows, int output_channels, int input_channels, Type output_type,
-                        const ops::Epilogue &);
-    void quantize(TensorView source, RowScaledView destination);
+                        const ops::Epilogue &, QuantizationGroups groups = {});
     void linear(RowScaledView input, RowScaledView weight, TensorView output);
     bool linear_finish(RowScaledView input, RowScaledView weight, TensorView output,
                        const ops::Epilogue &);
@@ -40,8 +39,5 @@ class QuantizedGemm {
                            const ops::NormFusion &, RowScaledView weight, TensorView output,
                            const ops::Epilogue &, RowScaledView encoded = {},
                            const QkvProjectionOutput *writeback = nullptr);
-    void norm(TensorView residual, TensorView update, TensorView weight, RowScaledView output,
-              float eps, bool gemma, TensorView update_scale = {});
-    void gated(TensorView gate_up, RowScaledView output, int kind);
 };
 } // namespace tts
