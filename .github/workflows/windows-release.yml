@@ -1,6 +1,14 @@
 name: Windows release package
 
 on:
+  workflow_call:
+    inputs:
+      cuda_version:
+        type: string
+        required: true
+      cuda_architectures:
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       cuda_version:

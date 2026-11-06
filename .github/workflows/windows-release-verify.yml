@@ -1,0 +1,16 @@
+name: Temporary manual Windows release verification
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.event.label.name == 'manual-windows-release-test'
+    uses: ./.github/workflows/windows-release.yml
+    with:
+      cuda_version: '13.2.0'
+      cuda_architectures: '86-real;89-real;120'
