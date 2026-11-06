@@ -16,6 +16,9 @@ void int8_hopper_gemm(void *x, const float *sx, void *w, const float *sw, void *
                       int output_channels, int input_channels, void *workspace,
                       size_t workspace_bytes, cudaStream_t stream, int tile_channels,
                       int tile_tokens, int splits, Type output_type = Type::BF16);
+void fp8_hopper_grouped(KernelProblem, const void *input, const float *input_scales,
+                         const void *weights, const float *weight_scales, void *output,
+                         void *workspace, size_t workspace_bytes, cudaStream_t, Type output_type, int tokens, int splits);
 // Optional direct INT8 epilogue; resources are queried only during preparation.
 void int8_hopper_finish(void *x, const float *sx, void *w, const float *sw, void *y, int rows,
                         int output_channels, int input_channels, void *workspace,

@@ -1,10 +1,9 @@
 #pragma once
 #include "ops/sequence.h"
-#include "runtime/device.h"
+#include "ops/cuda/cuda_check.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include "ops/kernels/common/sequence_address.cuh"
 #include "ops/kernels/common/activation.cuh"
-#include "ops/kernels/quant/quant_device.cuh"
 #include <cub/block/block_reduce.cuh>
 #include <cutlass/fast_math.h>
 #include <cuda_bf16.h>
@@ -133,22 +132,6 @@ struct RowTiles {
         col = int(column) * columns_per_tile;
     }
 };
-template <Type Storage> struct QuantizedRowOutput {
-    static constexpr bool quantized = true;
-    static constexpr Type storage_type = Storage;
-    unsigned char *values;
-    float *scales;
-    explicit QuantizedRowOutput(RowScaledView q)
-        : values(q.values.ptr<unsigned char>()), scales(q.scales.ptr<float>()) {}
-    __device__ float scale(int row, float amax) const {
-        float value = quant_device::scale<Storage>(amax);
-        if (!threadIdx.x) scales[row] = value;
-        return 1.f / value;
-    }
-    __device__ void store(int row, int col, int cols, float value, float inverse) const {
-        values[size_t(row) * cols + col] = quant_device::Format<Storage>::encode(value * inverse);
-    }
-};
 constexpr int norm_threads = 256;
 using NormReduce = cub::BlockReduce<float, norm_threads>;
 // Stay below CUDA's portable default 48 KiB block shared-memory budget,
@@ -198,6 +181,8 @@ static void check_epilogue(const Epilogue &e, TensorView out) {
 }
 static TensorShape check_quantized_output(TensorView x, RowScaledView q, TensorView retained) {
     q.validate();
+    if (q.rotation_size && !q.group_size)
+        throw std::invalid_argument("rotated sequence fusion requires group scales");
     if (!q.values.data || !q.scales.data || q.values.rows < 1 || q.values.cols < 1 ||
         (x.type != Type::F16 && x.type != Type::BF16))
         throw std::invalid_argument("quantized sequence output requires F16/BF16 input");

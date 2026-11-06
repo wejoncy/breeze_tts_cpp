@@ -11,6 +11,7 @@
 #include "ops/kernels/attention/qkv_writeback.cuh"
 #include "ops/sequence.h"
 #include "ops/kernels/sequence/norm_projection.h"
+#include "ops/kernels/quant/quant_gated.h"
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
@@ -140,6 +141,7 @@ void initialize_cuda_kernels(CudaContext &cuda) {
     cuda.normalized_linear_capacity = ops::normalized_linear_capacity(
         cuda.multiprocessors, fp32_latency_warps(cuda.sm_major, cuda.sm_minor), cuda.normalized_qkv_capacity);
     cuda.pdl = cuda.sm_major >= 9 && compiled_pdl_support();
+    cuda.quant_gated_clusters = quant_gated_supports_clusters(cuda.device);
 }
 void ops::matmul(TensorView x, TensorView w, TensorView y, bool full_precision, float accumulation,
                        float product_scale) {

@@ -1,6 +1,8 @@
 #include "models/gpt_sovits/dit.h"
+#include "core/forward_context.h"
 #include "ops/attention.h"
 #include "ops/basic.h"
+#include "ops/storage.h"
 #include <cmath>
 
 namespace tts {
@@ -85,12 +87,10 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
         throw std::invalid_argument("empty DiT");
     for (const auto &block : blocks_)
         for (const auto *layer : {&block.qkv, &block.up, &block.down})
-            if (layer->is_quantized())
-                quant_input_channels_ = std::max(quant_input_channels_, layer->input_channels());
+            quantization_capacity_.include(layer->workspace_capacity());
     for (const auto &block : text_blocks_)
         for (const auto *layer : {&block.up, &block.down})
-            if (layer->is_quantized())
-                quant_input_channels_ = std::max(quant_input_channels_, layer->input_channels());
+            quantization_capacity_.include(layer->workspace_capacity());
     text_positions_ = w.generated(root + ".text_positions", positions(max_time, text_channels_),
                                   max_time, text_channels_, type_);
     // Upstream rotates the first head_dim features before reshaping into heads.
@@ -168,7 +168,7 @@ TensorView DiT::forward(const Condition &condition, ForwardContext &context,
                                                    : text_blocks_.front().up.output_channels();
     Buffer expanded_storage(size_t(rows) * expanded_width * bytes(type_));
     Buffer statistics(size_t(batch) * expanded_width * sizeof(float));
-    Linear::Workspace linear(rows, quant_input_channels_);
+    Linear::Workspace linear(rows, quantization_capacity_);
     auto upload_rows = [&](TensorView source, Type type) {
         auto destination = context.tensor({rows, 1}, type);
         if (context.mode == ForwardContext::Execute && source.numel()) {
@@ -276,7 +276,7 @@ TensorView DiT::forward(TensorView noise, TensorView condition, TensorView veloc
     for (const auto &convolution : position_convs_)
         convolution_bytes = std::max(convolution_bytes, convolution.workspace_bytes(effective_batch, time));
     Buffer convolution_storage(convolution_bytes);
-    Linear::Workspace linear(rows, quant_input_channels_);
+    Linear::Workspace linear(rows, quantization_capacity_);
     if (context.mode == ForwardContext::Prepare && velocity.data) {
         for (const auto &convolution : position_convs_)
             if (convolution.workspace_bytes(1, 1))

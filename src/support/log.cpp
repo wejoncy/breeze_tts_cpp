@@ -1,4 +1,5 @@
 #include "support/log.h"
+#include "support/init_log.h"
 #include "io/json.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -7,8 +8,29 @@
 #include <cstring>
 #include <mutex>
 #include <filesystem>
+#include <exception>
 
 namespace tts::log {
+InitPhase::InitPhase(const char *name)
+    : name_(name), start_(std::chrono::steady_clock::now()),
+      exceptions_(std::uncaught_exceptions()) {
+    TTS_LOG(TTS_LOG_DEBUG, "engine.init", "begin phase={}", name_);
+}
+InitPhase::~InitPhase() {
+    const bool failed = std::uncaught_exceptions() > exceptions_;
+    TTS_LOG(failed ? TTS_LOG_ERROR : TTS_LOG_DEBUG, "engine.init", "{} phase={} elapsed_ms={:.3f}",
+            failed ? "failed" : "done", name_,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_)
+                .count());
+}
+void InitPhase::next(const char *name) {
+    TTS_LOG(TTS_LOG_DEBUG, "engine.init", "done phase={} elapsed_ms={:.3f}", name_,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_)
+                .count());
+    name_ = name;
+    start_ = std::chrono::steady_clock::now();
+    TTS_LOG(TTS_LOG_DEBUG, "engine.init", "begin phase={}", name_);
+}
 namespace {
 std::atomic<int> threshold{TTS_LOG_INFO};
 std::atomic<uint64_t> engine_sequence{0};
@@ -110,12 +132,17 @@ void emit(tts_log_level level, const char *component, const std::string &message
         } else {
             if (!s.output)
                 s.output = output(nullptr, false);
-            auto text = s.json ? Json{{"timestamp_us", us},       {"level", names[level]},
-                                      {"component", component},   {"engine_id", engine_id},
-                                      {"request_id", request_id}, {"message", message}}
-                                     .dump(-1, ' ', false, Json::error_handler_t::replace)
-                               : fmt::format("[{}] engine={} request={} {}", component, engine_id,
-                                             request_id, message);
+            std::string text;
+            if (s.json) {
+                Json fields{{"timestamp_us", us}, {"level", names[level]},
+                            {"component", component}, {"message", message}};
+                if (request_id)
+                    fields["request_id"] = request_id;
+                text = fields.dump(-1, ' ', false, Json::error_handler_t::replace);
+            } else {
+                text = request_id ? fmt::format("[{}] request={} {}", component, request_id, message)
+                                  : fmt::format("[{}] {}", component, message);
+            }
             s.output->log(now, spdlog::source_loc{}, static_cast<spdlog::level::level_enum>(level),
                           text);
         }

@@ -30,7 +30,7 @@ from email.parser import BytesParser
 from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from tts_cpp import Engine, configure_logging
+from tts_cpp import Engine, QUANTIZATIONS, configure_logging
 from model_source import model_info
 from request_schema import validate
 from serving import Responses, Overloaded
@@ -421,7 +421,7 @@ def main():
     )
     parser.add_argument("--queue-limit", type=int, default=32)
     parser.add_argument("--stream-buffer-mb", type=int, default=1)
-    parser.add_argument("--quantization", choices=("fp8", "int8"))
+    parser.add_argument("--quantization", choices=QUANTIZATIONS)
     parser.add_argument(
         "--log-level",
         choices=("trace", "debug", "info", "warn", "error", "off"),

@@ -1,5 +1,5 @@
 #pragma once
-#include "runtime/device.h"
+#include "ops/cuda/cuda_check.h"
 
 namespace tts::cuda_kernels {
 // Init-only function resolution; no kernel launch or shape-specific work.

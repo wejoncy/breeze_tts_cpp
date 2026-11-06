@@ -1,11 +1,15 @@
 #include "execution/model_runner.h"
 #include "execution/input_staging.h"
+#include "runtime/graph.h"
 #include "ops/basic.h"
 #include "ops/audio.h"
 #include "ops/sampling.h"
 #include "ops/attention.h"
 #include "core/input_fields.h"
 #include "support/profiler.h"
+#include "support/init_log.h"
+#include "support/log.h"
+#include "runtime/memory_log.h"
 #include <array>
 #include <cmath>
 #include <numeric>
@@ -23,7 +27,7 @@ std::vector<NamedTensor> output_views(const std::vector<std::string> &names) {
     return result;
 }
 std::vector<NamedTensor> output_views(const std::vector<std::string> &&) = delete;
-}
+} // namespace
 struct ModelRunner::Impl {
     const Model &network;
     RunnerResources &runtime;
@@ -39,6 +43,8 @@ struct ModelRunner::Impl {
     TensorView audio_output;
     int audio_stride = 0;
     size_t input_workspace = 0;
+    size_t device_total_bytes = 0;
+    size_t state_kv_bytes_per_row = 0;
     std::vector<int> host_done;
     std::vector<int> host_layout;
     std::vector<int16_t> host_audio;
@@ -403,6 +409,16 @@ struct ModelRunner::Impl {
           counts(done.size()), positions(done.size()),
           pcm(size_t(capacity) * definition.max_audio_frames * info.audio.samples_per_frame * sizeof(int16_t)),
           host_done(capacity), host_layout(size_t(capacity) * 2), host_audio(pcm.size() / sizeof(int16_t)) {
+        log::InitPhase phase("execution storage");
+        size_t history_bytes_per_row = 0;
+        for (const auto &history : runtime.states.layout().histories) {
+            state_kv_bytes_per_row += history.second.kv_bytes * 2;
+            for (size_t bytes : history.second.history_bytes) history_bytes_per_row += bytes;
+        }
+        TTS_LOG(TTS_LOG_DEBUG, "engine.init",
+                "persistent_state rows={} kv_backed={:.0f} MiB convolution_history={:.0f} MiB",
+                capacity, state_kv_bytes_per_row * capacity / (1024.0 * 1024.0),
+                history_bytes_per_row * capacity / (1024.0 * 1024.0));
         if (definition.query_heads > 0) {
             decode_plan = std::make_unique<FlashDecodePlan>(std::max(1,
                 ops::decode_capacity(runtime.memory.device, definition.head_dimensions, definition.type)),
@@ -422,6 +438,7 @@ struct ModelRunner::Impl {
             }
             description.input.uploads.clear();
         }
+        phase.next("workspace planning");
         size_t retained = 0, preparation = 0;
         for (const auto &description : programs) {
             preparation = std::max(preparation, workspace(description, ForwardContext::Prepare));
@@ -431,7 +448,12 @@ struct ModelRunner::Impl {
             if (description.replay == ProgramSpec::Replay::None && description.name != definition.audio_program)
                 input_workspace = std::max(input_workspace, bytes);
         }
+        TTS_LOG(TTS_LOG_DEBUG, "engine.init",
+                "workspaces retained={:.0f} MiB preparation={:.0f} MiB input_max={:.0f} MiB",
+                retained / (1024.0 * 1024.0), preparation / (1024.0 * 1024.0),
+                input_workspace / (1024.0 * 1024.0));
         runtime.execution.prepare(retained);
+        phase.next("operator preparation");
         {
             DeviceArena storage(runtime.memory, preparation);
             for (const auto &description : programs) {
@@ -439,6 +461,7 @@ struct ModelRunner::Impl {
                 prepare_forward(description, ForwardContext::Prepare);
             }
         }
+        phase.next("CUDA graph capture");
         auto &graphs = runtime.execution.graphs();
         for (const auto &description : programs) {
             if (description.replay == ProgramSpec::Replay::Cache) {
@@ -477,6 +500,7 @@ struct ModelRunner::Impl {
                 }
             }
         }
+        phase.next("execution plan finalization");
         runtime.execution.seal();
         ops::seal(runtime.memory.device);
         runtime.memory.trim();
@@ -497,12 +521,22 @@ struct ModelRunner::Impl {
         for (const auto &row : runtime.states.rows())
             for (const auto &field : row->fields())
                 if (!field.second.device().is_cpu()) transfers += Tensor::aligned(field.second.nbytes());
+        phase.next("host transfer reservation");
+        TTS_LOG(TTS_LOG_DEBUG, "engine.init",
+                "host_transfer_staging={:.0f} MiB pinned_tensor_pool={:.0f} MiB",
+                Tensor::aligned(transfers) / (1024.0 * 1024.0),
+                Tensor::aligned(transfers) / (1024.0 * 1024.0));
         runtime.memory.reserve_transfers(transfers);
+        phase.next("runtime memory reservation");
         const size_t available = runtime.memory.available_bytes();
         const size_t budget = runtime_bytes ? runtime_bytes
             : std::min(input_workspace + runtime.kv.max_storage_bytes(), available - available / 10);
+        TTS_LOG(TTS_LOG_INFO, "engine.init",
+                "runtime_budget={:.0f} MiB kv_max={:.0f} MiB",
+                budget / (1024.0 * 1024.0), runtime.kv.max_storage_bytes() / (1024.0 * 1024.0));
         if (!budget || budget > available) throw DeviceOutOfMemory("runtime reservation exceeds the available memory budget");
         runtime.memory.reserve_runtime(budget);
+        device_total_bytes = log_device_memory(runtime.memory, "ready");
     }
     State &state(RequestState &value) {
         auto &result = dynamic_cast<State &>(value);
@@ -514,6 +548,15 @@ ModelRunner::ModelRunner(const Model &model, RunnerResources &resources, Request
                          const ModelInfo &info, size_t runtime_bytes)
     : impl_(std::make_unique<Impl>(model, resources, inputs, info, runtime_bytes)) {}
 ModelRunner::~ModelRunner() = default;
+ModelRunner::CacheUsage ModelRunner::cache_usage() const {
+    const auto &runtime = impl_->runtime;
+    return {runtime.kv.storage_page_bytes(),
+            impl_->device_total_bytes,
+            impl_->state_kv_bytes_per_row,
+            runtime.kv.capacity() - runtime.kv.available(),
+            runtime.kv.capacity(),
+            impl_->capacity};
+}
 size_t ModelRunner::max_step_samples() const {
     return size_t(impl_->definition.max_audio_frames) * impl_->info.audio.samples_per_frame +
            size_t(impl_->info.audio.sample_rate) * 10;

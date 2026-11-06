@@ -1,6 +1,7 @@
 #include "ops/kernels/common/storage_dispatch.cuh"
 #include "runtime/cuda_context.h"
 #include "ops/kernels/sequence/sequence_internal.cuh"
+#include "ops/kernels/quant/quant_output.cuh"
 #include "ops/kernels/sequence/norm_projection.h"
 #include "ops/kernels/attention/qkv_writeback.cuh"
 
@@ -76,7 +77,7 @@ __global__ void norm_kernel(View x, View y, View weight, View bias, NormalizedIn
                 output.store(output_row, c, cols, nanf(""), 1.f);
         }
         if constexpr (Output::quantized)
-            if (!threadIdx.x) output.scales[output_row] = 1.f;
+            output.reset_scales(output_row, cols);
         return;
     }
     NormRow<T> fusion(x, y, weight, bias, f, row, output_row);
@@ -121,6 +122,22 @@ __global__ void norm_kernel(View x, View y, View weight, View bias, NormalizedIn
     __syncthreads();
     float row_inv = inv;
     if constexpr (Output::quantized) {
+        if (output.group_size) {
+            for (int column = threadIdx.x * 4; column < cols; column += norm_threads * 4) {
+                quant_device::ValuePack<T, 4> normalized{};
+#pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    int index = column + item;
+                    if (index >= cols) continue;
+                    float value = cached && !register_cached ? values[index] : fusion.load(index);
+                    normalized.v[item] = fusion.transform(index, value, row_mean, row_inv);
+                    if (fusion.raw) fusion.raw[index] = T(value);
+                    if (fusion.output) fusion.output[index] = normalized.v[item];
+                }
+                output.store_group(normalized, output_row, column, cols);
+            }
+            return;
+        }
         float amax = 0;
         if (register_cached) {
 #pragma unroll
@@ -413,11 +430,11 @@ void layer_norm_quantize( TensorView x, RowScaledView q, TensorView w,
             register_cached, output);
     };
     if (x.type == Type::F16) {
-        if (q.values.type == Type::I8) launch(__half{}, QuantizedRowOutput<Type::I8>(q));
-        else launch(__half{}, QuantizedRowOutput<Type::FP8>(q));
+        if (q.values.type == Type::I8) launch(__half{}, quant_device::RowOutput<Type::I8>(q));
+        else launch(__half{}, quant_device::RowOutput<Type::FP8>(q));
     } else {
-        if (q.values.type == Type::I8) launch(bf16{}, QuantizedRowOutput<Type::I8>(q));
-        else launch(bf16{}, QuantizedRowOutput<Type::FP8>(q));
+        if (q.values.type == Type::I8) launch(bf16{}, quant_device::RowOutput<Type::I8>(q));
+        else launch(bf16{}, quant_device::RowOutput<Type::FP8>(q));
     }
     CUDA(cudaGetLastError());
 }
@@ -503,7 +520,8 @@ bool normalized_quantized_linear(cudaStream_t stream, TensorView x, TensorView n
                                 const NormFusion &f, RowScaledView weight, TensorView output,
                                 const Epilogue &e, int resident_blocks, RowScaledView encoded,
                                 const QkvProjectionOutput *writeback) {
-    if (e.packed || e.condition_sources || e.output_rows) return false;
+    if (e.packed || e.condition_sources || e.output_rows || weight.group_size || encoded.group_size ||
+        weight.rotation_size || encoded.rotation_size) return false;
     weight.validate();
     if (writeback) writeback->validate(x, weight.values);
     int n = weight.values.rows, k = weight.values.cols;

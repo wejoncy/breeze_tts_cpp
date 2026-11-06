@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "layers/transformer/relative.h"
+#include "core/forward_context.h"
 #include "ops/relative_attention.h"
 namespace tts {
 namespace {

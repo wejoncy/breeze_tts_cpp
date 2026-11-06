@@ -20,14 +20,18 @@ add_library(tts SHARED
   src/ops/cuda/lt_linear.cpp
   src/ops/cuda/grouped_linear.cpp
   src/ops/cuda/execution_context.cpp
+  src/ops/cuda/quantization.cpp
+  src/ops/cuda/quantization_policy.cpp
   src/ops/linear.cpp
   src/ops/basic.cpp
   src/ops/tensor.cpp
   src/runtime/cuda_context.cpp
+  src/runtime/cuda_graph_runner.cpp
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
   src/layers/convolution.cpp
+  src/layers/linear.cpp
   src/execution/model_registry.cpp
   src/execution/model_factories/breeze.cpp
   src/execution/model_runtime.cpp
@@ -42,13 +46,15 @@ add_library(tts SHARED
   src/io/audio_speed.cpp
   src/io/mapped_file.cpp
   src/io/model_loader.cpp
+  src/io/weights.cpp
   src/io/safetensors.cpp
   src/ops/kernels/attention/flash_attention.cu
   src/ops/kernels/attention/flash_decoding.cu
   src/ops/kernels/audio/audio_kernels.cu
   src/ops/kernels/audio/encoder_kernels.cu
-  src/ops/kernels/quant/quantized_gemm.cu
+  src/ops/kernels/quant/row_quantize.cu
   src/ops/kernels/quant/quant_dispatch.cu
+  src/ops/kernels/quant/quant_grouped.cu
   src/ops/kernels/quant/quant_gated.cu
   src/ops/kernels/quant/quant_gemm_sm80.cu
   src/ops/kernels/quant/quant_norm.cu
@@ -86,7 +92,7 @@ target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_he
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
   src/ops/kernels/tensor_kernels.cu
-  src/ops/kernels/quant/quantized_gemm.cu
+  src/ops/kernels/quant/row_quantize.cu
   src/ops/kernels/quant/quant_norm.cu
   src/ops/kernels/quant/quant_gated.cu
   src/ops/kernels/quant/quant_dispatch.cu
@@ -100,6 +106,7 @@ set_source_files_properties(
   src/ops/kernels/attention/flash_attention.cu
   src/ops/kernels/attention/relative_attention.cu
   src/ops/kernels/quant/quant_gemm_sm80.cu
+  src/ops/kernels/quant/quant_grouped.cu
   PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr")
 set_target_properties(tts PROPERTIES POSITION_INDEPENDENT_CODE ON WINDOWS_EXPORT_ALL_SYMBOLS ON)
 tts_deploy_runtime(tts)

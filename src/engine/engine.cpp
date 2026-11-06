@@ -49,21 +49,15 @@ Engine::Engine(const std::string &dir, int device, int batch, int context, int p
     auto start = std::chrono::steady_clock::now();
     TTS_LOG(TTS_LOG_INFO, "engine",
             "loading device={} batch_capacity={} context={} quantization={}", device, batch,
-            context,
-            quantization == Quantization::None  ? "none"
-            : quantization == Quantization::FP8 ? "fp8"
-                                                : "int8");
+            context, quantization_name(quantization));
     impl_ = std::make_unique<Impl>(dir, ModelOptions{device, batch, context, page, quantization,
                                                    runtime_memory_bytes, memory_limit_bytes}, id);
     if (log::enabled(TTS_LOG_INFO)) {
-        auto memory = impl_->model->memory_stats();
         auto ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
         TTS_LOG(TTS_LOG_INFO, "engine",
-                "loaded ms={:.3f} weights={:.0f} MiB pool_used={:.0f} MiB pool_reserved={:.0f} MiB",
-                ms, weight_bytes() / bytes_per_mib, memory.used_bytes / bytes_per_mib,
-                memory.reserved_bytes / bytes_per_mib);
+                "ready elapsed_ms={:.3f} weights={:.0f} MiB", ms, weight_bytes() / bytes_per_mib);
     }
 }
 Engine::~Engine() = default;

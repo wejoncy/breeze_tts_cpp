@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "models/hubert/model.h"
+#include "core/forward_context.h"
 
 namespace tts {
 namespace {

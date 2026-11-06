@@ -1,5 +1,6 @@
 #pragma once
 #include "models/bert/model.h"
+#include "core/forward_context.h"
 
 namespace tts {
 class Pronunciation {

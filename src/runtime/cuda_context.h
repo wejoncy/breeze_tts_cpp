@@ -24,7 +24,7 @@ struct CudaContext {
     int resident_threads = 0;
     int normalized_linear_capacity = 0, normalized_qkv_capacity = 0;
     size_t shared_memory_per_block = 0;
-    bool pdl = false, plans_sealed = false;
+    bool pdl = false, plans_sealed = false, quant_gated_clusters = false;
     cublasHandle_t blas = nullptr;
     cublasLtHandle_t lt = nullptr;
     std::unique_ptr<LtLinear> matmul;

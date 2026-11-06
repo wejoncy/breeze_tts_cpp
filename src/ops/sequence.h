@@ -1,10 +1,10 @@
 #pragma once
+#include "ops/activation.h"
 #include "core/qkv_projection.h"
 #include "core/quantization.h"
 #include "core/sequence_layout.h"
 
 namespace tts::ops {
-enum class Activation { Identity, Relu, LeakyRelu, Silu, Gelu, GeluTanh, Mish, Tanh, Sigmoid };
 struct Epilogue {
     TensorView bias, residual;
     float value_scale = 1;

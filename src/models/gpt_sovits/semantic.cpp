@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "models/gpt_sovits/semantic.h"
+#include "io/weights.h"
 #include <cmath>
 
 namespace tts {

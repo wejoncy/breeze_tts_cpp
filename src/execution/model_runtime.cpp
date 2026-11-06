@@ -3,6 +3,7 @@
 #include "runtime/cuda_context.h"
 #include "io/model_loader.h"
 #include "io/weights.h"
+#include "support/init_log.h"
 #include <cmath>
 
 namespace tts {
@@ -12,6 +13,7 @@ struct ModelRuntime::Impl {
     Impl(const ModelLoader &loader, const ModelOptions &options, ModelFactory factory)
         : gpu(options.device, options.quantization, options.memory_limit_bytes) {
         ExecutionScope initialization_scope(gpu);
+        log::InitPhase phase("model construction and text frontend");
         parts = factory(gpu.memory, loader, options);
         const auto &info = parts.info;
         if (!parts.network || !parts.planner || !parts.resources ||
@@ -19,6 +21,7 @@ struct ModelRuntime::Impl {
             info.audio.sample_rate < 1 || info.audio.samples_per_frame < 1 ||
             info.max_output_frames < 1 || !std::isfinite(parts.quantum_ms) || parts.quantum_ms <= 0)
             throw std::invalid_argument("invalid model execution description");
+        phase.next("execution runner");
         parts.runner = std::make_unique<ModelRunner>(*parts.network, *parts.resources,
             *parts.planner, parts.info, options.runtime_memory_bytes);
     }

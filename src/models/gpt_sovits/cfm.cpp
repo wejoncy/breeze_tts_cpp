@@ -1,5 +1,6 @@
 #include "models/gpt_sovits/cfm.h"
 #include "layers/input_metadata.h"
+#include "ops/storage.h"
 #include <map>
 #include <numeric>
 #include <tuple>

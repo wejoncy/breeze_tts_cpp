@@ -62,6 +62,9 @@ class PagedKVCache {
     size_t storage_capacity_bytes() const {
         return size_t(capacity()) * page_bytes_ * 2;
     }
+    size_t storage_page_bytes() const {
+        return page_bytes_ * 2; // K and V across every layer, including page padding.
+    }
     size_t runtime_storage_bytes() const {
         size_t size = 0;
         for (const auto &chunk : chunks_)

@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "layers/transformer.h"
+#include "core/forward_context.h"
 #include "ops/attention.h"
 
 namespace tts {
@@ -20,8 +21,7 @@ TransformerEncoder::TransformerEncoder(std::vector<EncoderBlock> blocks, int hea
         for (const auto *linear : {&block.qkv, &block.out, &block.up, &block.down}) {
             if (linear->activation_type() != type_)
                 throw std::invalid_argument("dense transformer dtype mismatch");
-            if (linear->is_quantized())
-                quant_input_channels_ = std::max(quant_input_channels_, linear->input_channels());
+            quantization_capacity_.include(linear->workspace_capacity());
         }
         for (const auto &n : {block.attention_norm, block.feedforward_norm})
             if (!n.weight.data || !n.bias.data || n.weight.type != type_ || n.bias.type != type_ ||
@@ -43,7 +43,7 @@ TransformerEncoder::Workspace::Workspace(const TransformerEncoder &encoder, int 
     update = storage(encoder.hidden_);
     expanded = storage(encoder.blocks_.front().up.output_channels());
     lse = Buffer(rows * encoder.heads_ * sizeof(float));
-    linear = Linear::Workspace(max_rows, encoder.quant_input_channels_);
+    linear = Linear::Workspace(max_rows, encoder.quantization_capacity_);
 }
 void TransformerEncoder::prepare(Workspace &workspace, int max_rows) const {
     if (!max_rows) max_rows = workspace.max_rows;

@@ -1,15 +1,9 @@
 #pragma once
-#include "runtime/device.h"
 #include "core/quantization.h"
-#include <memory>
+#include <cuda_runtime_api.h>
 namespace tts {
-class QuantGated {
-    struct Impl;
-    std::unique_ptr<Impl> impl;
-
-  public:
-    QuantGated(DeviceContext &memory, Type format = Type::FP8);
-    ~QuantGated();
-    void run(TensorView input, RowScaledView output, int kind);
-};
+// Initialization-only query of the compiled kernel image and device capability.
+bool quant_gated_supports_clusters(int device);
+void launch_quantized_gated(TensorView input, RowScaledView output, int kind, cudaStream_t stream,
+                            int multiprocessors, bool clusters);
 } // namespace tts

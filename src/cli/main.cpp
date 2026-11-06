@@ -164,7 +164,7 @@ int run_cli(int argc, const char *const *argv) {
                        "codes.i32]\n"
                        "    [--repeat 3] [--no-graph] [--context 2048] [--device 0] "
                        "[--quantization "
-                       "fp8|int8] [--memory-limit-mb 0] [--runtime-memory-mb 0]\n"
+                       "int8|fp8|group_int8|group_fp8] [--memory-limit-mb 0] [--runtime-memory-mb 0]\n"
                        "    [--log-level trace|debug|info|warn|error|off] [--log-file FILE] "
                        "[--log-json]\n"
                        "    [--tokenize] [--decode-codes frames.i32 --output waveform.f32]\n"

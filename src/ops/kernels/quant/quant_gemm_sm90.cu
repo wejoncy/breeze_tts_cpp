@@ -282,3 +282,92 @@ KernelResources int8_hopper_finish_resources(int channels, int tokens, Type type
     return result;
 }
 } // namespace tts
+
+namespace tts {
+using namespace cute;
+namespace block_scaled {
+template <class Output, int Tokens> struct Native {
+    using Element = cutlass::float_e4m3_t;
+    using Tile = Shape<_64, Int<Tokens>, _128>;
+    using Cluster = Shape<_1, _1, _1>;
+    using Scales = cutlass::detail::Sm90BlockwiseScaleConfig<1, 1, 128>;
+    using ScaleA = decltype(Scales::deduce_layoutSFA());
+    using ScaleB = decltype(Scales::deduce_layoutSFB());
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, Tile, Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto, float, float, void,
+        cutlass::layout::ColumnMajor, 8, Output, cutlass::layout::ColumnMajor, 8,
+        cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, Element,
+        cute::tuple<cutlass::layout::RowMajor, ScaleA>, 16, Element,
+        cute::tuple<cutlass::layout::ColumnMajor, ScaleB>, 16, float, Tile, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epilogue::SharedStorage)>,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8BlockScaledAccum>::CollectiveOp;
+    using Kernel =
+        cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+    static void run(KernelProblem problem, const void *input, const float *input_scales, const void *weights, const float *weight_scales,
+                    void *output, void *workspace, size_t workspace_bytes, cudaStream_t stream, int splits) {
+        auto shape = make_shape(problem.channels, problem.rows, problem.reduction / splits, splits);
+        typename Mainloop::Arguments mainloop{static_cast<const Element *>(weights),
+                                              {problem.reduction, Int<1>{}, problem.reduction / splits},
+                                              static_cast<const Element *>(input),
+                                              {problem.reduction, Int<1>{}, problem.reduction / splits},
+                                              weight_scales,
+                                              Scales::tile_atom_to_shape_SFA(shape),
+                                              input_scales,
+                                              Scales::tile_atom_to_shape_SFB(shape)};
+        typename Epilogue::Arguments epilogue{};
+        epilogue.thread = {1, 0};
+        epilogue.ptr_D = static_cast<Output *>(output);
+        epilogue.dD = {Int<1>{}, problem.channels, problem.channels * problem.rows};
+        epilogue.dC = epilogue.dD;
+        typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kBatched, shape, mainloop,
+                                           epilogue};
+        auto check = [](cutlass::Status status) {
+            if (status != cutlass::Status::kSuccess)
+                throw std::runtime_error(cutlassGetStatusString(status));
+        };
+        if (Gemm::get_workspace_size(arguments) > workspace_bytes)
+            throw std::runtime_error("insufficient scratch");
+        Gemm gemm;
+        check(gemm.can_implement(arguments));
+        check(gemm.initialize(arguments, workspace, stream));
+        check(gemm.run(stream));
+    }
+};
+} // namespace block_scaled
+void fp8_hopper_grouped(KernelProblem problem, const void *input, const float *input_scales,
+                        const void *weights, const float *weight_scales, void *output,
+                        void *workspace, size_t workspace_bytes, cudaStream_t stream,
+                        Type output_type, int tokens, int splits) {
+    if (splits < 1 || problem.reduction % (128 * splits))
+        throw std::invalid_argument("FP8 grouped partitions require full K128 groups");
+    size_t partial_bytes = splits > 1 ? size_t(problem.rows) * problem.channels * splits * sizeof(float) : 0;
+    if (partial_bytes > workspace_bytes)
+        throw std::invalid_argument("FP8 grouped partial workspace overflow");
+    void *destination = splits > 1 ? workspace : output;
+    void *scratch = partial_bytes ? static_cast<char *>(workspace) + partial_bytes : workspace;
+    auto launch = [&](auto value) {
+        using Output = decltype(value);
+        auto invoke = [&](auto kernel) {
+            decltype(kernel)::run(problem, input, input_scales, weights, weight_scales,
+                                   destination, scratch, workspace_bytes - partial_bytes,
+                                   stream, splits);
+        };
+        if (tokens == 16) invoke(block_scaled::Native<Output, 16>{});
+        else if (tokens == 32) invoke(block_scaled::Native<Output, 32>{});
+        else if (tokens == 64) invoke(block_scaled::Native<Output, 64>{});
+        else throw std::invalid_argument("unsupported FP8 grouped token tile");
+    };
+    if (splits > 1) {
+        // Every partition already applies its own K-group scales in FP32.
+        launch(float{});
+        launch_quant_split_reduce(static_cast<const float *>(workspace), nullptr, nullptr,
+                                          output, problem.rows, problem.channels, splits,
+                                          stream, output_type);
+    } else if (output_type == Type::F16) launch(cutlass::half_t{});
+    else launch(cutlass::bfloat16_t{});
+}
+} // namespace tts

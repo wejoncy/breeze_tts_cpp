@@ -1,5 +1,6 @@
 #include "ops/basic.h"
 #include "layers/audio/style_encoder.h"
+#include "core/forward_context.h"
 #include "ops/attention.h"
 #include <cmath>
 namespace tts {

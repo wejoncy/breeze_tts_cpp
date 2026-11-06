@@ -23,7 +23,7 @@ bool prepare_matmul_gelu(TensorView input, TensorView weight, TensorView bias, T
 bool matmul_gelu(TensorView input, TensorView weight, TensorView bias, TensorView output);
 bool matmul_qkv(TensorView input, TensorView weight, const QkvProjectionOutput &output);
 void prepare_quantized(TensorView weight, int rows, int output_channels, int input_channels,
-                        Type type, const Epilogue &epilogue = {});
+                        Type type, const Epilogue &epilogue = {}, QuantizationGroups groups = {});
 void norm(TensorView input, TensorView weight, TensorView output, float epsilon, bool gemma = false,
             TensorView bias = {});
 void residual_norm(TensorView input, TensorView update, TensorView weight, TensorView output,

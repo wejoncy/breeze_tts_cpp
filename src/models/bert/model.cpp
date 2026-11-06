@@ -1,5 +1,7 @@
 #include "ops/basic.h"
 #include "models/bert/model.h"
+#include "io/weights.h"
+#include "core/forward_context.h"
 #include <cmath>
 
 namespace tts {

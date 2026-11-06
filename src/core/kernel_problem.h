@@ -3,6 +3,7 @@
 namespace tts {
 struct KernelProblem {
     int rows, channels, reduction;
+    int input_group = 0, weight_group = 0;
 };
 // Library dispatch cost is an initialization estimate, not a timing result.
 // Unknown execution plans retain the conservative two-kernel estimate.
