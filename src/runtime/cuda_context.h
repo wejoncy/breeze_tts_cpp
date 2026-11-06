@@ -21,6 +21,7 @@ struct CudaContext {
     std::array<int, 8> flash_decode_slots{};
     int qkv_gemv_capacity = 0;
     int multiprocessors = 0, sm_major = 0, sm_minor = 0;
+    int resident_threads = 0;
     int normalized_linear_capacity = 0, normalized_qkv_capacity = 0;
     size_t shared_memory_per_block = 0;
     bool pdl = false, plans_sealed = false;

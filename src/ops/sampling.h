@@ -1,6 +1,15 @@
 #pragma once
 #include "core/tensor.h"
 namespace tts {
+struct SamplingRng {
+    uint64_t seed = 0, offset = 0;
+};
+namespace ops {
+// One sample per row, with an independent Philox state {seed, offset} per row.
+// Probabilities are finite/nonnegative with a positive row sum. Outputs are I64;
+// RNG storage is I64 [rows, 2]. The caller supplies all storage, also for replay.
+void multinomial(TensorView probabilities, TensorView indices, TensorView random_states);
+}
 struct SamplingParams {
     float temperature = 0, top_p = 1;
     int top_k = 0;
@@ -9,7 +18,7 @@ struct SamplingParams {
 };
 struct SamplingRow {
     int *codes = nullptr, *done = nullptr, *seen = nullptr;
-    uint64_t *rng = nullptr;
+    SamplingRng *rng = nullptr;
     int logits[3] = {}, branches = 1;
     float cfg = 1, cfg_ref = 1, cfg_ins = 1, penalty = 1;
     SamplingParams backbone, depth;
@@ -21,7 +30,7 @@ struct SamplingLayout {
     int codebooks, entries, eos;
 };
 void sample( TensorView logits, SamplingLayout layout, int *codes,
-            uint64_t *rng, int batch, int branches, int codebook, float cfg, float temperature,
+            SamplingRng *rng, int batch, int branches, int codebook, float cfg, float temperature,
             int top_k, int *done, float top_p = 1.f, float cfg_ref = 1.f, float cfg_ins = 1.f,
             float penalty = 1.f, int *seen = nullptr, const SamplingRow *rows = nullptr);
 inline void sample( TensorView logits, SamplingLayout layout,

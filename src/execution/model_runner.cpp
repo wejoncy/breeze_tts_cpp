@@ -299,7 +299,7 @@ struct ModelRunner::Impl {
             sample.codes = const_cast<int *>(codes[row]);
             sample.done = data["done"].ptr<int>();
             sample.seen = data["seen"].ptr<int>();
-            sample.rng = data["rng"].ptr<uint64_t>();
+            sample.rng = data["rng"].ptr<SamplingRng>();
             sample.branches = int(state.current().lengths.size());
             sample.cfg = state.options.cfg_scale;
             sample.cfg_ref = state.options.cfg_scale_ref;
@@ -354,7 +354,8 @@ struct ModelRunner::Impl {
             if (tensor.size()) ops::zero(tensor);
         }
         state.options.seed = input.seed;
-        runtime.memory.upload(state.data["rng"].data, &input.seed, sizeof(input.seed));
+        const SamplingRng random{input.seed, 0};
+        runtime.memory.upload(state.data["rng"].data, &random, sizeof(random));
         runtime.memory.upload(state.data["positions"].data, input.lengths.data(), input.lengths.size() * sizeof(int));
         for (const auto &field : input.initializers) {
             auto destination = state.data[field.name];
