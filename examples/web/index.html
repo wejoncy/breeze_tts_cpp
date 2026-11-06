@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>语音合成</title>
+  <style>
+    :root {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #202b39;
+      background: #f5f7fa;
+      font-synthesis: none;
+      --accent: #315ee9;
+      --muted: #748093;
+      --border: #e4e9f0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    button, textarea, input { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button { cursor: pointer; }
+    button:disabled { cursor: default; opacity: .5; }
+    :focus-visible { outline: 3px solid #aebffc; outline-offset: 3px; }
+    main { width: min(100% - 40px, 1140px); margin: 48px auto 40px; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 24px; align-items: start; }
+    .editor { min-width: 0; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 30px; }
+    h1 { font-size: 30px; letter-spacing: -.8px; margin: 0 0 10px; font-weight: 720; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.7; }
+    .connection { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-top: 9px; color: var(--muted); font-size: 12px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #98a2b3; }
+    .connection[data-state="ready"] .dot { background: #2baf81; }
+    .connection[data-state="error"] .dot { background: #d65b69; }
+    .panel { background: #fff; border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 8px 36px #263e6510; overflow: hidden; }
+    .section { padding: 22px 24px; }
+    .section + .section { border-top: 1px solid var(--border); }
+    .label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    label, legend { font-weight: 650; font-size: 14px; }
+    .hint { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.6; }
+    textarea { display: block; width: 100%; color: inherit; background: #fafbfd; border: 1px solid var(--border); border-radius: 11px; padding: 14px 16px; resize: vertical; font-size: 14px; line-height: 1.85; transition: border-color .15s, box-shadow .15s; }
+    textarea::placeholder { color: #9aa4b3; }
+    textarea:focus { outline: none; border-color: #9db2f9; box-shadow: 0 0 0 3px #315ee90c; }
+    .instruction-editor { border: 1px solid var(--border); border-radius: 12px; background: #fafbfd; transition: border-color .15s, box-shadow .15s; container-type: inline-size; }
+    .instruction-editor:focus-within { border-color: #9db2f9; box-shadow: 0 0 0 3px #315ee90c; }
+    .instruction-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; padding: 13px 15px 0; }
+    .instruction-heading label { color: #647084; font-size: 13px; }
+    .instruction-heading .hint { color: #8792a2; }
+    #instructions { min-height: 90px; border: 0; border-radius: 0; background: transparent; padding: 10px 15px; color: #59677a; }
+    #instructions:focus { box-shadow: none; }
+    .instruction-controls { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--border); }
+    .cfg-control { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .control-label { color: var(--muted); font-size: 12px; font-weight: 500; white-space: nowrap; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+    #content { height: clamp(160px, 24vh, 220px); min-height: 120px; }
+    fieldset { border: 0; padding: 0; margin: 0; }
+    .cfg-options { display: flex; gap: 4px; }
+    .cfg { display: flex; justify-content: center; align-items: baseline; gap: 4px; border-radius: 6px; border: 1px solid transparent; padding: 6px 8px; background: transparent; color: var(--muted); transition: background .15s, border-color .15s; }
+    .cfg strong { font-size: 13px; font-weight: 550; color: #647084; }
+    .cfg span { font-size: 11px; }
+    .cfg:hover:not(:disabled) { background: #f6f8ff; border-color: #bdcbf8; }
+    .cfg[aria-pressed="true"] { background: #edf2ff; border-color: #91aaf5; color: var(--accent); }
+    .cfg[aria-pressed="true"] strong { color: var(--accent); }
+    .cfg[aria-pressed="true"]:disabled { background: #f0f2f6; border-color: var(--border); color: var(--muted); }
+    .cfg:disabled strong { color: var(--muted); }
+    .content-footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 10px; }
+    .actions { display: flex; align-items: center; gap: 12px; padding: 22px 30px; background: #fcfdff; border-top: 1px solid var(--border); }
+    .primary, .secondary { display: inline-flex; align-items: center; justify-content: center; gap: 9px; border-radius: 10px; padding: 13px 22px; font-size: 14px; font-weight: 600; }
+    .primary { color: white; border: 1px solid var(--accent); background: var(--accent); box-shadow: 0 3px 8px #315ee920; }
+    .primary:hover:not(:disabled) { background: #244ed1; }
+    .primary svg { width: 17px; height: 17px; }
+    .secondary { background: #fff; border: 1px solid var(--border); color: #536176; }
+    .shortcut { margin-left: auto; }
+    kbd { border: 1px solid #e3e7ed; border-radius: 4px; padding: 2px 5px; font: inherit; font-size: 11px; }
+    .result { margin-top: 18px; border: 1px solid var(--border); border-radius: 14px; background: #fff; padding: 18px 22px; }
+    .status-line { display: flex; align-items: center; gap: 10px; min-height: 22px; font-size: 13px; }
+    .activity { height: 14px; display: flex; align-items: center; gap: 3px; }
+    .activity i { display: block; width: 3px; height: 5px; border-radius: 2px; background: var(--accent); }
+    .result[data-busy="true"] .activity i { animation: pulse .8s ease-in-out infinite alternate; }
+    .activity i:nth-child(2) { animation-delay: .2s; }
+    .activity i:nth-child(3) { animation-delay: .4s; }
+    .result[data-error="true"] { border-color: #f0c4ca; background: #fff9fa; color: #ad3246; }
+    .seed-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    #seed { width: 180px; padding: 7px 9px; background: #fff; font-size: 12px; }
+    .reference { flex: 1; min-width: 0; }
+    .reference summary { width: fit-content; color: #647084; cursor: pointer; font-size: 12px; }
+    .reference summary .hint { margin-left: 8px; }
+    .reference-fields { display: grid; gap: 10px; margin-top: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: #fafbfd; }
+    .reference-fields label { font-size: 12px; color: #647084; }
+    .reference-file { display: flex; align-items: center; gap: 8px; }
+    .reference-file input { flex: 1; background: #fff; padding: 7px; font-size: 12px; }
+    .reference-file .secondary { flex-shrink: 0; padding: 8px 10px; font-size: 12px; }
+    #reference-text { min-height: 65px; padding: 9px 11px; background: #fff; font-size: 13px; }
+    .reference-fields .hint { margin: 0; }
+    input { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 9px; padding: 11px 12px; color: inherit; background: #fafbfd; font-size: 13px; }
+    input:focus { outline: none; border-color: #9db2f9; box-shadow: 0 0 0 3px #315ee90c; }
+    @container (max-width: 580px) {
+      .cfg span, .seed-caption { display: none; }
+      .instruction-controls { gap: 8px; }
+      .cfg-control { gap: 6px; }
+      .cfg { padding: 6px 8px; }
+      .seed-control { gap: 6px; }
+      #seed { width: 170px; }
+    }
+    @container (max-width: 350px) {
+      .instruction-controls { padding: 9px; gap: 6px; }
+      .cfg-control { gap: 5px; }
+      .cfg-options { gap: 2px; }
+      .cfg { padding: 6px; }
+      #seed { width: 120px; }
+    }
+    @container (max-width: 275px) {
+      .seed-control { flex: 1; }
+      #seed { width: 100%; }
+    }
+    .voices { padding: 24px 20px; }
+    .voices h2 { margin: 0; font-size: 17px; }
+    .voices .label-row { margin-bottom: 18px; }
+    .voices label { display: block; margin-bottom: 9px; font-size: 13px; }
+    .voice-actions { display: flex; gap: 8px; margin-top: 12px; }
+    .voice-actions button { padding: 11px 12px; font-size: 12px; }
+    #save-voice { flex: 1; }
+    .voice-help { margin: 12px 0 0; }
+    #voice-status { min-height: 20px; margin: 12px 0; overflow-wrap: anywhere; }
+    #voice-status[data-error="true"] { color: #ad3246; }
+    .voice-list { list-style: none; margin: 0; padding: 16px 0 0; border-top: 1px solid var(--border); display: grid; gap: 10px; }
+    .voice-item { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: 11px; overflow: hidden; }
+    .voice-item[data-selected="true"] { border-color: #91aaf5; background: #f4f7ff; }
+    .voice-load { flex: 1; min-width: 0; padding: 12px; border: 0; background: transparent; text-align: left; color: inherit; }
+    .voice-load strong { display: block; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+    .voice-load .hint { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+    .voice-delete { align-self: center; margin-right: 8px; padding: 7px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; }
+    .voice-delete:hover { background: #fff0f2; color: #ad3246; }
+    #voices-empty { margin-bottom: 0; }
+    [hidden] { display: none !important; }
+    footer { text-align: center; color: #8d98a8; font-size: 12px; margin-top: 22px; }
+    @keyframes pulse { from { height: 4px; } to { height: 14px; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+    @media (max-width: 860px) { .workspace { grid-template-columns: minmax(0, 1fr); } }
+    @media (max-width: 540px) {
+      main { width: calc(100% - 24px); margin-top: 28px; }
+      header { margin-bottom: 22px; gap: 10px; }
+      h1 { font-size: 25px; }
+      .section { padding: 22px 18px; }
+      .actions { padding: 18px; }
+      .shortcut { display: none; }
+      .label-row .hint { max-width: 65%; text-align: right; }
+      .result { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>让文字开口</h1>
+        <p class="subtitle">写下内容，选择语气，边生成边聆听。</p>
+      </div>
+      <div id="connection" class="connection" role="status" data-state="loading"><span class="dot"></span><span id="connection-text">连接中</span></div>
+    </header>
+
+    <div class="workspace">
+    <div class="editor">
+    <form id="synthesis" class="panel">
+      <section class="section">
+        <div class="instruction-editor">
+          <div class="instruction-heading"><label for="instructions">指令</label><span class="hint" id="instructions-hint">描述语气、情绪或语速，可留空</span></div>
+          <textarea id="instructions" rows="3" aria-describedby="instructions-hint" placeholder="例如：用温柔、自然的语气朗读，语速稍慢。"></textarea>
+          <div class="instruction-controls">
+            <fieldset class="cfg-control" title="填写指令后可调整 CFG">
+              <legend class="sr-only">CFG 强度，填写指令后生效</legend>
+              <span class="control-label" aria-hidden="true">CFG</span>
+              <div class="cfg-options">
+                <button type="button" class="cfg" data-cfg="1" aria-pressed="false" aria-label="CFG 1 基础"><strong>1</strong><span>基础</span></button>
+                <button type="button" class="cfg" data-cfg="2" aria-pressed="false" aria-label="CFG 2 轻度"><strong>2</strong><span>轻度</span></button>
+                <button type="button" class="cfg" data-cfg="3" aria-pressed="true" aria-label="CFG 3 标准"><strong>3</strong><span>标准</span></button>
+                <button type="button" class="cfg" data-cfg="4" aria-pressed="false" aria-label="CFG 4 较强"><strong>4</strong><span>较强</span></button>
+              </div>
+            </fieldset>
+            <div class="seed-control">
+              <label for="seed" class="control-label">Seed<span class="seed-caption"> 随机种子</span></label>
+              <input id="seed" type="text" inputmode="numeric" pattern="[0-9]+" required autocomplete="off" placeholder="读取中…" aria-describedby="seed-hint">
+              <span id="seed-hint" class="sr-only">随机种子随音色保存，相同文本、指令与种子便于复现声音。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="section">
+        <textarea id="content" rows="7" required aria-label="朗读内容" placeholder="你好，欢迎来到这里。把想说的话写下来，让声音替你传达。"></textarea>
+        <div class="content-footer">
+          <details id="reference" class="reference">
+            <summary>参考音频<span class="hint">可选 · 音频不保存</span></summary>
+            <div class="reference-fields">
+              <label for="reference-audio">选择参考音频</label>
+              <div class="reference-file">
+                <input id="reference-audio" type="file" accept="audio/*" aria-describedby="reference-hint">
+                <button id="clear-reference" class="secondary" type="button">清除参考</button>
+              </div>
+              <label for="reference-text">参考音频对应文本</label>
+              <textarea id="reference-text" rows="2" placeholder="填写参考音频中实际说出的文字。"></textarea>
+              <p id="reference-hint" class="hint">音频只在内存中使用，加载音色后需重新选择。</p>
+            </div>
+          </details>
+          <span class="hint" id="character-count">0 字</span>
+        </div>
+      </section>
+      <div class="actions">
+        <button id="generate" class="primary" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 10v4m4-8v12m4-15v18m4-15v12m4-8v4" stroke-linecap="round"/></svg><span>生成声音</span></button>
+        <button id="stop" class="secondary" type="button" hidden>停止</button>
+        <span class="shortcut hint"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+      </div>
+    </form>
+
+    <section id="result" class="result" aria-label="合成结果" data-busy="false" hidden>
+      <div class="status-line"><span class="activity" aria-hidden="true"><i></i><i></i><i></i></span><span id="status" role="status" aria-live="polite"></span></div>
+    </section>
+    </div>
+    <aside class="panel voices" aria-labelledby="voices-heading">
+      <div class="label-row"><h2 id="voices-heading">我的音色</h2><span id="voice-count" class="hint">0 个</span></div>
+      <label for="voice-name">音色名称</label>
+      <input id="voice-name" type="text" autocomplete="off" placeholder="大肥鱼（迷糊版） — 大肥鱼迷糊少女音">
+      <div class="voice-actions">
+        <button id="save-voice" class="primary" type="button" disabled>保存当前音色</button>
+        <button id="new-voice" class="secondary" type="button" title="保留当前配置，另存为新音色">另存为</button>
+      </div>
+      <p class="hint voice-help">保存正文、指令、CFG、种子及参考文本，点击历史音色即可恢复。音频不保存。</p>
+      <p id="voice-status" class="hint" role="status" aria-live="polite">正在读取音色…</p>
+      <ul id="voice-list" class="voice-list" aria-label="历史音色"></ul>
+      <p id="voices-empty" class="hint" hidden>还没有保存的音色。</p>
+    </aside>
+    </div>
+    <footer>声音由当前服务生成</footer>
+  </main>
+
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const form = $("synthesis"), content = $("content"), instructions = $("instructions");
+    let cfg = 3, current = null, selectedVoice = null, voices = [], storageEnabled = false, savingVoice = false;
+
+    function setCfg(value) {
+      cfg = value;
+      syncCfg();
+    }
+
+    function syncCfg() {
+      const enabled = Boolean(instructions.value.trim());
+      document.querySelectorAll("[data-cfg]").forEach(option => {
+        option.disabled = !enabled;
+        option.setAttribute("aria-pressed", String(Number(option.dataset.cfg) === (enabled ? cfg : 1)));
+      });
+    }
+
+    function voiceSettings() {
+      const value = $("seed").value.trim();
+      if (!/^[0-9]+$/.test(value) || BigInt(value) > (1n << 64n) - 1n)
+        throw new Error("种子需要是 0 到 18446744073709551615 之间的整数。");
+      const prompt = instructions.value.trim();
+      return {instructions: prompt, cfg_scale: prompt ? cfg : 1, seed: BigInt(value).toString()};
+    }
+
+    function voiceStatus(message, error = false) {
+      $("voice-status").textContent = message;
+      $("voice-status").dataset.error = String(error);
+    }
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, {cache: "no-store", ...options});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error?.message || `请求失败（HTTP ${response.status}）`);
+      return data;
+    }
+
+    function renderVoices() {
+      $("voice-list").replaceChildren();
+      $("voice-count").textContent = `${voices.length} 个`;
+      $("voices-empty").hidden = !storageEnabled || voices.length > 0;
+      $("save-voice").disabled = !storageEnabled || savingVoice;
+      $("new-voice").disabled = savingVoice;
+      $("save-voice").textContent = selectedVoice ? "更新当前音色" : "保存当前音色";
+      for (const voice of voices) {
+        const item = document.createElement("li");
+        item.className = "voice-item";
+        item.dataset.selected = String(voice.id === selectedVoice);
+        const load = document.createElement("button");
+        load.type = "button"; load.className = "voice-load";
+        load.disabled = savingVoice;
+        load.setAttribute("aria-pressed", String(voice.id === selectedVoice));
+        const name = document.createElement("strong"), detail = document.createElement("span");
+        name.textContent = voice.name;
+        detail.className = "hint";
+        detail.textContent = `CFG ${voice.cfg_scale} · Seed ${voice.seed}`;
+        load.append(name, detail);
+        load.addEventListener("click", () => {
+          selectedVoice = voice.id;
+          $("voice-name").value = voice.name;
+          instructions.value = voice.instructions;
+          if (typeof voice.input === "string") {
+            content.value = voice.input;
+            content.dispatchEvent(new Event("input"));
+          }
+          $("reference-audio").value = "";
+          $("reference-text").value = voice.ref_text ?? "";
+          $("reference").open = Boolean(voice.ref_text);
+          $("seed").value = voice.seed;
+          setCfg(voice.cfg_scale);
+          renderVoices();
+          const reminder = voice.ref_text ? "，请重新选择参考音频。" :
+            typeof voice.input !== "string" ? "，旧记录未保存正文，请补充后更新。" : "";
+          voiceStatus(`已载入「${voice.name}」${reminder}`);
+        });
+        const remove = document.createElement("button");
+        remove.type = "button"; remove.className = "voice-delete";
+        remove.disabled = savingVoice;
+        remove.textContent = "删除"; remove.setAttribute("aria-label", `删除音色 ${voice.name}`);
+        remove.addEventListener("click", async () => {
+          remove.disabled = true;
+          try {
+            await api(`/v1/voice-presets/${encodeURIComponent(voice.id)}`, {method: "DELETE"});
+            voices = voices.filter(entry => entry.id !== voice.id);
+            if (selectedVoice === voice.id) selectedVoice = null;
+            renderVoices(); voiceStatus(`已删除「${voice.name}」`);
+          } catch (error) { remove.disabled = false; voiceStatus(error.message, true); }
+        });
+        item.append(load, remove); $("voice-list").append(item);
+      }
+    }
+
+    async function loadVoices() {
+      try {
+        const data = await api("/v1/voice-presets");
+        voices = data.presets; storageEnabled = data.enabled;
+        renderVoices();
+        voiceStatus(storageEnabled ? "选择音色，或保存当前配置。" : "当前服务未启用音色保存。");
+      } catch (error) { voiceStatus(`无法读取音色：${error.message}`, true); }
+    }
+
+    $("save-voice").addEventListener("click", async () => {
+      if (!storageEnabled || savingVoice) return;
+      try {
+        const name = $("voice-name").value.trim();
+        if (!name) { $("voice-name").focus(); throw new Error("请先为音色起一个名字。"); }
+        const entry = {name, input: content.value, ref_text: $("reference-text").value, ...voiceSettings()};
+        if (selectedVoice) entry.id = selectedVoice;
+        savingVoice = true; renderVoices();
+        const saved = await api("/v1/voice-presets", {method: "POST",
+          headers: {"Content-Type": "application/json"}, body: JSON.stringify(entry)});
+        selectedVoice = saved.id;
+        voices = [saved, ...voices.filter(voice => voice.id !== saved.id)];
+        voiceStatus(`已保存「${saved.name}」`);
+      } catch (error) { voiceStatus(error.message, true); }
+      finally { savingVoice = false; renderVoices(); }
+    });
+
+    $("new-voice").addEventListener("click", () => {
+      selectedVoice = null; $("voice-name").value = "";
+      renderVoices(); $("voice-name").focus();
+      voiceStatus("已保留当前配置，输入新名称后保存。");
+    });
+
+    $("clear-reference").addEventListener("click", () => {
+      $("reference-audio").value = "";
+      $("reference-text").value = "";
+    });
+
+    async function loadDefaultSeed() {
+      try {
+        const model = await api("/v1/model");
+        if (!$("seed").value) $("seed").value = model.default_seed;
+        $("seed").placeholder = "输入随机种子";
+      } catch { $("seed").placeholder = "请输入随机种子"; }
+    }
+
+    function setStatus(message, busy = false, error = false) {
+      $("result").hidden = false;
+      $("result").dataset.busy = String(busy);
+      $("result").dataset.error = String(error);
+      $("status").textContent = message;
+    }
+
+    function finish(job, message) {
+      if (current !== job) return;
+      current = null;
+      $("generate").disabled = false;
+      $("stop").hidden = true;
+      job.context.close().catch(() => {});
+      setStatus(message);
+    }
+
+    function releasePlayback(job) {
+      job.controller.abort();
+      for (const source of job.sources) {
+        source.onended = null;
+        source.stop();
+        source.disconnect();
+        source.buffer = null;
+      }
+      job.sources.clear();
+    }
+
+    function stopPlayback() {
+      if (!current) return;
+      const job = current;
+      releasePlayback(job);
+      finish(job, "已停止");
+    }
+
+    function schedulePcm(job, data, format) {
+      const frameBytes = format.channels * 2;
+      const size = data.byteLength - data.byteLength % frameBytes;
+      if (!size) return data;
+      const samples = size / frameBytes;
+      const audio = job.context.createBuffer(format.channels, samples, format.rate);
+      const view = new DataView(data.buffer, data.byteOffset, size);
+      for (let channel = 0; channel < format.channels; ++channel) {
+        const output = audio.getChannelData(channel);
+        for (let i = 0; i < samples; ++i) output[i] = view.getInt16(i * frameBytes + channel * 2, true) / 32768;
+      }
+      const source = job.context.createBufferSource();
+      source.buffer = audio;
+      source.connect(job.context.destination);
+      job.nextTime = Math.max(job.nextTime, job.context.currentTime + job.context.baseLatency);
+      job.sources.add(source);
+      source.onended = () => {
+        job.sources.delete(source);
+        source.disconnect();
+        source.buffer = null;
+        if (job.received && job.sources.size === 0) finish(job, job.completion);
+      };
+      source.start(job.nextTime);
+      job.nextTime += audio.duration;
+      job.samples += samples;
+      setStatus(`正在生成并播放 · 已生成 ${(job.samples / format.rate).toFixed(1)} 秒`, true);
+      return data.slice(size);
+    }
+
+    async function checkConnection() {
+      try {
+        const response = await fetch("/health", {cache: "no-store"});
+        const health = await response.json();
+        if (!response.ok || health.status !== "ready") throw new Error("服务尚未就绪");
+        $("connection").dataset.state = "ready";
+        $("connection-text").textContent = "服务就绪";
+      } catch {
+        $("connection").dataset.state = "error";
+        $("connection-text").textContent = "服务未连接";
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (current || !content.value.trim()) return;
+      let settings;
+      try { settings = voiceSettings(); }
+      catch (error) { setStatus(error.message, false, true); $("seed").focus(); return; }
+      const referenceAudio = $("reference-audio").files[0], referenceText = $("reference-text").value.trim();
+      if (Boolean(referenceAudio) !== Boolean(referenceText)) {
+        $("reference").open = true;
+        setStatus(referenceAudio ? "请填写参考音频对应的文本。" : "请重新选择参考音频，或清除参考文本。", false, true);
+        (referenceAudio ? $("reference-text") : $("reference-audio")).focus();
+        return;
+      }
+      if (!window.AudioContext) { setStatus("当前浏览器不支持音频播放，请使用新版浏览器。", false, true); return; }
+      let context;
+      try { context = new AudioContext({latencyHint: "interactive"}); }
+      catch { setStatus("无法打开音频设备，请检查浏览器的声音设置。", false, true); return; }
+      const job = {controller: new AbortController(), context,
+        sources: new Set(), nextTime: 0, samples: 0, received: false, completion: "播放完成"};
+      current = job;
+      $("generate").disabled = true;
+      $("stop").hidden = false;
+      setStatus("正在准备声音…", true);
+      let reader;
+      try {
+        // Resume during the button gesture, before waiting for the HTTP response.
+        await job.context.resume();
+        const {seed, ...options} = settings;
+        const payload = {input: content.value.trim(), ...options, stream: true, response_format: "pcm"};
+        const request = {method: "POST", cache: "no-store", signal: job.controller.signal};
+        if (referenceAudio) {
+          // The browser streams the selected file as multipart; no audio copy is saved.
+          const body = new FormData();
+          for (const [name, value] of Object.entries({...payload, seed, ref_text: referenceText})) body.set(name, String(value));
+          body.set("ref_audio", referenceAudio);
+          request.body = body;
+        } else {
+          // JSON numbers support uint64; JavaScript Number does not. Append validated digits exactly.
+          request.headers = {"Content-Type": "application/json"};
+          request.body = JSON.stringify(payload).slice(0, -1) + ',"seed":' + seed + '}';
+        }
+        const response = await fetch("/v1/audio/speech", request);
+        if (!response.ok) {
+          const detail = await response.json().catch(() => null);
+          throw new Error(detail?.error?.message || `生成失败（HTTP ${response.status}）`);
+        }
+        const format = {rate: Number(response.headers.get("X-Sample-Rate")), channels: Number(response.headers.get("X-Channels"))};
+        if (response.headers.get("X-Sample-Format") !== "s16le" || !Number.isInteger(format.rate) || format.rate <= 0 ||
+            !Number.isInteger(format.channels) || format.channels <= 0) throw new Error("服务返回了不支持的音频格式。");
+        reader = response.body.getReader();
+        let pending = new Uint8Array();
+        for (;;) {
+          const {value, done} = await reader.read();
+          if (job.controller.signal.aborted) return;
+          if (done) break;
+          let data = value;
+          if (pending.byteLength) {
+            data = new Uint8Array(pending.byteLength + value.byteLength);
+            data.set(pending); data.set(value, pending.byteLength);
+          }
+          pending = schedulePcm(job, data, format);
+        }
+        if (pending.byteLength || !job.samples) throw new Error("未收到完整音频，请重试。");
+        const speechId = response.headers.get("X-SGLang-Omni-Speech-Id");
+        if (speechId) {
+          const outcome = await fetch(`/v1/audio/speech/${encodeURIComponent(speechId)}`, {cache: "no-store", signal: job.controller.signal});
+          if (outcome.ok && (await outcome.json()).finish_reason === "length")
+            job.completion = "播放完成 · 已达到生成时长上限，部分文字可能未读完";
+        }
+        if (job.controller.signal.aborted) return;
+        job.received = true;
+        setStatus(`合成完成 · ${(job.samples / format.rate).toFixed(1)} 秒，正在播放`, true);
+        if (job.sources.size === 0) finish(job, job.completion);
+        else job.completion += ` · ${(job.samples / format.rate).toFixed(1)} 秒`;
+      } catch (error) {
+        if (current !== job) return;
+        releasePlayback(job);
+        finish(job, "");
+        setStatus(error.name === "AbortError" ? "已停止" : error.message, false, error.name !== "AbortError");
+      } finally {
+        if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      }
+    });
+
+    document.querySelectorAll("[data-cfg]").forEach((button) => button.addEventListener("click", () => {
+      setCfg(Number(button.dataset.cfg));
+    }));
+    instructions.addEventListener("input", syncCfg);
+    content.addEventListener("input", () => { $("character-count").textContent = `${[...content.value].length} 字`; });
+    $("stop").addEventListener("click", stopPlayback);
+    document.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); form.requestSubmit(); }
+    });
+    window.addEventListener("pagehide", stopPlayback);
+    syncCfg();
+    checkConnection();
+    loadDefaultSeed();
+    loadVoices();
+  </script>
+</body>
+</html>

@@ -20,6 +20,7 @@ target_compile_definitions(tts_server PRIVATE TTS_ENTRY_POINT=run_server)
 target_include_directories(tts_server PRIVATE src)
 target_link_libraries(tts_server PRIVATE tts httplib::httplib
   nlohmann_json::nlohmann_json spdlog::spdlog_header_only Threads::Threads)
+add_subdirectory(examples/web)
 tts_deploy_runtime(tts_server)
 install(TARGETS tts_server)
 install(FILES "${httplib_SOURCE_DIR}/LICENSE"

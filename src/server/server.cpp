@@ -1,5 +1,6 @@
 #include "server/server.h"
 #include "server/protocol.h"
+#include "web.h"
 #include "tts/engine.h"
 #include "io/audio_io.h"
 #include "io/audio_speed.h"
@@ -173,6 +174,7 @@ struct Server::Impl {
                     json_reply(response, 500, error_json(500, "internal server error"));
                 }
             });
+        mount_web_ui(http, config.voice_presets_file);
         http.Get("/health", [this](const httplib::Request &, httplib::Response &response) {
             json_reply(response, stopping ? 503 : 200,
                        {{"status", stopping ? "stopping" : "ready"},
@@ -188,6 +190,7 @@ struct Server::Impl {
             });
         };
         metadata("/v1/model", {{"id", config.model_name},
+                               {"default_seed", std::to_string(engine.default_options().seed)},
                                {"model_type", info.model_type},
                                {"sample_rate", audio.sample_rate},
                                {"frame_rate", double(audio.sample_rate) / audio.samples_per_frame},

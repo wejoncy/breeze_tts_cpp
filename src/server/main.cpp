@@ -44,6 +44,7 @@ int run_server(int argc, const char *const *argv) {
         const std::map<std::string, Argument> arguments{
             {"--model", &model},
             {"--served-model-name", &config.model_name},
+            {"--voice-presets-file", &config.voice_presets_file},
             {"--host", &config.host},
             {"--port", &config.port},
             {"--device", &device},
