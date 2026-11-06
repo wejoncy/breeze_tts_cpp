@@ -96,7 +96,10 @@ void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs
         }
         auto head_context = context;
         head_context.max_rows = context.max_batch;
-        auto logits = Linear(lm_head).forward(hidden_states, head_context);
+        // Preserve FP32 head output through CFG and sampling.
+        auto logits = head_context.tensor({head_context.max_rows, lm_head.rows}, Type::F32)
+                          .slice(0, hidden_states.rows);
+        Linear(lm_head).forward(hidden_states, logits, head_context);
         auto done = sampler.forward(logits, inputs["sampling"], inputs["done"], head_context);
         outputs["logits"] = logits;
         outputs["hidden_states"] = hidden_states;

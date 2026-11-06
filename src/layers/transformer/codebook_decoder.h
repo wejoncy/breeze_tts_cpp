@@ -42,7 +42,7 @@ class ResidualCodebooks {
             decoder_.config.kvheads * decoder_.config.dim}, decoder_.config.type);
         cache.values = context.tensor(cache.keys, decoder_.config.type);
         auto hidden_states = context.tensor({context.max_rows * 2, hidden_size}, decoder_.config.type);
-        auto logits = context.tensor({context.max_rows, vocabulary_}, decoder_.config.type).slice(0, lanes);
+        auto logits = context.tensor({context.max_rows, vocabulary_}, Type::F32).slice(0, lanes);
         auto first_states = hidden_states.slice(0, lanes * 2).every_rows(0, 2, lanes);
         auto token_states = hidden_states.slice(0, lanes * 2).every_rows(1, 2, lanes);
         projection_.forward(backbone_states, first_states, context);
