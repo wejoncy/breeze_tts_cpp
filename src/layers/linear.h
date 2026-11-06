@@ -99,9 +99,9 @@ class Linear {
   private:
     TensorView apply_context(TensorView input, TensorView output, ForwardContext &context,
                              TensorView bias, const ops::Epilogue &finish) const {
+        validate_types(input, output);
         if (input.rows < 1 || input.rows > context.max_rows || input.cols != input_channels() ||
-            input.type != activation_type_ || output.rows != input.rows ||
-            output.cols != output_channels() || output.type != activation_type_)
+            output.rows != input.rows || output.cols != output_channels())
             throw std::invalid_argument("linear input shape/type");
         Workspace workspace(context.max_rows, is_quantized() ? input_channels() : 0);
         if (context.mode == ForwardContext::Prepare && input.data && output.data)
