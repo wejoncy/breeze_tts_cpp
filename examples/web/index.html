@@ -218,7 +218,7 @@
     <aside class="panel voices" aria-labelledby="voices-heading">
       <div class="label-row"><h2 id="voices-heading">我的音色</h2><span id="voice-count" class="hint">0 个</span></div>
       <label for="voice-name">音色名称</label>
-      <input id="voice-name" type="text" autocomplete="off" placeholder="大肥鱼（迷糊版） — 大肥鱼迷糊少女音">
+      <input id="voice-name" type="text" autocomplete="off">
       <div class="voice-actions">
         <button id="save-voice" class="primary" type="button" disabled>保存当前音色</button>
         <button id="new-voice" class="secondary" type="button" title="保留当前配置，另存为新音色">另存为</button>
@@ -264,6 +264,15 @@
       $("voice-status").dataset.error = String(error);
     }
 
+    function voiceToUpdate() {
+      const name = $("voice-name").value.trim();
+      return voices.find(voice => voice.id === selectedVoice && voice.name.trim() === name);
+    }
+
+    function updateSaveLabel() {
+      $("save-voice").textContent = voiceToUpdate() ? "更新当前音色" : "保存新音色";
+    }
+
     async function api(url, options = {}) {
       const response = await fetch(url, {cache: "no-store", ...options});
       const data = await response.json();
@@ -277,7 +286,7 @@
       $("voices-empty").hidden = !storageEnabled || voices.length > 0;
       $("save-voice").disabled = !storageEnabled || savingVoice;
       $("new-voice").disabled = savingVoice;
-      $("save-voice").textContent = selectedVoice ? "更新当前音色" : "保存当前音色";
+      updateSaveLabel();
       for (const voice of voices) {
         const item = document.createElement("li");
         item.className = "voice-item";
@@ -341,7 +350,8 @@
         const name = $("voice-name").value.trim();
         if (!name) { $("voice-name").focus(); throw new Error("请先为音色起一个名字。"); }
         const entry = {name, input: content.value, ref_text: $("reference-text").value, ...voiceSettings()};
-        if (selectedVoice) entry.id = selectedVoice;
+        const previous = voiceToUpdate();
+        if (previous) entry.id = previous.id;
         savingVoice = true; renderVoices();
         const saved = await api("/v1/voice-presets", {method: "POST",
           headers: {"Content-Type": "application/json"}, body: JSON.stringify(entry)});
@@ -357,6 +367,7 @@
       renderVoices(); $("voice-name").focus();
       voiceStatus("已保留当前配置，输入新名称后保存。");
     });
+    $("voice-name").addEventListener("input", updateSaveLabel);
 
     $("clear-reference").addEventListener("click", () => {
       $("reference-audio").value = "";
