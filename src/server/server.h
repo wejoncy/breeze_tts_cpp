@@ -8,6 +8,7 @@ namespace http {
 struct Config {
     std::string host = "127.0.0.1";
     std::string model_name;
+    std::string voice_presets_file;
     int port = 8088;
     size_t threads = 64;
     size_t queue_limit = 32;

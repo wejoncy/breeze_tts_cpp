@@ -1,0 +1,5 @@
+#pragma once
+
+namespace tts::http {
+inline constexpr char web_page[] = R"TTS_WEB(@TTS_WEB_HTML@)TTS_WEB";
+}
