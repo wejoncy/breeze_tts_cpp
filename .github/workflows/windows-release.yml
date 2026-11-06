@@ -124,5 +124,5 @@ jobs:
             }
             Write-Output "$program --help passed"
           }
-          'RTX 30/40/50 kernels packaged; GPU inference requires validation on GPU hardware.' |
+          'Package startup passed on clean Windows; GPU inference requires validation on GPU hardware.' |
             Out-File $env:GITHUB_STEP_SUMMARY -Append

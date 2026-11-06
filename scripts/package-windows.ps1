@@ -95,8 +95,8 @@ setlocal
 "%~dp0tts-server.exe" --quantization group_int8 %*
 exit /b %errorlevel%
 '@ | Set-Content -LiteralPath (Join-Path $destinationPath 'start-server.cmd') -Encoding ascii
-@'
-Windows x64, NVIDIA RTX 30 / 40 / 50 series (default workflow architectures).
+@"
+Windows x64. Packaged CUDA architectures: $ExpectedArchitectures.
 
 Extract the entire archive. Keep the DLLs beside the executables.
 CUDA Toolkit, Python, Rust and build tools are not required to run this package.
@@ -114,5 +114,5 @@ Generated web audio remains in memory. Reference audio is not saved in presets.
 
 CI checks DLL imports and startup on a separate runner without a CUDA SDK in PATH.
 GitHub-hosted Windows runners do not validate actual GPU speech synthesis.
-'@ | Set-Content -LiteralPath (Join-Path $destinationPath 'USAGE.txt') -Encoding ascii
+"@ | Set-Content -LiteralPath (Join-Path $destinationPath 'USAGE.txt') -Encoding ascii
 Write-Output "Windows runtime package ready: $destinationPath"
