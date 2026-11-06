@@ -19,6 +19,7 @@ CudaContext::CudaContext(int ordinal, Quantization format, size_t limit)
         if (properties.major < 8) throw std::invalid_argument("CUDA inference requires SM80+");
         shared_memory_per_block = properties.sharedMemPerBlock;
         multiprocessors = properties.multiProcessorCount;
+        resident_threads = multiprocessors * properties.maxThreadsPerMultiProcessor;
         sm_major = properties.major;
         sm_minor = properties.minor;
         gemm_workspace = Buffer(8 << 20);

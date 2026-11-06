@@ -59,7 +59,7 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
         {"positions", {1, 1}, Type::I32},
         {"phones", {options.context, 1}, Type::I32},
         {"seen", {model_instance.config.at("semantic").at("EOS"), 1}, Type::I32},
-        {"rng", {1, 1}, Type::I64},
+        {"rng", {1, 2}, Type::I64},
         {"done", {1, 1}, Type::I32},
         {"waveform_condition",
          {1, model_instance.acoustic.waveform_condition_channels()},

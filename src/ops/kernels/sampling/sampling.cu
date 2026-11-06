@@ -2,6 +2,10 @@
 #include "ops/sampling.h"
 #include "ops/kernels/common/cuda_math.cuh"
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
+#include <algorithm>
+#include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_radix_sort.cuh>
@@ -9,11 +13,63 @@ namespace tts {
 struct LogitMaximum {
     __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
 };
-__device__ uint64_t splitmix(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
+// Match PyTorch's CUDA exponential_ TensorIterator mapping, including the
+// unused float4 components and the per-call Philox offset increment.
+__device__ float exponential_noise(SamplingRng random, int token, int random_threads) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(random.seed, token % random_threads,
+                random.offset + uint64_t(token / (random_threads * 4)) * 4, &state);
+    float4 values = curand_uniform4(&state);
+    int component = token / random_threads % 4;
+    float uniform = component < 2 ? (component ? values.y : values.x)
+                                  : (component == 2 ? values.z : values.w);
+    return uniform >= 1.f - FLT_EPSILON / 2 ? FLT_EPSILON / 2 : -logf(uniform);
+}
+template <class T>
+__device__ float multinomial_score(float probability, SamplingRng random, int token, int threads) {
+    return rounded<T>(probability / rounded<T>(exponential_noise(random, token, threads)));
+}
+__device__ void advance_random(SamplingRng &random, int vocabulary, int threads) {
+    random.offset += uint64_t((vocabulary - 1) / (threads * 4) + 1) * 4;
+}
+static int random_threads(const CudaContext &cuda, int vocabulary) {
+    return int(std::min((int64_t(vocabulary) + 255) / 256, int64_t(cuda.resident_threads / 256))) * 256;
+}
+template <class T>
+__global__ void multinomial_kernel(const T *probabilities, int rows_stride, int vocabulary,
+                                    int64_t *indices, SamplingRng *random_states, int threads) {
+    using Candidate = cub::KeyValuePair<int, float>;
+    using Select = cub::BlockReduce<Candidate, 256>;
+    __shared__ typename Select::TempStorage storage;
+    int row = blockIdx.x;
+    SamplingRng random = random_states[row];
+    Candidate best{INT_MAX, -INFINITY};
+    for (int token = threadIdx.x; token < vocabulary; token += blockDim.x)
+        best = cub::ArgMax{}(best, Candidate{token,
+            multinomial_score<T>(f(probabilities[size_t(row) * rows_stride + token]), random, token, threads)});
+    best = Select(storage).Reduce(best, cub::ArgMax{});
+    if (!threadIdx.x) {
+        indices[row] = best.key;
+        advance_random(random_states[row], vocabulary, threads);
+    }
+}
+void ops::multinomial(TensorView probabilities, TensorView indices, TensorView random_states) {
+    auto &cuda = execution_context(probabilities, {indices, random_states});
+    if (probabilities.rows < 1 || probabilities.cols < 1 ||
+        indices.type != Type::I64 || indices.rows != probabilities.rows || indices.cols != 1 || !indices.dense() ||
+        random_states.type != Type::I64 || random_states.rows != probabilities.rows || random_states.cols != 2 || !random_states.dense() ||
+        probabilities.overlaps(indices) || probabilities.overlaps(random_states) || indices.overlaps(random_states))
+        throw std::invalid_argument("multinomial probability/output/RNG shape or storage mismatch");
+    auto launch = [&](auto value) {
+        using T = decltype(value);
+        multinomial_kernel<<<probabilities.rows, 256, 0, cuda.stream>>>(probabilities.ptr<T>(),
+            probabilities.ld(), probabilities.cols, indices.ptr<int64_t>(), random_states.ptr<SamplingRng>(),
+            random_threads(cuda, probabilities.cols));
+    };
+    if (probabilities.type == Type::BF16) launch(bf16{});
+    else if (probabilities.type == Type::F16) launch(__half{});
+    else if (probabilities.type == Type::F32) launch(float{});
+    else throw std::invalid_argument("multinomial requires F32, F16 or BF16 probabilities");
 }
 template <class T>
 __device__ float guided_logit(const T *logits, int vocab, int b, int batch, int branches, int cb,
@@ -91,20 +147,24 @@ __global__ void greedy_kernel(const T *logits, int vocab, int *codes, int batch,
            layout, int(blockIdx.x), nullptr);
 }
 template <class T>
-__global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *rng, int batch,
+__global__ void sample_kernel(const T *logits, int vocab, int *codes, SamplingRng *rng, int batch,
                               int branches, int cb, float cfg, float temp, int topk, int *done,
                               float topp, float cfg_ref, float cfg_ins, float penalty, int *seen,
-                              SamplingLayout layout, const SamplingRow *rows) {
+                              SamplingLayout layout, const SamplingRow *rows, int random_threads) {
     using Sort = cub::BlockRadixSort<float, 256, 16, int>;
     using Reduce = cub::BlockReduce<float, 256>;
+    using Candidate = cub::KeyValuePair<int, float>;
+    using Select = cub::BlockReduce<Candidate, 256>;
     __shared__ union {
         typename Sort::TempStorage sort;
         typename Reduce::TempStorage reduce;
+        typename Select::TempStorage select;
         struct {
             float values[4096];
             int ids[4096];
         } ordered;
     } storage;
+    __shared__ int candidates;
     int b = blockIdx.x;
     int *batch_done = rows ? done : nullptr;
     const int *logit_rows = nullptr;
@@ -155,6 +215,7 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
         values[j] = guided_logit(logits, vocab, b, batch, branches, cb, id, cfg, cfg_ref, cfg_ins,
                                  penalty, seen, layout, logit_rows, suppress_eos, &raw);
         if (nucleus_before_temperature) values[j] = rounded<T>(values[j]);
+        else if (temp > 0) values[j] /= temp;
         if (id != layout.eos) raw_max = fmaxf(raw_max, raw);
     }
     if (eos_on_argmax) {
@@ -190,10 +251,9 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
     __syncthreads();
     if (!threadIdx.x) {
         auto *v = storage.ordered.values;
-        auto *id = storage.ordered.ids;
         int valid = layout.entries + (cb == 0 && !suppress_eos ? 1 : 0),
             limit = valid, k = topk > 0 ? min(topk, valid) : valid;
-        if (!nucleus_before_temperature)
+        if (!nucleus_before_temperature && cb == 0)
             while (k < valid && v[k] == v[k - 1]) ++k;
         float sum = 0, maximum = v[0];
         if (nucleus_before_temperature && topp < 1.f) {
@@ -222,7 +282,7 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
         float scaled_maximum = rounded<T>(maximum / temp);
         for (int i = 0; i < k; i++) {
             v[i] = expf(nucleus_before_temperature
-                ? rounded<T>(v[i] / temp) - scaled_maximum : (v[i] - maximum) / temp);
+                ? rounded<T>(v[i] / temp) - scaled_maximum : v[i] - maximum);
             sum += v[i];
         }
         if (!nucleus_before_temperature && topp < 1.f) {
@@ -242,17 +302,25 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
             }
             sum = total;
         }
-        uint64_t state = rng[b];
-        rng[b] = state + 0x9e3779b97f4a7c15ULL;
-        float target = ((splitmix(state) >> 40) + .5f) * (1.f / 16777216) * sum, accum = 0;
-        int chosen = id[k - 1];
-        for (int i = 0; i < k; i++) {
-            accum += v[i];
-            if (accum >= target) {
-                chosen = id[i];
-                break;
-            }
-        }
+        candidates = k;
+    }
+    __syncthreads();
+    const SamplingRng random = rng[b];
+    Candidate best{INT_MAX, -INFINITY};
+    for (int index = threadIdx.x; index < candidates; index += blockDim.x) {
+        int token = storage.ordered.ids[index];
+        float probability = storage.ordered.values[index];
+        float score = nucleus_before_temperature
+            ? multinomial_score<T>(probability, random, token, random_threads)
+            : multinomial_score<float>(probability, random, token, random_threads);
+        best = cub::ArgMax{}(best, Candidate{token, score});
+    }
+    // Every thread has consumed the ordered values before reduction reuses them.
+    __syncthreads();
+    best = Select(storage.select).Reduce(best, cub::ArgMax{});
+    if (!threadIdx.x) {
+        advance_random(rng[b], vocab, random_threads);
+        int chosen = best.key;
         if (cb == 0 && chosen == layout.eos) {
             done[b] = 1;
             chosen = 0;
@@ -265,10 +333,11 @@ __global__ void sample_kernel(const T *logits, int vocab, int *codes, uint64_t *
     }
 }
 void sample( TensorView logits, SamplingLayout layout, int *codes,
-            uint64_t *rng, int batch, int branches, int cb, float cfg, float temp, int topk,
+            SamplingRng *rng, int batch, int branches, int cb, float cfg, float temp, int topk,
             int *done, float topp, float cfg_ref, float cfg_ins, float penalty, int *seen,
             const SamplingRow *rows) {
-    const auto stream = execution_context(logits).stream;
+    const auto &cuda = execution_context(logits);
+    const auto stream = cuda.stream;
     if (layout.codebooks < 1 || cb < 0 || cb >= layout.codebooks || layout.entries < 1 ||
         layout.entries > logits.cols ||
         (cb == 0 && (layout.eos < layout.entries || layout.eos >= logits.cols)) ||
@@ -283,7 +352,8 @@ void sample( TensorView logits, SamplingLayout layout, int *codes,
                 branches, cb, cfg, done, cfg_ref, cfg_ins, penalty, seen, layout);
         else
             sample_kernel<<<batch, 256, 0, stream>>>(logits.ptr<T>(), logits.cols, codes, rng, batch,
-                branches, cb, cfg, temp, topk, done, topp, cfg_ref, cfg_ins, penalty, seen, layout, rows);
+                branches, cb, cfg, temp, topk, done, topp, cfg_ref, cfg_ins, penalty, seen, layout, rows,
+                random_threads(cuda, logits.cols));
     };
     if (logits.type == Type::BF16) launch(bf16{});
     else if (logits.type == Type::F16) launch(__half{});

@@ -48,7 +48,7 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader,
         {"codes", {1, configuration.codebooks}, Type::I32},
         {"done", {1, 1}, Type::I32},
         {"positions", {breeze::max_guidance_branches, 1}, Type::I32},
-        {"rng", {1, 1}, Type::I64},
+        {"rng", {1, 2}, Type::I64},
         {"seen", {configuration.codec.codebook_size, 1}, Type::I32},
         {"table", {breeze::max_guidance_branches, parts.resources->kv.block_stride()}, Type::I32}};
     state.histories.emplace_back("audio", model_instance.codec.history_spec());
