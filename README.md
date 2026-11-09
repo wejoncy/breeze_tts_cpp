@@ -9,7 +9,7 @@ and streaming PCM. Python is optional; native inference needs no PyTorch or mode
 Requires CMake 3.28+, a C++17 compiler, CUDA 13+, Rust/Cargo, Git, libsndfile and
 libsoxr. Rust is a build dependency only. CUDA/cuBLAS and audio libraries are
 found locally; [FetchContent](cmake/Dependencies.cmake) fetches pinned JSON,
-spdlog, Corrosion, CUTLASS, FlashAttention, cppjieba, fastText,
+spdlog, concurrentqueue, Corrosion, CUTLASS, FlashAttention, cppjieba, fastText,
 Open JTalk/MeCab-Ko and missing audio headers. The native HTTP server also fetches
 cpp-httplib.
 
@@ -164,6 +164,7 @@ try {
 |---|---|
 | `POST /v1/audio/speech` | WAV by default; `response_format: "pcm"` for raw PCM |
 | `POST /v1/audio/speech/batch` | `{"items": [{"input":"..."}, ...]}` to ordered JSON results with base64 `audio_data` or per-item errors |
+| `GET /v1/audio/speech/{speech_id}` | Recent completed stream's `finish_reason` and nullable `usage` |
 | `GET /health`, `GET /v1/models`, `GET /v1/model` | Readiness, served model list and native metadata |
 
 Use `speed` (0.25–4), `instructions`, `language`, `max_new_tokens` and sampling
@@ -173,7 +174,7 @@ batch streaming is rejected. For SSE, set `stream_format: "sse"` and
 `response_format: "pcm"`; events carry `speech.audio.delta` with base64 PCM,
 then `speech.audio.done` or `error`. Raw PCM streams have no in-band events.
 `X-Sample-Rate`, `X-Channels` and `X-Bit-Depth` describe the audio; the raw stream's
-`X-SGLang-Omni-Speech-Id` identifies the same response connection. Token usage is `null`
+`X-SGLang-Omni-Speech-Id` identifies its completed outcome. Token usage is `null`
 because the native Engine does not report model-specific token counts.
 
 Reference input accepts base64 `ref_audio` plus `ref_text`, a multipart upload,
@@ -241,53 +242,22 @@ Eager activations borrow and return pool regions; serving does not grow physical
 Graphs are captured from largest to smallest at initialization and retained. Nearby shapes may pad
 rows by at most 12.5%; inactive rows own no KV/history/RNG state. Other shapes execute eagerly.
 `--max-batch` bounds active requests; `--queue-limit` and `--stream-buffer-mb` configure native
-admission and output-buffer limits. Slow consumers terminate without blocking other requests.
+admission and output-buffer limits. Slow consumers are cancelled without blocking other requests.
 `Request` carries `request_id`, `inputs` and `options`. Native `Engine::add_request(request)`
 returns `void`; Python submits the same fields as a dictionary and returns `None`.
-All requests publish `GenerationFrame` records to one `engine.output_queue()` FIFO
-(Python: `engine.output_queue.get(timeout)`). The application owns this queue's
-consumption and delivery to its original connections. There is no per-ID Engine
-output reader or result polling endpoint. `cancel_request(request_id)` posts a
-cancellation command and returns immediately. Already queued frames remain in FIFO
-order; active cancellation produces a terminal frame. Results carry their request
-ID, and callers keep IDs unique until terminal output is consumed. Duplicate active
-IDs are ignored and logged. Admission counts active work; the global output byte
-limit bounds unread PCM separately. Construction loads resources only; call `run_async()`
+Read with `engine.read_result(request_id)` (zero timeout polls), or discard/cancel with
+`engine.cancel_request(request_id)`, which posts a cancellation event and returns `None`
+(`void` in C++); unknown IDs are ignored. Results carry the same ID. Duplicate live IDs reject;
+reading terminal output/errors consumes the ID, after which it can be reused. Completed unread
+results count toward the admission limit. Construction loads resources only; call `run_async()`
 before execution or GPU control calls. C++ `shutdown()` and Python `close()` cancel outstanding requests and join
-the engine thread. Repeated starts while running and repeated shutdowns are harmless; restarting
+both threads. Repeated starts while running and repeated shutdowns are harmless; restarting
 a closed engine is rejected. The owner stops API ingress before calling shutdown; lifecycle
 calls belong to that owner. The C API exposes `tts_run_async()` and `tts_shutdown()`.
-Engine owns request preparation, lifecycle, statistics and output delivery.
-Scheduler reserves both a cache slot and physical KV backing before returning a
-running row. Runner uses the supplied resources without slot acquisition or a
-deferred-row retry path. Token and audio metadata each use one packed nonblocking
-Tensor upload with reusable CPU storage and fixed CUDA graph addresses.
-RequestScheduler owns waiting/running membership and selects ready rows under
-batch/slot/KV constraints, placing eligible prefill rows before decode rows.
-Completed prefills return to Scheduler before decode starts, so newly ready
-requests can join that selection. Engine attaches prepared inputs and calls
-ModelRunner; Scheduler receives only scheduling progress. There is no RequestPlanner.
-One engine thread calls CPU scheduling, model execution and output sampling.
-Selected batches retain their resources through direct adoption; there is no batch
-refresh/reselection path. PCM-producing models copy graph output directly into the
-batch result slot, without an intermediate PCM buffer. Engine writes audio directly
-to the global FIFO; terminal work retires before consumer notification. A compute
-stream and a separate readback stream use CUDA events for ordering. H2D shares the
-compute stream. For causal single-frame audio, Engine submits the next token+audio
-batch before querying the preceding event; an extra frame after EOS is discarded.
-Windowed models retain stages that depend on CPU metadata. Client
-threads share one Engine. HTTP workers parse requests and call `add_request()` to enqueue
-owned `Request` values. Engine registers them in Scheduler's waiting list and prepares inputs; Scheduler selects
-the running batch and reserves its slot/KV resources, then Engine calls ModelRunner. Each iteration
-prepares the successor while CUDA runs and publishes completed audio/status/errors to
-one shared Engine output FIFO. HTTP workers drain it and deliver to the existing
-response connections. They return complete audio or chunks on that connection. No executable callback crosses a thread boundary.
-Offline `generate()` uses these same queues. Engine creates only its execution thread
-and blocks on ingress when idle.
+A C++ scheduling thread performs tokenization and batch formation, independently of the GPU
+execution thread. They communicate through queues and block when idle; offline `generate()`
+wraps the same scheduler.
 
 See [architecture and ownership](docs/DESIGN.md) and the
 [C interface](include/tts/tts.h). CPU inference, multi-GPU and arbitrary model architectures
 are not supported.
-
-The current scheduler/engine architecture, Engine loop, correctness checks and
-16/32-client main comparison are documented in [DESIGN](docs/DESIGN.md#verification-evidence).
