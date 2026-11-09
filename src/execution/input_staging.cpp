@@ -1,5 +1,5 @@
 #include "execution/input_staging.h"
-#include "ops/storage.h"
+#include "runtime/cuda_context.h"
 #include <algorithm>
 
 namespace tts {
@@ -16,7 +16,8 @@ void run_forward(const Model &model, std::string_view program, const InputBatch 
         if (context.mode == ForwardContext::Execute && source.numel()) {
             if (source.device != -1 || !source.dense() || !source.data)
                 throw std::invalid_argument("input upload requires dense host data");
-            ops::upload_bytes(destination, source.data, source.size());
+            // Tensor H2D and its model consumers share compute-stream order.
+            destination.copy_(source, true);
         }
         uploaded.emplace_back(source, destination);
         return destination;

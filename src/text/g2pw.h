@@ -1,6 +1,6 @@
 #pragma once
 #include "io/tokenizer.h"
-#include "execution/request_planner.h"
+#include "execution/input_plan.h"
 #include "text/pinyin.h"
 #include <memory>
 #include <utility>
@@ -16,7 +16,7 @@ struct G2PWTask final : PreparationTask {
     void accept(HostResults) override;
 };
 // Immutable pronunciation assets and CPU tokenization. Network execution is
-// transferred to the same GPU executor as every other conditioning stage.
+// transferred by Engine to the runner like every other conditioning stage.
 class G2PW {
     struct Impl;
     std::unique_ptr<Impl> impl_;

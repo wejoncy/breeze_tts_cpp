@@ -1,3 +1,4 @@
+#include <chrono>
 #include "io/audio_io.h"
 #include "tts/engine.h"
 #include "support/log.h"
@@ -193,8 +194,25 @@ void add_request(EngineHandle *handle, std::string request_id, ffi::Array<Values
             {std::move(request_id), requests_from(input), snapshot_options(options)});
     });
 }
-Values read_result(EngineHandle *handle, std::string request_id, int timeout_ms) {
-    auto frame = with_errors([&] { return handle->get()->read_result(request_id, timeout_ms); });
+Values pop_output(EngineHandle *handle, int timeout_ms) {
+    auto frame = with_errors([&] {
+        auto &queue = handle->get()->output_queue();
+        std::unique_lock<std::mutex> lock(queue.mutex);
+        if (timeout_ms < 0) queue.available.wait(lock, [&] { return queue.closed || !queue.frames.empty(); });
+        else queue.available.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+            [&] { return queue.closed || !queue.frames.empty(); });
+        if (queue.frames.empty()) {
+            if (queue.closed) throw std::runtime_error("engine is shut down");
+            return GenerationFrame{};
+        }
+        auto value = std::move(queue.frames.front()); queue.frames.pop_front();
+        for (const auto &chunk : value.chunks) queue.bytes -= chunk.second.size() * sizeof(int16_t);
+        return value;
+    });
+    if (frame.request_id.empty()) return {};
+    std::string error;
+    if (frame.error) { try { std::rethrow_exception(frame.error); }
+        catch (const std::exception &failure) { error = failure.what(); } }
     ffi::Array<Values> chunks;
     for (const auto &[lane, pcm] : frame.chunks)
         chunks.push_back({{"index", lane},
@@ -203,7 +221,7 @@ Values read_result(EngineHandle *handle, std::string request_id, int timeout_ms)
     const auto &s = frame.stats;
     return {{"request_id", frame.request_id},
             {"chunks", chunks},
-            {"ready", frame.ready},
+            {"error", error},
             {"batch_size", frame.batch_size},
             {"done", frame.done},
             {"cancelled", frame.cancelled},
@@ -224,7 +242,7 @@ void configure_serving(EngineHandle *handle, int request_limit, int output_buffe
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure_serving, configure_serving);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_request, add_request);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(read_result, read_result);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pop_output, pop_output);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cancel_request, cancel_request);
 void run_async(EngineHandle *handle) {
     handle->get()->run_async();

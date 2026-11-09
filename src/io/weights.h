@@ -3,7 +3,6 @@
 #include "core/tensor_storage.h"
 #include "io/model_loader.h"
 #include <unordered_map>
-#include <functional>
 
 namespace tts {
 class Weights {
@@ -12,8 +11,15 @@ class Weights {
     SafeTensors files_;
     const std::vector<std::string> checkpoint_files_;
     std::unordered_map<std::string, Tensor> loaded_;
-    std::vector<std::function<void()>> uploads_;
-    std::vector<std::function<void()>> postprocess_;
+    struct Upload {
+        enum class Kind { Copy, Quantize, Packed };
+        Kind kind = Kind::Copy;
+        TensorView destination;
+        std::vector<std::string> sources;
+        RowScaledView quantized;
+        std::vector<char> packed;
+    };
+    std::vector<Upload> uploads_;
     enum class Phase { Registering, Loading, Loaded, Sealed };
     Phase phase_ = Phase::Registering;
     void require_loading() const;
@@ -28,7 +34,6 @@ class Weights {
     // Layers first declare destination storage and load transforms. Execute
     // these once after the network is built, before any runner/graph exists.
     void load();
-    void after_loading(std::function<void()> process);
     void seal();
     Device device() const {
         return device_;

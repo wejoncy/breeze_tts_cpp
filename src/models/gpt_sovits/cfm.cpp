@@ -1,6 +1,5 @@
 #include "models/gpt_sovits/cfm.h"
 #include "layers/input_metadata.h"
-#include "ops/storage.h"
 #include <map>
 #include <numeric>
 #include <tuple>
@@ -126,7 +125,7 @@ TensorBatch Flow::forward(const TensorBatch &feature_sources, TensorInputs input
         condition.mel_rows = TensorView(mel_rows.data(), int(mel_rows.size()), 1, Type::I32);
         if (!retained_features.empty())
             condition.retained_feature_rows = TensorView(retained_features.data(), int(retained_features.size()), 1, Type::I64);
-        ops::upload_bytes(prefix_tensor, prefixes.data(), prefixes.size() * sizeof(int));
+        prefix_tensor.copy_({prefixes.data(), prefix_tensor.rows, prefix_tensor.cols, Type::I32}, true);
         const auto parameters = sampling(steps, guidance);
         auto conditioned = estimator_.forward(condition, invocation, parameters.guidance > 1.e-5f);
         {

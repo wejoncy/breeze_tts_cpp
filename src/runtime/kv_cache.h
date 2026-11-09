@@ -14,6 +14,10 @@ class PagedKVCache {
     Type type_;
     size_t layer_bytes_, page_bytes_;
     Buffer key_table_, value_table_;
+    // Scheduler may append entries after Runner's current completion event.
+    // Immutable pinned entries must outlive those uploads independently of
+    // Runner's per-stage snapshot arena. Allocated only during construction.
+    Buffer host_tables_;
     std::vector<Buffer> chunks_;
     std::vector<void *> keys_, values_;
     std::vector<int> free_;
@@ -34,7 +38,7 @@ class PagedKVCache {
           layer_bytes_(size_t(page_tokens) * width * bytes(type)),
           page_bytes_(size_t(layers) * layer_bytes_),
           key_table_(size_t(lanes) * max_blocks_ * sizeof(void *)),
-          value_table_(key_table_.size()) {
+          value_table_(key_table_.size()), host_tables_(2 * key_table_.size(), memory.host_allocator()) {
         keys_.reserve(size_t(lanes) * max_blocks_);
         values_.reserve(keys_.capacity());
         free_.reserve(keys_.capacity());
@@ -102,12 +106,14 @@ class PagedKVCache {
             values_.push_back(base + (size_t(i) * 2 + 1) * page_bytes_);
             free_.push_back(old + i);
         }
-        memory_.upload(key_table_.ptr<void *>() + old, keys_.data() + old,
-                       added * sizeof(void *));
-        memory_.upload(value_table_.ptr<void *>() + old, values_.data() + old,
-                       added * sizeof(void *));
-        // The host tables reserve their full capacity at construction. Appended
-        // entries remain immutable and live until the pool is destroyed.
+        auto *key_source = host_tables_.ptr<void *>();
+        auto *value_source = key_source + key_table_.size() / sizeof(void *);
+        std::copy(keys_.begin() + old, keys_.end(), key_source + old);
+        std::copy(values_.begin() + old, values_.end(), value_source + old);
+        key_table_.view(1, added, Type::I64, size_t(old) * sizeof(void *))
+            .copy_({key_source + old, 1, added, Type::I64}, memory_.has_transfer_backing());
+        value_table_.view(1, added, Type::I64, size_t(old) * sizeof(void *))
+            .copy_({value_source + old, 1, added, Type::I64}, memory_.has_transfer_backing());
     }
     KVCacheView view(const int *table = nullptr) const {
         CacheLayout layout{table, max_blocks_, page_size_};
@@ -226,11 +232,11 @@ class PagedKVCache {
                 }
                 counts_[lane] = std::max(counts_[lane], needed);
             }
-            pool_.memory_.upload(table_, mapping_.data(), mapping_.size() * sizeof(int));
+            TensorView(table_, int(mapping_.size()), 1, Type::I32, 0, pool_.memory_.device)
+                .copy_({mapping_.data(), int(mapping_.size()), 1, Type::I32},
+                       pool_.memory_.has_transfer_backing());
             // Runtime uploads own a pinned snapshot; page IDs and table storage
             // are reused in stream order without a host completion barrier.
-            if (!pool_.memory_.has_transfer_backing())
-                pool_.memory_.sync();
         }
 
       private:

@@ -9,6 +9,8 @@
 namespace tts {
 class Acoustic {
     Tensor projected_codebook_;
+    TensorView codebook_;
+    std::unique_ptr<Linear> codebook_projection_;
     TensorView phones_;
     RelativeEncoder ssl_encoder_, text_encoder_, output_encoder_;
     Linear content_, text_, query_, key_value_, attention_out_, content_out_, bridge_;
@@ -33,6 +35,7 @@ class Acoustic {
     };
   public:
     Acoustic(Weights &, const std::string &prefix, const Json &);
+    void prepare_weights() const;
     Output forward(TensorView codes, TensorView phones, TensorView style, ForwardContext &) const;
     TensorBatch forward(TensorInputs, ForwardContext &) const;
     int feature_frames(int codes, double speed = 1.) const {

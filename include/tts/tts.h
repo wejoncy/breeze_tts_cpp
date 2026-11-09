@@ -92,7 +92,7 @@ tts_options tts_default_options(void);
 tts_engine *tts_create(const char *model_dir, int32_t device, int32_t max_batch, int32_t context,
                        const char *quantization, char *error, size_t error_capacity);
 /* Creation only loads resources. Start explicitly before execution/control calls.
-   Repeated starts while running succeed; shutdown is terminal and joins both threads. */
+   Repeated starts while running succeed; shutdown is terminal and joins the engine thread. */
 int tts_run_async(tts_engine *, char *error, size_t error_capacity);
 int tts_shutdown(tts_engine *, char *error, size_t error_capacity);
 void tts_destroy(tts_engine *);
@@ -102,7 +102,7 @@ typedef struct {
 int tts_get_audio_format(const tts_engine *, tts_audio_format *, char *error,
                          size_t error_capacity);
 /* Engine-owned pool bytes. Driver/library-private allocations are not included.
-   Synchronizes pending work; call between requests, never from an audio callback. */
+   Read at an Engine batch boundary; never call from an audio callback. */
 typedef struct {
     uint64_t used_bytes, reserved_bytes, peak_used_bytes, peak_reserved_bytes;
 } tts_memory_stats;

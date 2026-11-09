@@ -8,6 +8,8 @@
 #include <iostream>
 #include <filesystem>
 #include <limits>
+#include <variant>
+#include <type_traits>
 
 int run_cli(int argc, const char *const *argv) {
     try {
@@ -23,9 +25,14 @@ int run_cli(int argc, const char *const *argv) {
         size_t memory_limit_mb = 0;
         bool tokenize = false;
         using Options = tts::GenerationOptions;
-        std::vector<std::function<void(Options &)>> overrides;
+        using Override = std::variant<std::pair<int Options::*, int>,
+            std::pair<float Options::*, float>, std::pair<bool Options::*, bool>,
+            std::pair<uint64_t Options::*, uint64_t>, std::pair<double Options::*, double>,
+            std::pair<tts::SynthesisMode Options::*, tts::SynthesisMode>>;
+        std::vector<Override> overrides;
         auto set = [&](auto field, auto v) {
-            overrides.emplace_back([=](Options &options) { options.*field = v; });
+            using Value = std::decay_t<decltype(std::declval<Options>().*field)>;
+            overrides.emplace_back(std::pair<Value Options::*, Value>{field, static_cast<Value>(v)});
         };
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];
@@ -209,8 +216,8 @@ int run_cli(int argc, const char *const *argv) {
                            tts::quantization_from_string(quantization),
                            runtime_memory_mb * (1 << 20), memory_limit_mb * (1 << 20));
         auto opts = engine.default_options();
-        for (auto &apply : overrides)
-            apply(opts);
+        for (const auto &value : overrides)
+            std::visit([&](const auto &field) { opts.*field.first = field.second; }, value);
         engine.run_async();
         const auto format = engine.audio_format();
         if (!encodefile.empty()) {

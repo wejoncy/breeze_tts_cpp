@@ -1,5 +1,6 @@
 #pragma once
-#include "execution/request_planner.h"
+#include "execution/input_plan.h"
+#include "execution/batch.h"
 #include "execution/runner_resources.h"
 #include "core/model.h"
 #include "tts/model_info.h"
@@ -7,66 +8,69 @@
 #include <chrono>
 
 namespace tts {
-// The executor exclusively owns this interface and every admission/state created
-// through it. Model weights and init-time workspaces outlive those states.
+// Device execution and live request storage. Engine drives it through data
+// records; it knows no scheduler, client queue or output callback.
 class ModelRunner {
+    struct Cache;
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    ForwardOutputs prefill_forward(const std::vector<Cache *> &);
+    ForwardOutputs decode_forward();
+    ForwardOutputs frame_outputs() const;
+    void commit_frame(const SampledOutputs &);
+    ForwardOutputs audio_forward();
+    ForwardOutputs preparation_forward();
+    ForwardOutputs decode_codes_forward();
+    void commit_audio(const SampledOutputs &);
+    void commit_preparation(const SampledOutputs &);
+    void finish_step();
+    std::shared_ptr<Cache> prepare(RequestPlan &, const ExecutionRow &);
 
   public:
-    ModelRunner(const Model &, RunnerResources &, RequestPlanner &, const ModelInfo &,
+    ModelRunner(const Model &, RunnerResources &, const InputDefinition &, const ModelInfo &,
                  size_t runtime_memory_bytes);
-    // Reserves a request's capacity across all input waves. Destroy states before
-    // releasing this admission, including on cancellation and executor failure.
-    using RequestAdmission = RequestAdmissionPool::Lease;
-    // Executor-owned progress and leases common to all networks. Tensor storage
-    // stays in RunnerResources; a plan can add CPU preparation data.
-    class RequestState {
-      public:
-        std::unique_ptr<RequestAdmission::RowLease> row_credit;
-        std::unique_ptr<RequestSlots::Lease> slot;
-        StatePool::Row &data;
-        GenerationOptions options;
-        std::unique_ptr<PagedKVCache::Lease> cache;
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-        Stats metrics;
-        std::exception_ptr failure;
-        bool finished = false, is_prefilled = false;
-        RequestState(RunnerResources &resources, std::unique_ptr<RequestAdmission::RowLease> credit,
-                     std::unique_ptr<RequestSlots::Lease> reservation, GenerationOptions parameters)
-            : row_credit(std::move(credit)), slot(std::move(reservation)),
-              data(*resources.states.rows().at(slot->index)), options(std::move(parameters)) {}
-        virtual ~RequestState() = default;
-        bool done() const { return finished; }
-        bool prefilled() const { return is_prefilled; }
-        Stats stats() const { return metrics; }
-        std::exception_ptr error() const { return failure; }
-    };
     ~ModelRunner();
     struct CacheUsage {
         size_t page_bytes, device_bytes, state_kv_bytes_per_row;
         int used_pages, backed_pages, state_rows;
     };
-    // Executor-owned counters only: no CUDA query, synchronization or allocation.
-    CacheUsage cache_usage() const;
-    // Init-time host staging bound for all audio callbacks of one input in one
-    // step(), including any pending tail and inter-segment silence.
+    // Initialization bounds for readbacks and per-row audio delivery.
     size_t max_step_samples() const;
-    void prepare_tasks(std::vector<PreparedTask> &);
-    // Empty means temporarily unavailable; retry after a release checkpoint.
-    // Invalid requests and requests that cannot fit alone throw a terminal error.
-    std::unique_ptr<RequestAdmission> admit(RequestPlan &);
-    // Empty means this admitted request has no free row credit. The input must
-    // remain untouched; retry this row after a resource-release checkpoint.
-    std::unique_ptr<RequestState> prepare(RequestPlan &, size_t input, RequestAdmission &);
-    // Advance model-defined preparation checkpoints. A model may pack fewer rows
-    // than offered to respect admitted workspace; it must make forward progress.
-    size_t prefill_step(const std::vector<RequestState *> &);
-    // Advance each ready input by a model-defined execution quantum. Callback i
-    // receives that input's audio, if produced; state records completion/errors.
-    void step(const std::vector<RequestState *> &, const std::vector<AudioCallback> &);
-    std::shared_ptr<const Reference> prepare_reference(ReferencePlan &);
-    std::vector<int> encode_audio(const std::vector<float> &);
-    std::vector<float> decode_codes(const std::vector<int> &);
+    size_t max_readback_bytes() const;
+    void set_engine_id(uint64_t);
+    // Enqueue one successor while the current frame batch is still in flight.
+    // EOS is collected afterwards; an extra frame for an ended row is discarded.
+    // Engine retains the batch and passes it to forward() after collecting this one.
+    bool submit_next(const ExecutionBatch &);
+    bool can_submit_next() const;
+    bool has_submitted() const;
+    ForwardOutputs forward(ExecutionBatch);
+    ForwardOutputs forward(PreparationBatch);
+    ForwardOutputs forward_reference(const ReferencePlan &);
+    ForwardOutputs forward_encode(const std::vector<float> &);
+    // Cache survives between single-frame decode calls; transient workspaces do not.
+    struct AudioDecodeCache;
+    std::shared_ptr<AudioDecodeCache> prepare_codes(const std::vector<int> &);
+    ForwardOutputs forward_codes(std::shared_ptr<AudioDecodeCache>);
+    ForwardOutputs forward();
+    void commit(const SampledOutputs &);
+    bool finished() const;
+    bool has_batch() const;
+    bool preparing() const;
+    bool has_control() const;
+    Completion collect();
+    PreparationBatch collect_preparation();
+    HostResults collect_evaluation();
+    // Empty until the last frame; relinquishes this quantum on every call.
+    std::vector<float> collect_codes();
+    // Engine has drained the stream after a failed control preparation. Preserve
+    // resident generation states while dropping only the failed CPU/GPU task.
+    void discard_control() noexcept;
+    void abort();
+    // CPU metadata only: Engine passes these requirements to Scheduler.
+    ResourceRequirements requirements(const RequestPlan &) const;
+    // Only drops request records after every execution row has been destroyed.
+    bool release_if_idle(uint64_t request);
+
 };
 } // namespace tts

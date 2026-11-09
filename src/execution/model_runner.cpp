@@ -14,6 +14,8 @@
 #include <cmath>
 #include <numeric>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace tts {
 namespace {
@@ -27,47 +29,203 @@ std::vector<NamedTensor> output_views(const std::vector<std::string> &names) {
     return result;
 }
 std::vector<NamedTensor> output_views(const std::vector<std::string> &&) = delete;
+// Fixed Tensor storage and views keep graph addresses stable. Each program
+// uploads one CPU snapshot; reuse is handled by the Tensor transfer backend.
+struct PackedMetadata {
+    Buffer device, host;
+    explicit PackedMetadata(std::initializer_list<size_t> fields) {
+        size_t bytes = 0;
+        for (size_t field : fields) bytes += Tensor::aligned(field);
+        device = Buffer(bytes);
+        host = Buffer(bytes, Device::cpu());
+    }
+    TensorView take(size_t &offset, int rows, int columns, Type type) const {
+        auto result = device.view(rows, columns, type, offset);
+        offset += Tensor::aligned(result.size());
+        return result;
+    }
+    template <class Value> Value *values(TensorView field) const {
+        const auto offset = reinterpret_cast<uintptr_t>(field.data) - reinterpret_cast<uintptr_t>(device.data());
+        return reinterpret_cast<Value *>(host.ptr<char>() + offset);
+    }
+    void upload() const {
+        device.view(1, int(device.size()), Type::I8).copy_(host.view(1, int(host.size()), Type::I8), true);
+    }
+};
 } // namespace
+struct ModelRunner::Cache {
+    std::shared_ptr<PagedKVCache::Reservation> capacity;
+    std::shared_ptr<RequestSlots::Lease> slot;
+    StatePool::Row &data;
+    GenerationOptions options;
+    std::unique_ptr<PagedKVCache::Lease> kv;
+    Clock::time_point prefill_start = Clock::now();
+    double prefill_ms = 0;
+    int emitted_frames = 0;
+    bool truncated = false;
+    bool finished = false, is_prefilled = false;
+    GenerationInput input;
+    size_t segment = 0;
+    int generated = 0, rendered = 0, audio_rendered = 0, windows = 0, segment_start_frames = 0;
+    bool semantic_done = false;
+    WindowSchedule schedule;
+    std::vector<int16_t> pending;
+    Cache(RunnerResources &resources, std::shared_ptr<PagedKVCache::Reservation> capacity,
+          std::shared_ptr<RequestSlots::Lease> slot, GenerationInput value, GenerationOptions options)
+        : capacity(std::move(capacity)), slot(std::move(slot)),
+          data(*resources.states.rows().at(this->slot->index)), options(std::move(options)), input(std::move(value)) {}
+    GenerationSegment &current() { return input.segments.at(segment); }
+    const GenerationSegment &current() const { return input.segments.at(segment); }
+};
+struct ModelRunner::AudioDecodeCache {
+    std::vector<int> codes;
+    std::vector<float> audio;
+    size_t frame = 0, workspace_bytes = 0;
+    // Arena outlives all Tensor storage borrowed from it.
+    std::unique_ptr<DeviceArena> arena;
+    std::unique_ptr<SequenceState> history;
+    Buffer token, pointer, cache, histories;
+};
 struct ModelRunner::Impl {
+    using Cache = ModelRunner::Cache;
     const Model &network;
     RunnerResources &runtime;
-    RequestPlanner &planner;
     const ModelInfo &info;
-    const InputDefinition &definition;
+    const InputDefinition definition;
     std::vector<ProgramSpec> programs;
     std::vector<Buffer> input_storage;
     std::unique_ptr<FlashDecodePlan> decode_plan;
     const int capacity, lane_capacity;
-    Buffer samples, previous_codes, code_rows, owners, caches, audio_caches, histories;
-    Buffer done, counts, positions, pcm;
+    const size_t history_bytes, pcm_bytes;
+    PackedMetadata token_metadata, audio_metadata;
+    TensorView samples, previous_codes, code_rows, owners, caches, counts, positions;
+    TensorView audio_code_rows, audio_caches, histories;
+    Buffer done, waveform_pcm;
     TensorView audio_output;
+    std::vector<TensorView> audio_graph_outputs;
     int audio_stride = 0;
     size_t input_workspace = 0;
     size_t device_total_bytes = 0;
     size_t state_kv_bytes_per_row = 0;
-    std::vector<int> host_done;
     std::vector<int> host_layout;
     std::vector<int16_t> host_audio;
-    struct State final : RequestState {
-        Impl &owner;
-        GenerationInput input;
-        size_t segment = 0;
-        int generated = 0, rendered = 0, audio_rendered = 0, windows = 0, segment_start_frames = 0;
-        bool semantic_done = false;
-        WindowSchedule schedule;
-        std::vector<int16_t> pending;
-        State(Impl &implementation, std::unique_ptr<RequestAdmission::RowLease> credit,
-              std::unique_ptr<RequestSlots::Lease> slot, GenerationInput value, GenerationOptions options)
-            : RequestState(implementation.runtime, std::move(credit), std::move(slot), std::move(options)),
-              owner(implementation), input(std::move(value)) {}
-        GenerationSegment &current() { return input.segments.at(segment); }
-        const GenerationSegment &current() const { return input.segments.at(segment); }
+    struct RequestRecord {
+        std::unique_ptr<RequestPlan> plan;
+        size_t cache_pages = 0, cache_rows = 0, peak_cache_bytes = 0;
+        bool cache_reported = false;
     };
-    int available(const State &state) const {
+    struct LiveCache { uint64_t request; std::shared_ptr<Cache> value; };
+    // All execution state belongs to the runner. Scheduler sees IDs and records.
+    std::unordered_map<uint64_t, RequestRecord> requests;
+    std::unordered_map<uint64_t, LiveCache> states;
+    ExecutionBatch scheduled;
+    Completion completion;
+    PreparationBatch preparation_batch;
+    size_t preparation_first = 0, preparation_end = 0;
+    std::vector<Cache *> prefill_rows;
+    std::vector<std::vector<int16_t> *> audio_sinks;
+    std::vector<Cache *> input_rows, step_rows, decode_rows;
+    std::vector<size_t> audio_members;
+    ProgramSpec audio_execution;
+    size_t audio_total = 0, readback_bytes = 0;
+    std::unique_ptr<DeviceArena> input_arena;
+    Clock::time_point next_cache_log{};
+    struct FrameRow {
+        uint64_t id;
+        std::shared_ptr<Cache> cache;
+        bool decoded;
+    };
+    struct Frame {
+        std::vector<FrameRow> rows;
+        int slot = -1;
+    } frame, submitted_frame;
+    std::array<Buffer, 2> frame_storage;
+    uint64_t engine_id = 0;
+    ProgramSpec evaluation;
+    HostResults evaluation_result;
+    std::shared_ptr<AudioDecodeCache> audio_decode;
+    void clear_control() noexcept {
+        audio_decode.reset();
+        evaluation_result.clear();
+        evaluation = {};
+    }
+    bool has_work() const {
+        return completion.executed || !preparation_batch.tasks.empty() || !evaluation.name.empty() || bool(audio_decode);
+    }
+    enum class Phase { Prefill, Decode, Audio, Frame, Preparation, Evaluation, Codes, Finish, Idle };
+    Phase phase = Phase::Idle;
+    void log_cache_usage(bool changed) {
+        if (!log::enabled(TTS_LOG_INFO))
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const bool periodic = now >= next_cache_log;
+        if (!periodic && !changed)
+            return;
+        const auto usage = CacheUsage{runtime.kv.storage_page_bytes(), device_total_bytes,
+            state_kv_bytes_per_row, runtime.kv.capacity() - runtime.kv.available(),
+            runtime.kv.capacity(), capacity};
+        constexpr double mib = 1024.0 * 1024.0;
+        const auto percent = [](size_t used, size_t total) {
+            return total ? 100.0 * double(used) / double(total) : 0.0;
+        };
+        for (auto &entry : requests) {
+            entry.second.cache_pages = 0;
+            entry.second.cache_rows = 0;
+        }
+        for (const auto &entry : states) {
+            auto &request = requests.at(entry.second.request);
+            ++request.cache_rows;
+            if (const auto &cache = entry.second.value->kv)
+                request.cache_pages += cache->pages().size();
+        }
+        bool admitted = false;
+        for (auto &entry : requests) {
+            auto &request = entry.second;
+            const size_t used = request.cache_pages * usage.page_bytes +
+                request.cache_rows * usage.state_kv_bytes_per_row;
+            request.peak_cache_bytes = std::max(request.peak_cache_bytes, used);
+            const bool first = !request.cache_reported;
+            admitted |= first;
+            if ((first || periodic) && log::enabled(TTS_LOG_DEBUG)) {
+                log::Scope scope(engine_id, entry.first);
+                TTS_LOG(TTS_LOG_DEBUG, "request.kv",
+                        "{} used={:.0f} MiB paged_pages={} observed_peak={:.0f} MiB device_used={:.2f}%",
+                        first ? "admitted" : "active", used / mib, request.cache_pages,
+                        request.peak_cache_bytes / mib,
+                        percent(used, usage.device_bytes));
+            }
+            request.cache_reported = true;
+        }
+        if (periodic || admitted || changed) {
+            const size_t used = size_t(usage.used_pages) * usage.page_bytes +
+                states.size() * usage.state_kv_bytes_per_row;
+            const size_t paged_backed = size_t(usage.backed_pages) * usage.page_bytes;
+            const size_t backed = paged_backed + size_t(usage.state_rows) * usage.state_kv_bytes_per_row;
+            TTS_LOG(TTS_LOG_INFO, "engine.kv", "KV cache usage={:.1f}%", percent(used, backed));
+            next_cache_log = now + std::chrono::seconds(1);
+        }
+    }
+    void release_request(uint64_t id) {
+        const auto found = requests.find(id);
+        if (found == requests.end())
+            return;
+        log::Scope scope(engine_id, id);
+        TTS_LOG(TTS_LOG_DEBUG, "request.kv", "released observed_peak={:.0f} MiB",
+                found->second.peak_cache_bytes / (1024.0 * 1024.0));
+        requests.erase(found);
+    }
+    void clear_requests() {
+        const bool changed = !states.empty() || !requests.empty();
+        states.clear();
+        requests.clear();
+        if (changed)
+            log_cache_usage(true);
+    }
+    int available(const Cache &state) const {
         return std::min(state.options.max_frames - state.segment_start_frames,
             state.input.rate.frames(state.generated, state.options.speed_factor));
     }
-    int ready(const State &state) const {
+    int ready(const Cache &state) const {
         const double now = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
         const auto &windows = state.input.windows;
         const int accepted = windows.ready(available(state), state.rendered, state.semantic_done, state.schedule, now);
@@ -79,21 +237,21 @@ struct ModelRunner::Impl {
         }
         return accepted;
     }
-    bool audio_pending(const State &state) const {
+    bool audio_pending(const Cache &state) const {
         return state.input.windows.mode == SynthesisMode::Offline && state.semantic_done &&
             state.rendered == available(state) && state.audio_rendered < state.rendered;
     }
-    void emit(State &state, const AudioCallback &callback, const int16_t *audio, size_t count) const {
+    void append_pcm(Cache &state, std::vector<int16_t> &output, const int16_t *audio, size_t count) const {
         if (!count || state.finished) return;
         const int frame_samples = info.audio.samples_per_frame;
-        if (count % frame_samples || count / frame_samples > size_t(state.options.max_frames - state.metrics.frames))
+        if (count % frame_samples || count / frame_samples > size_t(state.options.max_frames - state.emitted_frames))
             throw std::logic_error("audio delivery exceeds the admitted frame limit");
-        if (!state.metrics.frames) state.metrics.first_audio_ms = milliseconds(state.start);
-        if (!callback(0, audio, count)) state.finished = true;
-        state.metrics.frames += int(count / frame_samples);
-        state.metrics.audio_seconds += double(count) / info.audio.sample_rate;
+        if (count > output.capacity() - output.size())
+            throw std::logic_error("audio step exceeds initialized output capacity");
+        output.insert(output.end(), audio, audio + count);
+        state.emitted_frames += int(count / frame_samples);
     }
-    ProgramSpec audio_description(const std::vector<State *> &rows) const {
+    ProgramSpec audio_description(const std::vector<Cache *> &rows) const {
         auto result = program(definition.audio_program, ForwardMode::Prefill);
         auto &input = result.input;
         if (!rows.front()->current().audio.bindings.empty() || !rows.front()->current().audio.uploads.empty()) {
@@ -119,17 +277,17 @@ struct ModelRunner::Impl {
             for (size_t row = 0; row < rows.size(); ++row) values[row] = extract(*rows[row]);
             input.bindings.push_back({name, tensor});
         };
-        append("generated", [](const State &state) { return state.generated; });
-        append("rendered", [](const State &state) { return state.rendered; });
-        append("audio_rendered", [](const State &state) { return state.audio_rendered; });
-        append("available_frames", [&](const State &state) { return available(state); });
-        append("frames", [&](const State &state) { return ready(state); });
-        append("history_frames", [](const State &state) { return std::min(state.rendered, state.input.windows.left); });
-        append("future_frames", [&](const State &state) {
+        append("generated", [](const Cache &state) { return state.generated; });
+        append("rendered", [](const Cache &state) { return state.rendered; });
+        append("audio_rendered", [](const Cache &state) { return state.audio_rendered; });
+        append("available_frames", [&](const Cache &state) { return available(state); });
+        append("frames", [&](const Cache &state) { return ready(state); });
+        append("history_frames", [](const Cache &state) { return std::min(state.rendered, state.input.windows.left); });
+        append("future_frames", [&](const Cache &state) {
             return std::min(state.input.windows.lookahead(state.rendered), available(state) - state.rendered - ready(state));
         });
-        append("seed", [](const State &state) { return state.options.seed; });
-        append("windows", [](const State &state) { return uint64_t(state.windows); });
+        append("seed", [](const Cache &state) { return state.options.seed; });
+        append("windows", [](const Cache &state) { return uint64_t(state.windows); });
         return result;
     }
     struct StateBindings {
@@ -137,8 +295,8 @@ struct ModelRunner::Impl {
         std::vector<NamedValue<ArrayView<const TensorView>>> fields;
         void bind(ForwardContext &context) const { context.state = {fields.data(), fields.size()}; }
     };
-    std::vector<State *> active_audio;
-    StateBindings state_bindings(const std::vector<State *> &rows, int padded) const {
+    std::vector<Cache *> active_audio;
+    StateBindings state_bindings(const std::vector<Cache *> &rows, int padded) const {
         StateBindings result;
         const auto &prototype = runtime.states.rows().front()->fields();
         result.values.reserve(prototype.size());
@@ -161,14 +319,14 @@ struct ModelRunner::Impl {
             if (candidate.name == name && candidate.mode == mode) return candidate;
         throw std::invalid_argument("input definition has no matching forward program");
     }
-    std::array<NamedTensor, 8> bindings(int rows, int lanes) const {
-        return {{{"sampling", samples.view(rows, sizeof(SamplingRow), Type::I8)},
-                 {"previous_codes", previous_codes.view(rows, 1, Type::I64)},
-                 {"code_rows", code_rows.view(rows, 1, Type::I64)},
-                 {"owner_rows", owners.view(lanes, 1, Type::I32)},
+    std::array<NamedTensor, 8> bindings(int rows, int lanes, bool audio = false) const {
+        return {{{"sampling", samples.slice(0, rows)},
+                 {"previous_codes", previous_codes.slice(0, rows)},
+                 {"code_rows", (audio ? audio_code_rows : code_rows).slice(0, rows)},
+                 {"owner_rows", owners.slice(0, lanes)},
                  {"done", done.view(rows, 1, Type::I32)},
-                 {"audio_positions", positions.view(rows, 1, Type::I32)},
-                 {"histories", histories.view(1, int(histories.size()), Type::I8)},
+                 {"audio_positions", positions.slice(0, rows)},
+                 {"histories", histories},
                  {"destination", TensorView{}}}};
     }
     void prepare_forward(const ProgramSpec &description, ForwardContext::Mode mode) {
@@ -181,10 +339,14 @@ struct ModelRunner::Impl {
         context.batch.cache.layout.sequences = caches.ptr<CacheSequence>();
         auto state = state_bindings({}, capacity);
         state.bind(context);
-        auto arguments = bindings(capacity, lane_capacity);
+        auto arguments = bindings(capacity, lane_capacity, description.name == definition.audio_program);
         auto outputs = output_views(description.outputs);
         run_forward(network, description.name, description.input,
             {arguments.data(), arguments.size()}, {outputs.data(), outputs.size()}, context);
+        size_t total = 0;
+        for (const auto &field : outputs) if (field.value.device >= 0)
+            total += Tensor::aligned(field.value.size());
+        readback_bytes = std::max(readback_bytes, total);
     }
     size_t workspace(const ProgramSpec &description, ForwardContext::Mode mode) {
         return Tensor::plan([&] { prepare_forward(description, mode); });
@@ -211,22 +373,6 @@ struct ModelRunner::Impl {
             size_t count = 1;
             while (count < sources.size && fits(count)) ++count;
             if (!result.count) throw RequestOverloaded("forward input exceeds initialized runtime workspace");
-        }
-        return result;
-    }
-    HostResults evaluate(const ProgramSpec &description, size_t workspace_bytes) {
-        DeviceArena storage(runtime.memory, workspace_bytes);
-        Tensor::Scope scope(storage);
-        const auto &input = description.input;
-        ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
-        auto outputs = output_views(description.outputs);
-        run_forward(network, description.name, input, {}, {outputs.data(), outputs.size()},
-                    context);
-        HostResults result;
-        for (const auto &field : outputs) {
-            auto tensor = Tensor::empty({field.value.rows, field.value.cols}, field.value.type);
-            runtime.memory.download(tensor.data_ptr(), field.value.data, field.value.size());
-            result.emplace(field.name, std::move(tensor));
         }
         return result;
     }
@@ -259,9 +405,12 @@ struct ModelRunner::Impl {
         context.batch.cache = runtime.kv.view();
         context.batch.cache.layout.sequences = description.history.empty()
             ? caches.ptr<CacheSequence>() : audio_caches.ptr<CacheSequence>();
-        auto state = state_bindings(active_audio, rows);
+        // Token decode can be submitted while the previous audio readback still
+        // owns active_audio. Token programs use their normal slot bindings.
+        const std::vector<Cache *> no_audio;
+        auto state = state_bindings(description.name == definition.main_program ? no_audio : active_audio, rows);
         state.bind(context);
-        auto arguments = bindings(rows, lanes);
+        auto arguments = bindings(rows, lanes, description.name == definition.audio_program);
         auto outputs = output_views(description.outputs);
         for (auto &field : outputs)
             if (field.name == "audio_layout") {
@@ -278,29 +427,50 @@ struct ModelRunner::Impl {
         } else if (description.name == definition.audio_program) {
             auto selected = std::find_if(outputs.begin(), outputs.end(),
                 [](const auto &field) { return field.name == "pcm" && field.value.numel(); });
-            if (selected != outputs.end()) audio_output = selected->value;
+            if (selected != outputs.end()) {
+                // This view borrows the graph workspace. launch_frame copies
+                // it directly into the batch result slot on the same stream,
+                // before the next token program can reuse that workspace.
+                audio_output = selected->value;
+                if (audio_output.size() > pcm_bytes) throw std::logic_error("audio output exceeds storage");
+            }
             else {
                 auto waveform = result["waveform"];
-                if (waveform.numel()) tts::pcm(waveform, pcm.ptr<int16_t>());
-                audio_output = pcm.view(waveform.rows, waveform.cols, Type::I16);
+                if (waveform.size() && waveform.numel() * sizeof(int16_t) > waveform_pcm.size())
+                    throw std::logic_error("waveform output exceeds PCM storage");
+                if (waveform.numel()) tts::pcm(waveform, waveform_pcm.ptr<int16_t>());
+                audio_output = waveform_pcm.view(waveform.rows, waveform.cols, Type::I16);
             }
             audio_stride = int(audio_output.numel() / rows);
+            if (description.replay == ProgramSpec::Replay::Batch)
+                audio_graph_outputs.at(rows) = audio_output;
         }
     }
-    void map(const std::vector<State *> &rows, int padded_rows, int padded_lanes) {
-        std::vector<SamplingRow> sampling(padded_rows);
-        std::vector<const int *> previous(padded_rows), codes(padded_rows);
-        std::vector<CacheSequence> sequences(padded_lanes);
-        std::vector<int> membership(padded_lanes, -1), generated(padded_rows), relative(padded_rows);
+    void map(const std::vector<Cache *> &rows, const std::vector<int> *cursors = nullptr) {
+        auto *sampling = token_metadata.values<SamplingRow>(samples);
+        auto *previous = token_metadata.values<const int *>(previous_codes);
+        auto *codes = token_metadata.values<const int *>(code_rows);
+        auto *sequences = token_metadata.values<CacheSequence>(caches);
+        auto *membership = token_metadata.values<int>(owners);
+        auto *generated = token_metadata.values<int>(counts);
+        auto *relative = token_metadata.values<int>(positions);
+        std::fill_n(sampling, capacity, SamplingRow{});
+        std::fill_n(previous, capacity, nullptr);
+        std::fill_n(codes, capacity, nullptr);
+        std::fill_n(sequences, lane_capacity, CacheSequence{});
+        std::fill_n(membership, lane_capacity, -1);
+        std::fill_n(generated, capacity, 0);
+        std::fill_n(relative, capacity, 0);
         int lane_index = 0;
         for (size_t row = 0; row < rows.size(); ++row) {
             auto &state = *rows[row];
+            const int cursor = cursors ? cursors->at(row) : state.generated;
             auto &data = state.data;
             const size_t token_bytes = size_t(definition.codebooks) * sizeof(int);
             const bool history = data["codes"].size() > token_bytes;
             auto *tokens = data["codes"].ptr<int>();
-            previous[row] = tokens + size_t(history ? std::max(0, state.generated - 1) : 0) * definition.codebooks;
-            codes[row] = tokens + size_t(history ? state.generated : 0) * definition.codebooks;
+            previous[row] = tokens + size_t(history ? std::max(0, cursor - 1) : 0) * definition.codebooks;
+            codes[row] = tokens + size_t(history ? cursor : 0) * definition.codebooks;
             auto &sample = sampling[row];
             sample.codes = const_cast<int *>(codes[row]);
             sample.done = data["done"].ptr<int>();
@@ -318,9 +488,9 @@ struct ModelRunner::Impl {
             sample.generated = counts.ptr<int>() + row;
             sample.eos_min_tokens = definition.min_tokens;
             sample.eos_on_argmax = definition.eos_on_argmax;
-            generated[row] = state.generated;
-            relative[row] = state.current().position_offset + std::max(0, state.generated - 1);
-            auto cache = state.cache->view();
+            generated[row] = cursor;
+            relative[row] = state.current().position_offset + std::max(0, cursor - 1);
+            auto cache = state.kv->view();
             for (int branch = 0; branch < sample.branches; ++branch) {
                 sample.logits[branch] = lane_index;
                 membership[lane_index] = int(row);
@@ -330,43 +500,163 @@ struct ModelRunner::Impl {
                     data["positions"].ptr<int>() + branch};
             }
         }
-        runtime.memory.upload(samples.data(), sampling.data(), sampling.size() * sizeof(SamplingRow));
-        runtime.memory.upload(previous_codes.data(), previous.data(), previous.size() * sizeof(int *));
-        runtime.memory.upload(code_rows.data(), codes.data(), codes.size() * sizeof(int *));
-        runtime.memory.upload(owners.data(), membership.data(), membership.size() * sizeof(int));
-        runtime.memory.upload(caches.data(), sequences.data(), sequences.size() * sizeof(CacheSequence));
-        runtime.memory.upload(counts.data(), generated.data(), generated.size() * sizeof(int));
-        runtime.memory.upload(positions.data(), relative.data(), relative.size() * sizeof(int));
+        token_metadata.upload();
     }
-    void sampled(const std::vector<State *> &rows) {
-        runtime.memory.download(host_done.data(), done.data(), rows.size() * sizeof(int));
+    void sampled(const std::vector<Cache *> &rows, TensorView values) {
+        if (values.type != Type::I32 || values.numel() != rows.size())
+            throw std::logic_error("sample completion does not match the forward rows");
         for (size_t row = 0; row < rows.size(); ++row) {
             auto &state = *rows[row];
-            if (host_done[row]) state.semantic_done = true;
+            if (values.ptr<int>()[row]) state.semantic_done = true;
             else if (++state.generated == state.current().max_tokens) {
                 state.semantic_done = true;
-                state.metrics.truncated = 1;
+                state.truncated = true;
             }
         }
     }
-    void start_segment(State &state) {
+    void launch_decode(const std::vector<Cache *> &decode, const std::vector<int> *cursors = nullptr) {
+        int lanes = 0, key_length = 0;
+        bool enabled = true;
+        for (size_t row = 0; row < decode.size(); ++row) {
+            auto *state = decode[row];
+            const int cursor = cursors ? cursors->at(row) : state->generated;
+            auto lengths = state->current().lengths;
+            for (auto &length : lengths) length += cursor;
+            state->kv->ensure(lengths);
+            lanes += int(state->current().lengths.size());
+            for (int length : state->current().lengths)
+                key_length = std::max(key_length, length + cursor);
+            enabled &= state->options.use_cuda_graph;
+        }
+        auto shape = runtime.shapes.select(int(decode.size()), lanes, definition.max_branches);
+        if (!shape.first) shape = {int(decode.size()), lanes};
+        map(decode, cursors);
+        const int partitions = decode_plan
+            ? decode_plan->select(shape.second, definition.query_heads, key_length) : 1;
+        const auto &description = program(definition.main_program, ForwardMode::Decode);
+        runtime.execution.graphs().run(description.name.c_str(), {shape.first, shape.second, partitions}, enabled,
+            [&] { invoke(description, shape.first, shape.second, partitions); });
+    }
+    void launch_audio(const std::vector<Cache *> &audio, const ProgramSpec &description) {
+        int padded = description.replay == ProgramSpec::Replay::None ? int(audio.size())
+            : runtime.shapes.select(int(audio.size()));
+        if (!padded) padded = int(audio.size());
+        auto *codes = audio_metadata.values<const int *>(audio_code_rows);
+        auto *sequences = audio_metadata.values<CacheSequence>(audio_caches);
+        const size_t layers = description.history.empty() ? 0
+            : runtime.states.history_spec(description.history).history_bytes.size();
+        auto *history = audio_metadata.values<ConvHistory>(histories);
+        std::fill_n(codes, capacity, nullptr);
+        std::fill_n(sequences, capacity, CacheSequence{});
+        std::fill_n(history, history_bytes / sizeof(ConvHistory), ConvHistory{});
+        bool enabled = true;
+        for (size_t row = 0; row < audio.size(); ++row) {
+            auto &cache = *audio[row];
+            const size_t books = definition.codebooks;
+            const bool retained = cache.data["codes"].size() > books * sizeof(int);
+            codes[row] = cache.data["codes"].ptr<int>() + size_t(retained ? cache.generated - 1 : 0) * books;
+            enabled &= cache.options.use_cuda_graph;
+            if (!description.history.empty()) {
+                auto &sequence = cache.data.history(description.history);
+                sequences[row] = {sequence.keys.data(), sequence.values.data(), sequence.layer_bytes,
+                                  nullptr, sequence.position.ptr<int>()};
+                for (size_t layer = 0; layer < layers; ++layer)
+                    history[layer * capacity + row] = {sequence.history[layer].ptr<float>(), sequence.position.ptr<int>()};
+            }
+        }
+        audio_metadata.upload();
+        active_audio = audio;
+        const bool replayed = runtime.execution.graphs().run(description.name.c_str(), {padded}, enabled,
+            [&] { invoke(description, padded, padded, 1, ForwardContext::Execute, enabled); });
+        if (replayed) {
+            audio_output = audio_graph_outputs.at(padded);
+            audio_stride = int(audio_output.numel() / padded);
+        }
+    }
+    bool framewise() const {
+        const auto &audio = program(definition.audio_program, ForwardMode::Prefill);
+        return definition.max_audio_frames == 1 && audio.replay == ProgramSpec::Replay::Batch &&
+            !audio.history.empty() && std::find(audio.outputs.begin(), audio.outputs.end(), "pcm") != audio.outputs.end();
+    }
+    bool framewise(const Cache &cache) const {
+        const auto &windows = cache.input.windows;
+        return framewise() && cache.input.segments.size() == 1 &&
+            cache.input.rate.semantic_repeat == 1 && cache.input.rate.feature_repeat == 1 &&
+            cache.options.speed_factor == 1 && windows.mode != SynthesisMode::Offline &&
+            windows.core == 1 && !windows.future && !windows.holdback && !windows.fade && !windows.left &&
+            cache.current().audio.bindings.empty() && cache.current().audio.uploads.empty() &&
+            cache.data["codes"].size() == size_t(definition.codebooks) * sizeof(int);
+    }
+    Frame launch_frame(const ExecutionBatch &batch, const Frame *previous = nullptr) {
+        Frame packet;
+        packet.rows.reserve(batch.rows.size());
+        std::vector<FrameRow> pending_audio;
+        std::vector<int> cursors;
+        cursors.reserve(batch.rows.size());
+        for (const auto &row : batch.rows) {
+            const auto found = states.find(row.id);
+            if (found == states.end()) continue;
+            const auto &handle = found->second.value;
+            auto &cache = *handle;
+            if (!cache.is_prefilled || cache.finished) continue;
+            int cursor = cache.generated;
+            bool decoded = cache.generated == cache.rendered;
+            if (previous) {
+                auto old = std::find_if(previous->rows.begin(), previous->rows.end(),
+                    [&](const FrameRow &entry) { return entry.cache == handle; });
+                if (old == previous->rows.end()) continue;
+                decoded = true;
+                cursor += old->decoded ? 1 : 0;
+            }
+            if (decoded && (cache.semantic_done || cursor >= cache.current().max_tokens)) continue;
+            if (decoded) cursors.push_back(cursor);
+            FrameRow entry{row.id, handle, decoded};
+            (decoded ? packet.rows : pending_audio).push_back(std::move(entry));
+        }
+        const size_t decoded = packet.rows.size();
+        packet.rows.insert(packet.rows.end(), pending_audio.begin(), pending_audio.end());
+        if (packet.rows.empty()) return packet;
+        packet.slot = previous ? 1 - previous->slot : 0;
+        auto &storage = frame_storage[packet.slot];
+        std::vector<Cache *> decode;
+        decode.reserve(decoded);
+        for (size_t row = 0; row < decoded; ++row) {
+            decode.push_back(packet.rows[row].cache.get());
+        }
+        if (decoded) {
+            launch_decode(decode, &cursors);
+            storage.view(int(decoded), 1, Type::I32).copy_(done.view(int(decoded), 1, Type::I32), true);
+        }
+        if (decoded < packet.rows.size())
+            ops::zero(storage.view(int(packet.rows.size() - decoded), 1, Type::I32, decoded * sizeof(int)));
+        active_audio.clear(); active_audio.reserve(packet.rows.size());
+        for (const auto &row : packet.rows) active_audio.push_back(row.cache.get());
+        launch_audio(active_audio, program(definition.audio_program, ForwardMode::Prefill));
+        const int samples = info.audio.samples_per_frame;
+        storage.view(int(packet.rows.size()), samples, Type::I16, Tensor::aligned(done.size()))
+            .copy_(audio_output.slice(0, int(packet.rows.size())), true);
+        return packet;
+    }
+    void start_segment(Cache &state) {
         auto &input = state.current();
         state.data.reset_host();
-        state.cache.reset();
-        state.cache = std::make_unique<PagedKVCache::Lease>(runtime.kv, input.lengths, input.capacities,
-                                                          state.data["table"].ptr<int>());
+        state.kv.reset();
+        state.kv = std::make_unique<PagedKVCache::Lease>(runtime.kv, input.lengths, input.capacities,
+                                                          state.data["table"].ptr<int>(), state.capacity.get());
         for (auto name : {"codes", "done", "seen"}) {
             auto tensor = state.data[name];
             if (tensor.size()) ops::zero(tensor);
         }
         state.options.seed = input.seed;
-        const SamplingRng random{input.seed, 0};
-        runtime.memory.upload(state.data["rng"].data, &random, sizeof(random));
-        runtime.memory.upload(state.data["positions"].data, input.lengths.data(), input.lengths.size() * sizeof(int));
+        SamplingRng random{input.seed, 0};
+        state.data["rng"].copy_({&random, 1, 2, Type::I64}, true);
+        state.data["positions"].slice(0, int(input.lengths.size()))
+            .copy_({input.lengths.data(), int(input.lengths.size()), 1, Type::I32}, true);
         for (const auto &field : input.initializers) {
             auto destination = state.data[field.name];
             if (field.value.size() > destination.size()) throw std::invalid_argument("initial state exceeds its declared capacity");
-            runtime.memory.upload(destination.data, field.value.data, field.value.size());
+            TensorView(destination.data, field.value.rows, field.value.cols, field.value.type, 0, destination.device)
+                .copy_(field.value, true);
         }
         for (const auto &address : input.input.addresses) {
             auto values = std::make_shared<Tensor>(Tensor::zeros({int(address.offsets.size()), 1}, Type::I64));
@@ -383,32 +673,53 @@ struct ModelRunner::Impl {
         for (const auto &description : programs)
             if (!description.history.empty()) state.data.history(description.history).reset(runtime.memory.stream);
         state.generated = state.rendered = state.audio_rendered = state.windows = 0;
-        state.segment_start_frames = state.metrics.frames;
+        state.segment_start_frames = state.emitted_frames;
         const double now = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
         state.schedule = WindowSchedule(state.input.windows.core, state.input.windows.maximum, now);
         state.pending.clear();
         state.pending.reserve(size_t(state.input.windows.fade) * info.audio.samples_per_frame);
         state.is_prefilled = state.semantic_done = false;
     }
-    Impl(const Model &model, RunnerResources &resources, RequestPlanner &inputs,
+    Impl(const Model &model, RunnerResources &resources, const InputDefinition &inputs,
           const ModelInfo &metadata, size_t runtime_bytes)
-        : network(model), runtime(resources), planner(inputs), info(metadata), definition(inputs.definition()), programs(definition.programs),
+        : network(model), runtime(resources), info(metadata), definition(inputs), programs(definition.programs),
           capacity(resources.batch), lane_capacity(capacity * definition.max_branches),
-          samples(size_t(capacity) * sizeof(SamplingRow)),
-          previous_codes(size_t(capacity) * sizeof(void *)),
-          code_rows(previous_codes.size()), owners(size_t(lane_capacity) * sizeof(int)),
-          caches(size_t(lane_capacity) * sizeof(CacheSequence)),
-          audio_caches(size_t(capacity) * sizeof(CacheSequence)),
-          histories([&] {
+          history_bytes([&] {
               size_t maximum = 0;
               for (const auto &description : programs)
                   if (!description.history.empty()) maximum = std::max(maximum,
                       resources.states.rows().front()->history(description.history).history.size());
               return maximum * capacity * sizeof(ConvHistory);
-          }()), done(size_t(capacity) * sizeof(int)),
-          counts(done.size()), positions(done.size()),
-          pcm(size_t(capacity) * definition.max_audio_frames * info.audio.samples_per_frame * sizeof(int16_t)),
-          host_done(capacity), host_layout(size_t(capacity) * 2), host_audio(pcm.size() / sizeof(int16_t)) {
+          }()),
+          pcm_bytes(size_t(capacity) * definition.max_audio_frames * info.audio.samples_per_frame * sizeof(int16_t)),
+          token_metadata({size_t(capacity) * sizeof(SamplingRow), size_t(capacity) * sizeof(void *),
+              size_t(capacity) * sizeof(void *), size_t(lane_capacity) * sizeof(int),
+              size_t(lane_capacity) * sizeof(CacheSequence), size_t(capacity) * sizeof(int),
+              size_t(capacity) * sizeof(int)}),
+          audio_metadata({size_t(capacity) * sizeof(void *), size_t(capacity) * sizeof(CacheSequence), history_bytes}),
+          done(size_t(capacity) * sizeof(int)),
+          waveform_pcm([&] {
+              const auto &outputs = program(definition.audio_program, ForwardMode::Prefill).outputs;
+              return std::find(outputs.begin(), outputs.end(), "pcm") == outputs.end() ? pcm_bytes : 0;
+          }()), audio_graph_outputs(size_t(capacity) + 1),
+          host_layout(size_t(capacity) * 2), host_audio(pcm_bytes / sizeof(int16_t)) {
+        size_t offset = 0;
+        samples = token_metadata.take(offset, capacity, sizeof(SamplingRow), Type::I8);
+        previous_codes = token_metadata.take(offset, capacity, 1, Type::I64);
+        code_rows = token_metadata.take(offset, capacity, 1, Type::I64);
+        owners = token_metadata.take(offset, lane_capacity, 1, Type::I32);
+        caches = token_metadata.take(offset, lane_capacity, sizeof(CacheSequence), Type::I8);
+        counts = token_metadata.take(offset, capacity, 1, Type::I32);
+        positions = token_metadata.take(offset, capacity, 1, Type::I32);
+        offset = 0;
+        audio_code_rows = audio_metadata.take(offset, capacity, 1, Type::I64);
+        audio_caches = audio_metadata.take(offset, capacity, sizeof(CacheSequence), Type::I8);
+        histories = audio_metadata.take(offset, 1, int(history_bytes), Type::I8);
+        readback_bytes = pcm_bytes;
+        if (framewise()) {
+            readback_bytes = Tensor::aligned(done.size()) + Tensor::aligned(pcm_bytes);
+            for (auto &storage : frame_storage) storage = Buffer(readback_bytes);
+        }
         log::InitPhase phase("execution storage");
         size_t history_bytes_per_row = 0;
         for (const auto &history : runtime.states.layout().histories) {
@@ -425,8 +736,7 @@ struct ModelRunner::Impl {
                 runtime.context);
             ops::reserve_decode(runtime.memory.device, definition.head_dimensions, definition.type);
         }
-        for (auto *buffer : {&samples, &previous_codes, &code_rows, &owners, &caches,
-                            &audio_caches, &histories, &done, &counts, &positions}) runtime.memory.zero(*buffer);
+        for (auto *buffer : {&token_metadata.device, &audio_metadata.device, &done}) runtime.memory.zero(*buffer);
         for (auto &description : programs) {
             if (description.replay == ProgramSpec::Replay::None) continue;
             for (const auto &field : description.input.uploads) {
@@ -504,7 +814,7 @@ struct ModelRunner::Impl {
         runtime.execution.seal();
         ops::seal(runtime.memory.device);
         runtime.memory.trim();
-        size_t transfers = pcm.size();
+        size_t transfers = pcm_bytes;
         for (const auto &description : definition.programs) {
             const size_t upload = Tensor::plan([&] {
                 for (const auto &field : description.input.uploads) Tensor::reserve(field.value.size());
@@ -515,18 +825,21 @@ struct ModelRunner::Impl {
             });
             transfers = std::max(transfers, upload);
         }
-        for (auto *buffer : {&samples, &previous_codes, &code_rows, &owners, &caches,
-                            &audio_caches, &histories, &done, &counts, &positions})
+        for (auto *buffer : {&token_metadata.device, &audio_metadata.device, &done})
             transfers += Tensor::aligned(buffer->size());
         for (const auto &row : runtime.states.rows())
             for (const auto &field : row->fields())
                 if (!field.second.device().is_cpu()) transfers += Tensor::aligned(field.second.nbytes());
         phase.next("host transfer reservation");
+        // At most the current audio stage and one submitted successor retain
+        // upload snapshots. Neither may recycle the other's pending H2D data.
+        if (transfers > SIZE_MAX / 2) throw std::overflow_error("host transfer reservation");
+        const size_t transfer_capacity = transfers * 2;
         TTS_LOG(TTS_LOG_DEBUG, "engine.init",
                 "host_transfer_staging={:.0f} MiB pinned_tensor_pool={:.0f} MiB",
-                Tensor::aligned(transfers) / (1024.0 * 1024.0),
-                Tensor::aligned(transfers) / (1024.0 * 1024.0));
-        runtime.memory.reserve_transfers(transfers);
+                Tensor::aligned(transfer_capacity) / (1024.0 * 1024.0),
+                (Tensor::aligned(transfer_capacity) + Tensor::aligned(readback_bytes)) / (1024.0 * 1024.0));
+        runtime.memory.reserve_transfers(transfer_capacity, readback_bytes);
         phase.next("runtime memory reservation");
         const size_t available = runtime.memory.available_bytes();
         const size_t budget = runtime_bytes ? runtime_bytes
@@ -538,30 +851,330 @@ struct ModelRunner::Impl {
         runtime.memory.reserve_runtime(budget);
         device_total_bytes = log_device_memory(runtime.memory, "ready");
     }
-    State &state(RequestState &value) {
-        auto &result = dynamic_cast<State &>(value);
-        if (&result.owner != this) throw std::invalid_argument("request belongs to another execution engine");
-        return result;
-    }
+
 };
-ModelRunner::ModelRunner(const Model &model, RunnerResources &resources, RequestPlanner &inputs,
+ModelRunner::ModelRunner(const Model &model, RunnerResources &resources, const InputDefinition &inputs,
                          const ModelInfo &info, size_t runtime_bytes)
     : impl_(std::make_unique<Impl>(model, resources, inputs, info, runtime_bytes)) {}
 ModelRunner::~ModelRunner() = default;
-ModelRunner::CacheUsage ModelRunner::cache_usage() const {
-    const auto &runtime = impl_->runtime;
-    return {runtime.kv.storage_page_bytes(),
-            impl_->device_total_bytes,
-            impl_->state_kv_bytes_per_row,
-            runtime.kv.capacity() - runtime.kv.available(),
-            runtime.kv.capacity(),
-            impl_->capacity};
+size_t ModelRunner::max_readback_bytes() const { return impl_->readback_bytes; }
+void ModelRunner::set_engine_id(uint64_t id) { impl_->engine_id = id; }
+bool ModelRunner::finished() const { return impl_->phase == Impl::Phase::Idle; }
+bool ModelRunner::has_batch() const { return impl_->completion.executed; }
+bool ModelRunner::preparing() const { return !impl_->preparation_batch.tasks.empty(); }
+bool ModelRunner::has_control() const { return !impl_->evaluation.name.empty() || impl_->audio_decode; }
+bool ModelRunner::has_submitted() const { return impl_->submitted_frame.slot >= 0; }
+bool ModelRunner::can_submit_next() const {
+    return impl_->completion.executed && impl_->phase == Impl::Phase::Frame && !has_submitted();
 }
+void ModelRunner::abort() {
+    impl_->runtime.memory.sync();
+    impl_->submitted_frame = {};
+    impl_->frame = {};
+    impl_->clear_control();
+    impl_->input_arena.reset();
+    impl_->clear_requests();
+    impl_->phase = Impl::Phase::Idle;
+    impl_->completion = {};
+    impl_->scheduled = {};
+    impl_->preparation_batch = {};
+}
+bool ModelRunner::submit_next(const ExecutionBatch &batch) {
+    auto &i = *impl_;
+    if (has_submitted()) throw std::logic_error("a successor is already submitted");
+    if (!can_submit_next() || batch.rows.empty() ||
+        !batch.requests.empty() || !batch.release.empty() || !batch.release_requests.empty()) return false;
+    for (const auto &row : batch.rows) {
+        auto found = i.states.find(row.id);
+        if (row.create || (found != i.states.end() && !i.framewise(*found->second.value))) return false;
+    }
+    Range trace("tts.runner.submit_next");
+    i.submitted_frame = i.launch_frame(batch, &i.frame);
+    return has_submitted();
+}
+ForwardOutputs ModelRunner::forward(ExecutionBatch batch) {
+    auto &i = *impl_;
+    if (i.has_work()) throw std::logic_error("runner already has scheduled work");
+    const bool submitted = has_submitted();
+    if (submitted) {
+        for (const auto &row : i.submitted_frame.rows)
+            if (std::none_of(batch.rows.begin(), batch.rows.end(),
+                [&](const ExecutionRow &entry) { return entry.id == row.id; }))
+                throw std::logic_error("submitted batch changed");
+        i.frame = std::move(i.submitted_frame);
+        i.submitted_frame = {};
+    }
+    i.scheduled = std::move(batch);
+    i.step_rows.clear();
+    i.completion = std::move(i.scheduled.output);
+    auto &result = i.completion;
+    result.valid_rows = 0;
+    result.fatal = {};
+    result.decoded_rows = 0;
+    result.executed = true;
+    for (auto id : i.scheduled.release) {
+        auto found = i.states.find(id);
+        if (found != i.states.end()) { found->second.value->finished = true; i.states.erase(found); }
+    }
+    for (auto id : i.scheduled.release_requests) i.release_request(id);
+    for (auto &request : i.scheduled.requests)
+        i.requests.emplace(request.id, Impl::RequestRecord{std::move(request.plan)});
+    std::unordered_map<uint64_t, std::exception_ptr> rejected;
+    i.scheduled.rows.erase(std::remove_if(i.scheduled.rows.begin(), i.scheduled.rows.end(),
+        [&](const ExecutionRow &row) { return !row.create && !i.states.count(row.id); }), i.scheduled.rows.end());
+    if (i.scheduled.rows.size() > result.rows.size())
+        throw std::logic_error("batch exceeds initialized completion capacity");
+    for (const auto &row : i.scheduled.rows) {
+        auto &out = result.rows[result.valid_rows++];
+        out.id = row.id;
+        out.stats = {};
+        out.error = {};
+        out.done = out.prefilled = false;
+        out.pcm.clear();
+        if (rejected.count(row.request)) continue;
+        if (!i.states.count(row.id)) {
+            try {
+                log::Scope scope(i.engine_id, row.request);
+                auto &request = i.requests.at(row.request);
+                auto state = prepare(*request.plan, row);
+                i.states.emplace(row.id, Impl::LiveCache{row.request, std::move(state)});
+            } catch (const DeviceError &) { throw; }
+            catch (...) { rejected[row.request] = std::current_exception(); }
+        }
+    }
+    i.prefill_rows.clear();
+    for (size_t index = 0; index < i.scheduled.rows.size(); ++index) {
+        const auto &row = i.scheduled.rows[index];
+        auto &out = result.rows[index];
+        if (auto error = rejected.find(row.request); error != rejected.end()) {
+            out.error = error->second;
+            out.done = true;
+        }
+        auto found = i.states.find(row.id);
+        if (!out.done && found != i.states.end() &&
+            !found->second.value->is_prefilled && !found->second.value->finished)
+            i.prefill_rows.push_back(found->second.value.get());
+    }
+    i.phase = i.prefill_rows.empty() ? Impl::Phase::Decode : Impl::Phase::Prefill;
+    if (submitted) {
+        decode_forward();
+        return frame_outputs();
+    }
+    return forward();
+}
+
+ForwardOutputs ModelRunner::forward(PreparationBatch batch) {
+    auto &i = *impl_;
+    if (i.has_work()) throw std::logic_error("runner already has scheduled work");
+    if (batch.tasks.empty()) throw std::invalid_argument("empty preparation batch");
+    i.preparation_batch = std::move(batch);
+    i.preparation_first = i.preparation_end = 0;
+    i.phase = Impl::Phase::Preparation;
+    return forward();
+}
+
+ForwardOutputs ModelRunner::forward() {
+    auto &i = *impl_;
+    switch (i.phase) {
+    case Impl::Phase::Prefill: return prefill_forward(i.prefill_rows);
+    case Impl::Phase::Decode: return decode_forward();
+    case Impl::Phase::Audio: return audio_forward();
+    case Impl::Phase::Frame: return frame_outputs();
+    case Impl::Phase::Preparation: return preparation_forward();
+    case Impl::Phase::Evaluation: {
+        const auto &description = i.evaluation;
+        i.input_arena = std::make_unique<DeviceArena>(i.runtime.memory,
+            i.workspace(description, ForwardContext::Plan));
+        Tensor::Scope scope(*i.input_arena);
+        const auto &input = description.input;
+        ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
+        auto outputs = output_views(description.outputs);
+        run_forward(i.network, description.name, input, {}, {outputs.data(), outputs.size()}, context);
+        return {std::move(outputs)};
+    }
+    case Impl::Phase::Codes: return decode_codes_forward();
+    case Impl::Phase::Finish:
+        finish_step();
+        i.log_cache_usage(!i.scheduled.release.empty() || !i.scheduled.release_requests.empty());
+        for (size_t index = 0; index < i.completion.valid_rows; ++index) {
+            auto &out = i.completion.rows[index];
+            auto found = i.states.find(out.id);
+            if (found == i.states.end()) continue;
+            auto &state = *found->second.value;
+            out.stats.prefill_ms = state.prefill_ms;
+            out.stats.frames = state.emitted_frames;
+            out.stats.audio_seconds = double(state.emitted_frames) * i.info.audio.samples_per_frame / i.info.audio.sample_rate;
+            out.stats.truncated = state.truncated;
+            out.prefilled = state.is_prefilled;
+            out.done |= state.finished;
+            if (out.done) i.states.erase(found);
+        }
+        i.phase = Impl::Phase::Idle;
+        return {};
+    case Impl::Phase::Idle: return {};
+    }
+    throw std::logic_error("unknown forward phase");
+}
+
+void ModelRunner::commit(const SampledOutputs &sampled) {
+    auto &i = *impl_;
+    TensorInputs values(sampled.values.data(), sampled.values.size());
+    switch (i.phase) {
+    case Impl::Phase::Prefill:
+        i.sampled(i.input_rows, values["done"]);
+        for (auto *state : i.input_rows) {
+            state->is_prefilled = true;
+            state->prefill_ms = milliseconds(state->prefill_start);
+        }
+        i.input_arena.reset();
+        // Return completed prefills to Scheduler before starting another model
+        // step. Newly prepared waiting rows may now outrank existing decoders.
+        if (std::none_of(i.prefill_rows.begin(), i.prefill_rows.end(),
+            [](const auto *state) { return !state->is_prefilled && !state->finished; })) i.phase = Impl::Phase::Finish;
+        break;
+    case Impl::Phase::Decode:
+        i.sampled(i.decode_rows, values["done"]);
+        i.phase = Impl::Phase::Audio;
+        break;
+    case Impl::Phase::Audio: commit_audio(sampled); break;
+    case Impl::Phase::Frame: commit_frame(sampled); break;
+    case Impl::Phase::Preparation: commit_preparation(sampled); break;
+    case Impl::Phase::Evaluation:
+        for (const auto &field : sampled.values)
+            i.evaluation_result.emplace(field.name, Tensor(field.value));
+        i.input_arena.reset();
+        i.phase = Impl::Phase::Idle;
+        break;
+    case Impl::Phase::Codes: {
+        const auto waveform = values["waveform"];
+        const size_t samples = size_t(i.info.audio.samples_per_frame);
+        if (waveform.type != Type::F32 || waveform.numel() != samples)
+            throw std::logic_error("discrete audio decoder must return one F32 frame");
+        auto &cache = *i.audio_decode;
+        std::copy_n(waveform.ptr<float>(), samples, cache.audio.data() + cache.frame * samples);
+        ++cache.frame;
+        i.input_arena.reset();
+        i.phase = Impl::Phase::Idle;
+        break;
+    }
+    case Impl::Phase::Idle:
+        if (!sampled.values.empty()) throw std::logic_error("unexpected idle sample result");
+        break;
+    default: throw std::logic_error("unexpected sampled completion");
+    }
+}
+
+Completion ModelRunner::collect() {
+    if (!finished() || !impl_->completion.executed) throw std::logic_error("execution is not complete");
+    impl_->frame = {};
+    impl_->scheduled = {};
+    return std::exchange(impl_->completion, {});
+}
+PreparationBatch ModelRunner::collect_preparation() {
+    if (!finished() || !preparing()) throw std::logic_error("preparation is not complete");
+    return std::exchange(impl_->preparation_batch, {});
+}
+HostResults ModelRunner::collect_evaluation() {
+    auto &i = *impl_;
+    if (!finished() || i.evaluation.name.empty())
+        throw std::logic_error("evaluation is not complete");
+    i.evaluation = {};
+    return std::move(i.evaluation_result);
+}
+std::vector<float> ModelRunner::collect_codes() {
+    auto &i = *impl_;
+    if (!finished() || !i.audio_decode)
+        throw std::logic_error("code decode frame is not complete");
+    auto cache = std::exchange(i.audio_decode, {});
+    if (cache->frame == cache->codes.size() / i.info.audio.codebooks)
+        return std::move(cache->audio);
+    return {};
+}
+void ModelRunner::discard_control() noexcept {
+    auto &i = *impl_;
+    i.runtime.memory.complete_transfers();
+    if (!preparing() && !has_control()) return;
+    i.clear_control();
+    i.input_arena.reset();
+    i.preparation_batch = {};
+    i.phase = Impl::Phase::Idle;
+}
+
+ForwardOutputs ModelRunner::preparation_forward() {
+    auto &i = *impl_;
+    auto &tasks = i.preparation_batch.tasks;
+    while (i.preparation_first < tasks.size()) {
+        const size_t first = i.preparation_first;
+        if (tasks[first].error) { ++i.preparation_first; continue; }
+        const auto &prototype = tasks[first].program;
+        size_t end = first + 1;
+        std::vector<const InputBatch *> sources{&prototype.input};
+        while (end < tasks.size() && !tasks[end].error) {
+            const auto &program = tasks[end].program;
+            const auto &parameters = program.input.parameters;
+            const auto &expected = prototype.input.parameters;
+            if (program.name != prototype.name || program.outputs != prototype.outputs ||
+                program.input.fixed_position != prototype.input.fixed_position ||
+                parameters.size() != expected.size() || !std::equal(parameters.begin(), parameters.end(),
+                    expected.begin(), [](const auto &a, const auto &b) { return a.name == b.name && a.value == b.value; })) break;
+            sources.push_back(&program.input);
+            ++end;
+        }
+        try {
+            auto packed = i.pack(prototype.name, prototype.outputs, {sources.data(), sources.size()});
+            i.preparation_end = first + packed.count;
+            i.input_arena = std::make_unique<DeviceArena>(i.runtime.memory, packed.workspace_bytes);
+            Tensor::Scope scope(*i.input_arena);
+            const auto &input = packed.description.input;
+            ForwardContext context(input.limits.batch, input.limits.time, input.limits.rows);
+            // Output names must outlive the asynchronous readback. The task's
+            // program remains owned until the preparation completion is consumed.
+            auto outputs = output_views(prototype.outputs);
+            run_forward(i.network, packed.description.name, input, {}, {outputs.data(), outputs.size()}, context);
+            return {std::move(outputs)};
+        } catch (const DeviceError &) { throw; }
+        catch (const RequestOverloaded &) { end = first + 1; tasks[first].error = std::current_exception(); }
+        catch (...) {
+            auto error = std::current_exception();
+            for (size_t index = first; index < end; ++index) tasks[index].error = error;
+        }
+        i.input_arena.reset();
+        i.preparation_first = end;
+    }
+    i.phase = Impl::Phase::Idle;
+    return {};
+}
+
+void ModelRunner::commit_preparation(const SampledOutputs &sampled) {
+    auto &i = *impl_;
+    auto &tasks = i.preparation_batch.tasks;
+    const size_t first = i.preparation_first, end = i.preparation_end;
+    TensorInputs outputs(sampled.values.data(), sampled.values.size());
+    const auto &prototype = tasks[first].program;
+    std::vector<int> offsets(prototype.outputs.size());
+    for (size_t field = 0; field < offsets.size(); ++field) {
+        int64_t rows = 0;
+        for (size_t index = first; index < end; ++index) rows += tasks[index].outputs[field].rows;
+        if (rows != outputs[prototype.outputs[field]].rows)
+            throw std::logic_error("preparation output does not match its row partitions");
+    }
+    for (size_t index = first; index < end; ++index) {
+        for (size_t field = 0; field < offsets.size(); ++field) {
+            const auto &partition = tasks[index].outputs[field];
+            auto source = outputs[partition.name].slice(offsets[field], partition.rows);
+            offsets[field] += partition.rows;
+            tasks[index].results.emplace(partition.name, Tensor(source));
+        }
+    }
+    i.input_arena.reset();
+    i.preparation_first = end;
+}
+
 size_t ModelRunner::max_step_samples() const {
     return size_t(impl_->definition.max_audio_frames) * impl_->info.audio.samples_per_frame +
            size_t(impl_->info.audio.sample_rate) * 10;
 }
-std::unique_ptr<ModelRunner::RequestAdmission> ModelRunner::admit(RequestPlan &plan) {
+ResourceRequirements ModelRunner::requirements(const RequestPlan &plan) const {
     auto &implementation = *impl_;
     std::vector<int> pages;
     size_t workspace = 0;
@@ -574,30 +1187,35 @@ std::unique_ptr<ModelRunner::RequestAdmission> ModelRunner::admit(RequestPlan &p
         }
         pages.push_back(maximum);
     }
-    return implementation.runtime.admissions.admit(pages, workspace);
+    return {std::move(pages), workspace};
 }
-std::unique_ptr<ModelRunner::RequestState> ModelRunner::prepare(RequestPlan &plan, size_t input,
-                                                               RequestAdmission &admission) {
-    auto &implementation = *impl_;
-    if (!admission.belongs_to(implementation.runtime.admissions)) throw std::invalid_argument("foreign request admission");
-    auto credit = admission.acquire_row();
-    if (!credit) return {};
-    auto state = std::make_unique<Impl::State>(implementation, std::move(credit),
-        implementation.runtime.slots.acquire(), std::move(plan.inputs.at(input)), plan.options);
-    implementation.start_segment(*state);
+bool ModelRunner::release_if_idle(uint64_t id) {
+    if (std::any_of(impl_->states.begin(), impl_->states.end(),
+        [&](const auto &entry) { return entry.second.request == id; })) return false;
+    impl_->release_request(id);
+    return true;
+}
+std::shared_ptr<ModelRunner::Cache> ModelRunner::prepare(RequestPlan &plan, const ExecutionRow &row) {
+    auto &i = *impl_;
+    if (!row.cache || !row.cache->belongs_to(i.runtime.kv) || !row.slot || &row.slot->pool != &i.runtime.slots)
+        throw std::invalid_argument("batch has no reserved cache resources");
+    auto state = std::make_shared<Cache>(i.runtime, row.cache,
+        row.slot, std::move(plan.inputs.at(row.input)), plan.options);
+    i.start_segment(*state);
     return state;
 }
-size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
+ForwardOutputs ModelRunner::prefill_forward(const std::vector<Cache *> &requests) {
+    Range trace("tts.runner.prefill");
     auto &implementation = *impl_;
-    std::vector<Impl::State *> rows;
+    std::vector<Impl::Cache *> rows;
     std::vector<const InputBatch *> sources;
     for (auto *request : requests) {
-        auto &state = implementation.state(*request);
+        auto &state = *request;
         if (state.is_prefilled || state.finished) continue;
         rows.push_back(&state);
         sources.push_back(&state.current().input);
     }
-    if (rows.empty()) return 0;
+    if (rows.empty()) return {};
     auto program = implementation.pack(implementation.definition.main_program,
         {"hidden_states", "logits", "done"}, {sources.data(), sources.size()},
         size_t(implementation.runtime.kv.block_stride()) * sizeof(int));
@@ -606,18 +1224,18 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     std::vector<int> blocks;
     blocks.reserve(size_t(packed.sequence.shape.batch) * implementation.runtime.kv.block_stride());
     for (const auto *state : rows) {
-        const auto &table = state->cache->block_table();
+        const auto &table = state->kv->block_table();
         blocks.insert(blocks.end(), table.begin(), table.end());
     }
     const size_t bytes = program.workspace_bytes + Tensor::aligned(blocks.size() * sizeof(int));
-    DeviceArena storage(implementation.runtime.memory, bytes);
+    implementation.input_arena = std::make_unique<DeviceArena>(implementation.runtime.memory, bytes);
     auto block_values = std::make_shared<Tensor>(Tensor::zeros({int(blocks.size()), 1}, Type::I32));
     std::copy(blocks.begin(), blocks.end(), block_values->view().ptr<int>());
     packed.uploads.push_back({"cache_blocks", block_values->view()});
     packed.owners.push_back(block_values);
     packed.batch_bindings.push_back({"cache_blocks", BatchField::CacheTable});
-    implementation.map(rows, int(rows.size()), packed.sequence.shape.batch);
-    Tensor::Scope scope(storage);
+    implementation.map(rows);
+    Tensor::Scope scope(*implementation.input_arena);
     ForwardContext context(packed.limits.batch, packed.limits.time, packed.limits.rows);
     context.batch.capacity = implementation.runtime.context;
     context.batch.cache = implementation.runtime.kv.view();
@@ -625,181 +1243,206 @@ size_t ModelRunner::prefill_step(const std::vector<RequestState *> &requests) {
     auto outputs = output_views(program.description.outputs);
     run_forward(implementation.network, program.description.name, packed, {arguments.data(), arguments.size()},
                 {outputs.data(), outputs.size()}, context);
-    implementation.sampled(rows);
-    for (auto *state : rows) {
-        state->is_prefilled = true;
-        state->metrics.prefill_ms = milliseconds(state->start);
-    }
-    return rows.size();
+    implementation.input_rows = std::move(rows);
+    return {{{"done", implementation.done.view(int(implementation.input_rows.size()), 1, Type::I32)}}};
 }
-void ModelRunner::step(const std::vector<RequestState *> &requests,
-                        const std::vector<AudioCallback> &callbacks) {
-    if (requests.empty() || requests.size() != callbacks.size()) throw std::invalid_argument("invalid execution batch");
+ForwardOutputs ModelRunner::decode_forward() {
+    Range trace("tts.runner.decode");
+    auto &implementation = *impl_;
+    auto &rows = implementation.step_rows;
+    auto &decode = implementation.decode_rows;
+    rows.clear(); decode.clear();
+    implementation.audio_sinks.clear();
+    implementation.active_audio.clear();
+    for (size_t index = 0; index < implementation.scheduled.rows.size(); ++index) {
+        const auto &row = implementation.scheduled.rows[index];
+        const auto &out = implementation.completion.rows[index];
+        const auto found = implementation.states.find(row.id);
+        if (out.done || found == implementation.states.end()) continue;
+        auto &cache = *found->second.value;
+        if (cache.finished || !cache.is_prefilled) continue;
+        rows.push_back(&cache);
+        implementation.audio_sinks.push_back(&implementation.completion.rows[index].pcm);
+        if (!cache.semantic_done && !implementation.ready(cache)) decode.push_back(&cache);
+    }
+    implementation.completion.decoded_rows = int(rows.size());
+    if (implementation.frame.slot >= 0) {
+        implementation.phase = Impl::Phase::Frame;
+        return frame_outputs();
+    }
+    if (!rows.empty() && std::all_of(rows.begin(), rows.end(),
+        [&](const auto *row) { return implementation.framewise(*row); })) {
+        implementation.frame = implementation.launch_frame(implementation.scheduled);
+        if (implementation.frame.slot >= 0) {
+            implementation.phase = Impl::Phase::Frame;
+            return frame_outputs();
+        }
+    }
+    if (!decode.empty()) implementation.launch_decode(decode);
+    if (decode.empty()) { implementation.phase = Impl::Phase::Audio; return forward(); }
+    return {{{"done", implementation.done.view(int(decode.size()), 1, Type::I32)}}};
+}
+ForwardOutputs ModelRunner::frame_outputs() const {
+    const auto &i = *impl_;
+    const auto &storage = i.frame_storage.at(i.frame.slot);
+    const int rows = int(i.frame.rows.size());
+    return {{{"done", storage.view(rows, 1, Type::I32)},
+             {"pcm", storage.view(rows, i.info.audio.samples_per_frame, Type::I16, Tensor::aligned(i.done.size()))}}};
+}
+void ModelRunner::commit_frame(const SampledOutputs &sampled) {
+    auto &i = *impl_;
+    TensorInputs values(sampled.values.data(), sampled.values.size());
+    const auto done = values["done"], pcm = values["pcm"];
+    const int samples = i.info.audio.samples_per_frame;
+    if (done.numel() != i.frame.rows.size() || pcm.numel() != i.frame.rows.size() * samples)
+        throw std::logic_error("frame completion does not match submitted rows");
+    for (size_t index = 0; index < i.frame.rows.size(); ++index) {
+        const auto &row = i.frame.rows[index];
+        auto &cache = *row.cache;
+        // EOS of the preceding frame can retire this cache while one final
+        // frame is still executing. The packet owns it; discard that result.
+        if (cache.finished || !i.states.count(row.id)) continue;
+        auto out = std::find_if(i.completion.rows.begin(), i.completion.rows.begin() + i.completion.valid_rows,
+            [&](const CompletedRow &entry) { return entry.id == row.id; });
+        if (out == i.completion.rows.begin() + i.completion.valid_rows) continue;
+        if (row.decoded) {
+            if (done.ptr<int>()[index]) { cache.semantic_done = true; continue; }
+            if (++cache.generated == cache.current().max_tokens) {
+                cache.semantic_done = true;
+                cache.truncated = true;
+            }
+        }
+        i.append_pcm(cache, out->pcm, pcm.ptr<int16_t>() + index * samples, samples);
+        ++cache.rendered; ++cache.audio_rendered; ++cache.windows;
+    }
+    i.phase = Impl::Phase::Finish;
+}
+ForwardOutputs ModelRunner::audio_forward() {
     auto &implementation = *impl_;
     auto &runtime = implementation.runtime;
-    std::vector<Impl::State *> rows, decode;
-    implementation.active_audio.clear();
-    auto available = [&](const Impl::State &state) { return implementation.available(state); };
-    auto ready = [&](const Impl::State &state) { return implementation.ready(state); };
-    for (auto *request : requests) {
-        auto &state = implementation.state(*request);
-        if (!state.is_prefilled) throw std::logic_error("decode scheduled before input execution");
-        rows.push_back(&state);
-        if (!state.finished && !state.semantic_done && !ready(state)) {
-            auto lengths = state.current().lengths;
-            for (auto &length : lengths) length += state.generated;
-            state.cache->ensure(lengths);
-            decode.push_back(&state);
-        }
-    }
-    if (!decode.empty()) {
-        int lanes = 0, key_length = 0;
-        bool enabled = true;
-        for (const auto *state : decode) {
-            lanes += int(state->current().lengths.size());
-            for (int length : state->current().lengths)
-                key_length = std::max(key_length, length + state->generated);
-            enabled &= state->options.use_cuda_graph;
-        }
-        auto shape = runtime.shapes.select(int(decode.size()), lanes, implementation.definition.max_branches);
-        if (!shape.first) shape = {int(decode.size()), lanes};
-        implementation.map(decode, shape.first, shape.second);
-        const int partitions = implementation.decode_plan
-            ? implementation.decode_plan->select(shape.second, implementation.definition.query_heads, key_length) : 1;
-        const auto &description = implementation.program(implementation.definition.main_program, ForwardMode::Decode);
-        runtime.execution.graphs().run(description.name.c_str(), {shape.first, shape.second, partitions}, enabled,
-            [&] { implementation.invoke(description, shape.first, shape.second, partitions); });
-        implementation.sampled(decode);
-    }
+    auto &rows = implementation.step_rows;
+    auto ready = [&](const Impl::Cache &state) { return implementation.ready(state); };
     const auto &description = implementation.program(implementation.definition.audio_program, ForwardMode::Prefill);
-    std::vector<Impl::State *> audio;
-    std::vector<size_t> members;
+    auto &audio = implementation.active_audio;
+    auto &members = implementation.audio_members;
+    audio.clear(); members.clear();
     for (size_t row = 0; row < rows.size(); ++row)
         if (!rows[row]->finished && (ready(*rows[row]) || implementation.audio_pending(*rows[row]))) {
             members.push_back(row);
             audio.push_back(rows[row]);
         }
     if (!audio.empty()) {
-        int padded = description.replay == ProgramSpec::Replay::None ? int(audio.size())
-            : runtime.shapes.select(int(audio.size()));
-        if (!padded) padded = int(audio.size());
-        std::vector<const int *> codes(padded);
-        std::vector<CacheSequence> sequences(padded);
-        const size_t history_count = description.history.empty() ? 0
-            : runtime.states.history_spec(description.history).history_bytes.size();
-        std::vector<ConvHistory> history(history_count * implementation.capacity);
-        bool enabled = true;
-        for (size_t row = 0; row < audio.size(); ++row) {
-            auto &state = *audio[row];
-            const size_t books = implementation.definition.codebooks;
-            const bool retained = state.data["codes"].size() > books * sizeof(int);
-            codes[row] = state.data["codes"].ptr<int>() + size_t(retained ? state.generated - 1 : 0) * books;
-            enabled &= state.options.use_cuda_graph;
-            if (!description.history.empty()) {
-                auto &sequence = state.data.history(description.history);
-                sequences[row] = {sequence.keys.data(), sequence.values.data(), sequence.layer_bytes,
-                                  nullptr, sequence.position.ptr<int>()};
-                for (size_t layer = 0; layer < history_count; ++layer)
-                    history[layer * implementation.capacity + row] = {
-                        sequence.history[layer].ptr<float>(), sequence.position.ptr<int>()};
-            }
-        }
-        runtime.memory.upload(implementation.code_rows.data(), codes.data(), codes.size() * sizeof(int *));
-        runtime.memory.upload(implementation.audio_caches.data(), sequences.data(), sequences.size() * sizeof(CacheSequence));
-        if (!history.empty()) runtime.memory.upload(implementation.histories.data(), history.data(), history.size() * sizeof(ConvHistory));
-        implementation.active_audio = audio;
-        auto execution = implementation.audio_description(audio);
-        runtime.execution.graphs().run(description.name.c_str(), {padded}, enabled,
-            [&] { implementation.invoke(execution, padded, padded, 1, ForwardContext::Execute, enabled); });
+        implementation.audio_execution = implementation.audio_description(audio);
+        implementation.launch_audio(audio, implementation.audio_execution);
         const bool indexed = std::find(description.outputs.begin(), description.outputs.end(), "audio_layout") != description.outputs.end();
         const int stride = implementation.audio_stride;
         const size_t total = indexed ? implementation.audio_output.numel() : size_t(stride) * audio.size();
         if ((!indexed && stride < 1) || total > implementation.host_audio.size())
             throw std::logic_error("model audio exceeds its declared output capacity");
-        if (total) runtime.memory.download(implementation.host_audio.data(), implementation.audio_output.data, total * sizeof(int16_t));
-        const TensorInputs audio_inputs(execution.input.bindings.data(), execution.input.bindings.size());
-        for (size_t row = 0; row < audio.size(); ++row) {
-            auto &state = *audio[row];
-            const int accepted = audio_inputs["frames"].ptr<int>()[row];
-            const int left = std::min(state.rendered, state.input.windows.left);
-            const int offset = indexed ? implementation.host_layout[row * 2] : int(row) * stride;
-            const int count = indexed ? implementation.host_layout[row * 2 + 1] : stride;
-            const int samples_per_frame = implementation.info.audio.samples_per_frame;
-            const bool deferred = state.input.windows.mode == SynthesisMode::Offline;
-            state.rendered += accepted;
-            if (accepted) ++state.windows;
-            if (!count) continue;
-            const int begin = left * samples_per_frame, length = deferred ? count : accepted * samples_per_frame;
-            if (offset < 0 || count < begin + length || size_t(offset + count) > total ||
-                state.pending.size() > size_t(begin)) throw std::logic_error("invalid model audio output layout");
-            auto *current = implementation.host_audio.data() + offset + begin;
-            auto *output = current - state.pending.size();
-            for (size_t sample = 0; sample < state.pending.size(); ++sample) {
-                const float alpha = state.pending.size() > 1 ? float(sample) / (state.pending.size() - 1) : 1;
-                output[sample] = int16_t(std::lround(state.pending[sample] * (1 - alpha) + output[sample] * alpha));
-            }
-            const bool final = state.semantic_done && state.rendered == available(state);
-            const int send = final ? length : length - state.input.windows.fade * samples_per_frame;
-            const size_t emitted = state.pending.size() + send;
-            state.pending.assign(current + send, current + length);
-            implementation.emit(state, callbacks[members[row]], output, emitted);
-            state.audio_rendered += int(emitted / samples_per_frame);
-            if (state.input.windows.mode == SynthesisMode::Hybrid) {
-                const double now = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
-                state.schedule.observe(accepted, emitted, implementation.info.audio.sample_rate, now);
-            }
-        }
-        implementation.active_audio.clear();
+        implementation.audio_total = total;
+        return {{{"pcm", TensorView(implementation.audio_output.data, int(total), 1,
+                                    Type::I16, 0, runtime.memory.device)}}};
     }
+    implementation.phase = Impl::Phase::Finish;
+    return forward();
+}
+void ModelRunner::commit_audio(const SampledOutputs &sampled) {
+    auto &implementation = *impl_;
+    auto &audio = implementation.active_audio;
+    auto &members = implementation.audio_members;
+    const auto &execution = implementation.audio_execution;
+    const auto &description = implementation.program(implementation.definition.audio_program, ForwardMode::Prefill);
+    const bool indexed = std::find(description.outputs.begin(), description.outputs.end(), "audio_layout") != description.outputs.end();
+    const int stride = implementation.audio_stride;
+    const size_t total = implementation.audio_total;
+    auto available = [&](const Impl::Cache &state) { return implementation.available(state); };
+    TensorInputs values(sampled.values.data(), sampled.values.size());
+    auto *host_pcm = values["pcm"].ptr<int16_t>();
+    const TensorInputs audio_inputs(execution.input.bindings.data(), execution.input.bindings.size());
+    for (size_t row = 0; row < audio.size(); ++row) {
+        auto &state = *audio[row];
+        const int accepted = audio_inputs["frames"].ptr<int>()[row];
+        const int left = std::min(state.rendered, state.input.windows.left);
+        const int offset = indexed ? implementation.host_layout[row * 2] : int(row) * stride;
+        const int count = indexed ? implementation.host_layout[row * 2 + 1] : stride;
+        const int samples_per_frame = implementation.info.audio.samples_per_frame;
+        const bool deferred = state.input.windows.mode == SynthesisMode::Offline;
+        state.rendered += accepted;
+        if (accepted) ++state.windows;
+        if (!count) continue;
+        const int begin = left * samples_per_frame, length = deferred ? count : accepted * samples_per_frame;
+        if (offset < 0 || count < begin + length || size_t(offset + count) > total ||
+            state.pending.size() > size_t(begin)) throw std::logic_error("invalid model audio output layout");
+        auto *current = host_pcm + offset + begin;
+        auto *output = current - state.pending.size();
+        for (size_t sample = 0; sample < state.pending.size(); ++sample) {
+            const float alpha = state.pending.size() > 1 ? float(sample) / (state.pending.size() - 1) : 1;
+            output[sample] = int16_t(std::lround(state.pending[sample] * (1 - alpha) + output[sample] * alpha));
+        }
+        const bool final = state.semantic_done && state.rendered == available(state);
+        const int send = final ? length : length - state.input.windows.fade * samples_per_frame;
+        const size_t emitted = state.pending.size() + send;
+        state.pending.assign(current + send, current + length);
+        implementation.append_pcm(state, *implementation.audio_sinks[members[row]], output, emitted);
+        state.audio_rendered += int(emitted / samples_per_frame);
+        if (state.input.windows.mode == SynthesisMode::Hybrid) {
+            const double now = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+            state.schedule.observe(accepted, emitted, implementation.info.audio.sample_rate, now);
+        }
+    }
+    implementation.active_audio.clear();
+    implementation.phase = Impl::Phase::Finish;
+}
+void ModelRunner::finish_step() {
+    auto &implementation = *impl_;
+    auto &rows = implementation.step_rows;
+    auto available = [&](const Impl::Cache &state) { return implementation.available(state); };
     for (size_t row = 0; row < rows.size(); ++row) {
         auto *state = rows[row];
         if (!state->finished && state->semantic_done && state->rendered >= available(*state) &&
             !implementation.audio_pending(*state)) {
-            implementation.emit(*state, callbacks[row], state->pending.data(), state->pending.size());
+            implementation.append_pcm(*state, *implementation.audio_sinks[row], state->pending.data(), state->pending.size());
             state->pending.clear();
-            if (state->segment + 1 < state->input.segments.size() && state->metrics.frames < state->options.max_frames) {
-                int pause = std::min(state->input.pause_frames, state->options.max_frames - state->metrics.frames);
+            if (state->segment + 1 < state->input.segments.size() && state->emitted_frames < state->options.max_frames) {
+                int pause = std::min(state->input.pause_frames, state->options.max_frames - state->emitted_frames);
                 std::fill(implementation.host_audio.begin(), implementation.host_audio.end(), int16_t{});
                 while (pause && !state->finished) {
                     const int count = std::min(pause, implementation.definition.max_audio_frames);
-                    implementation.emit(*state, callbacks[row], implementation.host_audio.data(),
+                    implementation.append_pcm(*state, *implementation.audio_sinks[row], implementation.host_audio.data(),
                         size_t(count) * implementation.info.audio.samples_per_frame);
                     pause -= count;
                 }
-                if (!state->finished && state->metrics.frames < state->options.max_frames) {
+                if (!state->finished && state->emitted_frames < state->options.max_frames) {
                     ++state->segment;
                     implementation.start_segment(*state);
                 } else state->finished = true;
             } else state->finished = true;
         }
-        if (state->metrics.frames >= state->options.max_frames) state->finished = true;
-        state->metrics.total_ms = milliseconds(state->start);
+        if (state->emitted_frames >= state->options.max_frames) state->finished = true;
     }
 }
-std::shared_ptr<const Reference> ModelRunner::prepare_reference(ReferencePlan &plan) {
-    ProgramSpec description{plan.program, plan.input, plan.outputs};
-    return impl_->planner.finish_reference(plan, impl_->evaluate(description,
-        impl_->workspace(description, ForwardContext::Plan)));
+ForwardOutputs ModelRunner::forward_reference(const ReferencePlan &plan) {
+    auto &i = *impl_;
+    if (i.has_work())
+        throw std::logic_error("runner already has scheduled work");
+    i.evaluation = {plan.program, plan.input, plan.outputs};
+    i.evaluation_result.clear();
+    i.phase = Impl::Phase::Evaluation;
+    return forward();
 }
-std::vector<int> ModelRunner::encode_audio(const std::vector<float> &mono) {
-    auto &implementation = *impl_;
-    if (mono.empty() || mono.size() > implementation.info.max_reference_samples)
+ForwardOutputs ModelRunner::forward_encode(const std::vector<float> &mono) {
+    auto &i = *impl_;
+    if (mono.empty() || mono.size() > i.info.max_reference_samples)
         throw std::invalid_argument("reference audio is empty or exceeds its declared capacity");
-    InputBatch input;
-    input.limits = {1, int(mono.size()), int(mono.size())};
-    input.sequence.shape = {1, int(mono.size()), int(mono.size())};
-    input.uploads.push_back({"waveform", TensorView(const_cast<float *>(mono.data()), int(mono.size()), 1, Type::F32)});
-    ProgramSpec description{implementation.definition.reference_program, input, {"codes"}};
-    DeviceArena storage(implementation.runtime.memory, implementation.workspace(description, ForwardContext::Plan));
-    Tensor::Scope scope(storage);
-    ForwardContext context(1, int(mono.size()), int(mono.size()));
-    NamedTensor outputs[] = {{"codes", {}}};
-    run_forward(implementation.network, description.name, input, {}, {outputs, std::size(outputs)}, context);
-    std::vector<int> result(outputs[0].value.numel());
-    implementation.runtime.memory.download(result.data(), outputs[0].value.data, outputs[0].value.size());
-    return result;
+    ReferencePlan plan;
+    plan.program = i.definition.reference_program;
+    plan.input.limits = {1, int(mono.size()), int(mono.size())};
+    plan.input.sequence.shape = {1, int(mono.size()), int(mono.size())};
+    plan.input.uploads.push_back({"waveform", TensorView(const_cast<float *>(mono.data()), int(mono.size()), 1, Type::F32)});
+    plan.outputs = {"codes"};
+    return forward_reference(plan);
 }
-std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
+std::shared_ptr<ModelRunner::AudioDecodeCache> ModelRunner::prepare_codes(const std::vector<int> &codes) {
     auto &implementation = *impl_;
     const auto &format = implementation.info.audio;
     const auto &description = implementation.program(implementation.definition.audio_program, ForwardMode::Prefill);
@@ -822,90 +1465,65 @@ std::vector<float> ModelRunner::decode_codes(const std::vector<int> &codes) {
     input.parameters = {{"history_stride", 1}};
     ProgramSpec sizing{description.name, input, description.outputs};
     const size_t network_bytes = implementation.workspace(sizing, ForwardContext::Plan);
-    DeviceArena storage(implementation.runtime.memory, history_bytes + network_bytes);
-    Tensor::Scope allocation_scope(storage);
-    SequenceState history(specification);
+    if (implementation.has_work())
+        throw std::logic_error("runner already has scheduled work");
+    auto result = std::make_shared<AudioDecodeCache>();
+    // Retain ownership before submitting initialization, including error cleanup.
+    implementation.audio_decode = result;
+    result->codes = codes;
+    result->workspace_bytes = network_bytes;
+    result->arena = std::make_unique<DeviceArena>(implementation.runtime.memory, history_bytes);
+    Tensor::Scope allocation_scope(*result->arena);
+    result->history = std::make_unique<SequenceState>(specification);
+    auto &history = *result->history;
     history.reset(implementation.runtime.memory.stream);
-    Buffer frame(size_t(format.codebooks) * sizeof(int)), pointers(sizeof(int *));
-    Buffer cache(sizeof(CacheSequence)), histories(specification.history_bytes.size() * sizeof(ConvHistory));
-    const int *frame_pointer = frame.ptr<int>();
+    result->token = Buffer(size_t(format.codebooks) * sizeof(int));
+    result->pointer = Buffer(sizeof(int *));
+    result->cache = Buffer(sizeof(CacheSequence));
+    result->histories = Buffer(specification.history_bytes.size() * sizeof(ConvHistory));
+    const int *frame_pointer = result->token.ptr<int>();
     CacheSequence sequence{history.keys.data(), history.values.data(), history.layer_bytes, nullptr, history.position.ptr<int>()};
     std::vector<ConvHistory> descriptors;
     for (auto &buffer : history.history) descriptors.push_back({buffer.ptr<float>(), history.position.ptr<int>()});
-    implementation.runtime.memory.upload(pointers.data(), &frame_pointer, sizeof(frame_pointer));
-    implementation.runtime.memory.upload(cache.data(), &sequence, sizeof(sequence));
-    implementation.runtime.memory.upload(histories.data(), descriptors.data(), descriptors.size() * sizeof(ConvHistory));
-    const size_t frames = codes.size() / format.codebooks;
-    std::vector<float> result(frames * format.samples_per_frame);
-    for (size_t frame_index = 0; frame_index < frames; ++frame_index) {
-        implementation.runtime.memory.upload(frame.data(), codes.data() + frame_index * format.codebooks, frame.size());
-        Tensor::Scope scratch;
-        ForwardContext context(1, 1, 1);
-        context.batch.cache.layout.sequences = cache.ptr<CacheSequence>();
-        const NamedTensor bindings[] = {{"code_rows", pointers.view(1, 1, Type::I64)},
-            {"histories", histories.view(1, int(histories.size()), Type::I8)}};
-        auto outputs = output_views(description.outputs);
-        run_forward(implementation.network, description.name, input, {bindings, std::size(bindings)},
-                    {outputs.data(), outputs.size()}, context);
-        TensorInputs values(outputs.data(), outputs.size());
-        const auto waveform = values["waveform"];
-        if (waveform.type != Type::F32) throw std::invalid_argument("discrete audio decoder must return F32 samples");
-        implementation.runtime.memory.download(result.data() + frame_index * format.samples_per_frame,
-                                                waveform.data, waveform.size());
-    }
+    result->pointer.copy_({&frame_pointer, 1, 1, Type::I64}, true);
+    result->cache.copy_({&sequence, 1, int(sizeof(sequence)), Type::I8}, true);
+    result->histories.copy_({descriptors.data(), 1, int(descriptors.size() * sizeof(ConvHistory)), Type::I8}, true);
+    result->audio.resize(codes.size() / format.codebooks * format.samples_per_frame);
+    implementation.audio_decode.reset();
     return result;
 }
-void ModelRunner::prepare_tasks(std::vector<PreparedTask> &tasks) {
-    for (size_t first = 0; first < tasks.size();) {
-        if (tasks[first].error) { ++first; continue; }
-        const auto &prototype = tasks[first].program;
-        size_t end = first + 1;
-        std::vector<const InputBatch *> sources{&prototype.input};
-        while (end < tasks.size() && !tasks[end].error) {
-            const auto &program = tasks[end].program;
-            const auto &parameters = program.input.parameters;
-            const auto &expected = prototype.input.parameters;
-            if (program.name != prototype.name || program.outputs != prototype.outputs ||
-                program.input.fixed_position != prototype.input.fixed_position ||
-                parameters.size() != expected.size() ||
-                !std::equal(parameters.begin(), parameters.end(), expected.begin(),
-                    [](const auto &left, const auto &right) { return left.name == right.name && left.value == right.value; }))
-                break;
-            sources.push_back(&program.input);
-            ++end;
-        }
-        try {
-            auto packed = impl_->pack(prototype.name, prototype.outputs, {sources.data(), sources.size()});
-            end = first + packed.count;
-            auto outputs = impl_->evaluate(packed.description, packed.workspace_bytes);
-            std::vector<int> offsets(prototype.outputs.size());
-            for (size_t field = 0; field < offsets.size(); ++field) {
-                int64_t rows = 0;
-                for (size_t index = first; index < end; ++index) rows += tasks[index].outputs[field].rows;
-                if (rows != outputs.at(prototype.outputs[field]).size(0))
-                    throw std::logic_error("preparation output does not match its row partitions");
-            }
-            for (size_t index = first; index < end; ++index) {
-                HostResults result;
-                for (size_t field = 0; field < offsets.size(); ++field) {
-                    const auto &partition = tasks[index].outputs[field];
-                    auto tensor = outputs.at(partition.name).narrow(0, offsets[field], partition.rows);
-                    offsets[field] += partition.rows;
-                    result.emplace(partition.name, std::move(tensor));
-                }
-                try { tasks[index].task->accept(std::move(result)); }
-                catch (const DeviceError &) { throw; }
-                catch (...) { tasks[index].error = std::current_exception(); }
-            }
-        } catch (const DeviceError &) { throw; }
-        catch (const RequestOverloaded &) {
-            end = first + 1;
-            tasks[first].error = std::current_exception();
-        } catch (...) {
-            auto error = std::current_exception();
-            for (size_t index = first; index < end; ++index) tasks[index].error = error;
-        }
-        first = end;
-    }
+ForwardOutputs ModelRunner::forward_codes(std::shared_ptr<AudioDecodeCache> cache) {
+    auto &i = *impl_;
+    if (i.has_work()) throw std::logic_error("runner already has scheduled work");
+    if (!cache || cache->frame >= cache->codes.size() / i.info.audio.codebooks)
+        throw std::logic_error("code decode cache is complete");
+    i.audio_decode = std::move(cache);
+    i.input_arena = std::make_unique<DeviceArena>(i.runtime.memory, i.audio_decode->workspace_bytes);
+    i.phase = Impl::Phase::Codes;
+    return forward();
+}
+
+ForwardOutputs ModelRunner::decode_codes_forward() {
+    auto &i = *impl_;
+    auto &cache = *i.audio_decode;
+    const auto &format = i.info.audio;
+    const auto &description = i.program(i.definition.audio_program, ForwardMode::Prefill);
+    auto input = description.input;
+    input.limits = {1, 1, 1};
+    input.sequence = {{}, {1, 1, 1}};
+    input.parameters = {{"history_stride", 1}};
+    cache.token.copy_({cache.codes.data() + cache.frame * format.codebooks,
+                          1, format.codebooks, Type::I32}, true);
+    Tensor::Scope allocation_scope(*i.input_arena);
+    Tensor::Scope scratch;
+    ForwardContext context(1, 1, 1);
+    context.batch.cache.layout.sequences = cache.cache.ptr<CacheSequence>();
+    const NamedTensor bindings[] = {{"code_rows", cache.pointer.view(1, 1, Type::I64)},
+        {"histories", cache.histories.view(1, int(cache.histories.size()), Type::I8)}};
+    auto outputs = output_views(description.outputs);
+    run_forward(i.network, description.name, input, {bindings, std::size(bindings)},
+                {outputs.data(), outputs.size()}, context);
+    TensorInputs values(outputs.data(), outputs.size());
+    return {{{"waveform", values["waveform"]}}};
 }
 } // namespace tts

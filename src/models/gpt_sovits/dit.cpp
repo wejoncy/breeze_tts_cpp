@@ -118,38 +118,33 @@ DiT::DiT(Weights &w, const std::string &root, const Json &cfg, int max_time)
                 time_table[size_t(offset + step) * frequency_dim + frequency_dim / 2 + i] =
                     std::cos(angle);
             }
-    auto encoded = w.generated(root + ".times", time_table, time_rows, frequency_dim, type_);
+    time_encoded_ = w.generated(root + ".times", time_table, time_rows, frequency_dim, type_);
     final_time_modulation_ = Tensor({time_rows, 2 * hidden_}, type_, w.device());
+}
+void DiT::prepare_weights() const {
+    const int time_rows = time_encoded_.rows;
     std::vector<std::pair<Linear, TensorView>> modulations;
     for (const auto &block : blocks_)
         modulations.emplace_back(block.modulation, block.time_modulation.view());
     modulations.emplace_back(final_modulation_, final_time_modulation_.view());
-    // Capture views, not layer addresses: registering a layer must not depend
-    // on whether its owner later moves it while constructing the network.
-    w.after_loading([encoded, first = time_in_, second = time_out_, time_rows,
-                     ranges = sampling_offsets_, hidden = hidden_, type = type_,
-                     modulations = std::move(modulations), device = w.device()] {
-        Tensor time_states({time_rows, hidden}, type, device);
-        Tensor projected_states({time_rows, hidden}, type, device);
-        ops::Epilogue activation;
-        activation.activation = ops::Activation::Silu;
-        // These are derived parameters. Materialize them with matrix GEMM,
-        // independently of the runtime vector-projection dispatch policy.
-        auto transform = [&](const Linear &layer, TensorView input, TensorView output,
-                             ops::Epilogue finish = {}) {
-            ops::grouped_matmul(input, layer.dense_weight(), output, 1);
-            finish.bias = layer.bias();
-            ops::pointwise(output, output, finish);
-        };
-        for (auto [steps, offset] : ranges) {
-            auto input = time_states.view().slice(offset, steps);
-            auto output = projected_states.view().slice(offset, steps);
-            transform(first, encoded.slice(offset, steps), input, activation);
-            transform(second, input, output, activation);
-            for (const auto &[layer, target] : modulations)
-                transform(layer, output, target.slice(offset, steps));
-        }
-    });
+    Tensor time_states({time_rows, hidden_}, type_, Device::cuda(time_encoded_.device));
+    Tensor projected_states({time_rows, hidden_}, type_, Device::cuda(time_encoded_.device));
+    ops::Epilogue activation;
+    activation.activation = ops::Activation::Silu;
+    auto transform = [&](const Linear &layer, TensorView input, TensorView output,
+                         ops::Epilogue finish = {}) {
+        ops::grouped_matmul(input, layer.dense_weight(), output, 1);
+        finish.bias = layer.bias();
+        ops::pointwise(output, output, finish);
+    };
+    for (auto [steps, offset] : sampling_offsets_) {
+        auto input = time_states.view().slice(offset, steps);
+        auto output = projected_states.view().slice(offset, steps);
+        transform(time_in_, time_encoded_.slice(offset, steps), input, activation);
+        transform(time_out_, input, output, activation);
+        for (const auto &[layer, target] : modulations)
+            transform(layer, output, target.slice(offset, steps));
+    }
 }
 TensorView DiT::forward(const Condition &condition, ForwardContext &context,
                         bool need_negative) const {
@@ -175,7 +170,7 @@ TensorView DiT::forward(const Condition &condition, ForwardContext &context,
             if (source.rows != rows || source.cols != 1 || source.type != type ||
                 source.device != -1 || !source.dense())
                 throw std::invalid_argument("invalid DiT conditioning row metadata");
-            ops::upload_bytes(destination, source.data, source.size());
+            destination.copy_(source, true);
         }
         return source.numel() ? destination : TensorView{};
     };

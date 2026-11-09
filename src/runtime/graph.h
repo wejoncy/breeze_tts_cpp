@@ -2,7 +2,8 @@
 #include <cuda_runtime_api.h>
 #include <chrono>
 #include <cstddef>
-#include <functional>
+#include "ops/cuda/cuda_check.h"
+#include <stdexcept>
 
 namespace tts {
 // Init diagnostics shared by graph families; no state or logging in replay.
@@ -24,7 +25,18 @@ struct Graph {
     Graph(const Graph &) = delete;
     Graph &operator=(const Graph &) = delete;
     ~Graph();
-    void capture(cudaStream_t stream, const std::function<void()> &forward);
+    template <class Forward> void capture(cudaStream_t stream, Forward &&forward) {
+        if (executable) throw std::logic_error("graph already captured");
+        if (graph) { CUDA(cudaGraphDestroy(graph)); graph = nullptr; }
+        CUDA(cudaStreamSynchronize(stream));
+        CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        try { forward(); }
+        catch (...) { cudaStreamEndCapture(stream, &graph); throw; }
+        CUDA(cudaStreamEndCapture(stream, &graph));
+        CUDA(cudaGraphInstantiate(&executable, graph, 0));
+        CUDA(cudaGraphUpload(executable, stream));
+        CUDA(cudaStreamSynchronize(stream));
+    }
     void run(cudaStream_t stream) const;
 };
 } // namespace tts

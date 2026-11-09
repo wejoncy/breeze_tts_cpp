@@ -22,6 +22,7 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader,
                                    options.max_batch, options.context, options.quantization));
     auto &model_instance = *model;
     parts.parameters->load();
+    model_instance.prepare_weights();
     parts.parameters->seal();
     parts.info = {
         "breeze",
@@ -32,8 +33,7 @@ ModelComponents breeze_model(DeviceContext &memory, const ModelLoader &loader,
         size_t(model_instance.config.max_reference_frames) *
             model_instance.config.samples_per_frame,
         parts.parameters->checkpoint_files()};
-    parts.quantum_ms = 1000. * parts.info.audio.samples_per_frame / parts.info.audio.sample_rate;
-    parts.planner = std::make_unique<TokenInputs>(loader.path(""), model_instance.config,
+    parts.inputs = std::make_unique<TokenInputs>(loader.path(""), model_instance.config,
                                                   options.max_batch, options.context);
     parts.resources = std::make_unique<RunnerResources>(
         memory,

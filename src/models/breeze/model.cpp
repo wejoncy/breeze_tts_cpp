@@ -51,12 +51,11 @@ Model::Model(Weights &weights, ModelConfig configuration)
         depth_heads.push_back(weights.custom("depth_head." + std::to_string(head_index),
                                              transposed.data(), vocabulary, hidden, Type::BF16));
     }
-    weights.after_loading([input = audio_embedding, projection = Linear(depth_proj),
-                           output = depth_embedding] {
-        projection.forward(input, output);
-    });
     residual_codebooks = std::make_unique<ResidualCodebooks>(depth, depth_embedding, depth_proj,
         depth_heads, SamplingLayout{config.codebooks, config.codec.codebook_size, config.backbone_eos});
+}
+void Model::prepare_weights() const {
+    Linear(depth_proj).forward(audio_embedding, depth_embedding);
 }
 void Model::forward(std::string_view program, TensorInputs inputs, TensorOutputs outputs,
                      ForwardContext &context) const {

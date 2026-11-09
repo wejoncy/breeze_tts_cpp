@@ -44,13 +44,13 @@ Acoustic::Acoustic(Weights &w, const std::string &prefix, const Json &cfg)
     if (heads_ < 1 || content_.output_channels() % heads_ ||
         cfg.at("gin_channels").get<int>() != content_.output_channels())
         throw std::invalid_argument("invalid acoustic rates/attention geometry");
-    auto codebook = w.get(prefix + ".quantizer.vq.layers.0._codebook.embed");
-    Linear project(w, prefix + ".enc_p.ssl_proj");
+    codebook_ = w.get(prefix + ".quantizer.vq.layers.0._codebook.embed");
+    codebook_projection_ = std::make_unique<Linear>(w, prefix + ".enc_p.ssl_proj");
     projected_codebook_ =
-        Tensor({codebook.rows, project.output_channels()}, type_, w.device());
-    w.after_loading([project, codebook, output = projected_codebook_.view()] {
-        project.forward(codebook, output);
-    });
+        Tensor({codebook_.rows, codebook_projection_->output_channels()}, type_, w.device());
+}
+void Acoustic::prepare_weights() const {
+    codebook_projection_->forward(codebook_, projected_codebook_.view());
 }
 Acoustic::Batch Acoustic::describe(int batch, int codes, int phones, double speed) const {
     Batch input;

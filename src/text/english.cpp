@@ -5,7 +5,6 @@
 #include "models/g2p_en/model.h"
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -222,7 +221,7 @@ struct EnglishPhonemizer::Impl {
         word.erase(std::remove_if(word.begin(), word.end(), [](char c) { return !letter(c) && !digit(c); }), word.end());
         struct Candidate { double score; Strings words; };
         std::map<std::pair<size_t, std::string>, Candidate> memo;
-        std::function<Candidate(size_t, const std::string &)> search = [&](size_t p, const std::string &previous) -> Candidate {
+        auto search = [&](auto &&self, size_t p, const std::string &previous) -> Candidate {
             if (p == word.size()) return {0, {}};
             auto key = std::make_pair(p, previous);
             auto cached = memo.find(key);
@@ -235,7 +234,7 @@ struct EnglishPhonemizer::Impl {
                     ? std::log10(two->second / word_total / (prior->second / word_total))
                     : one != unigrams.end() ? std::log10(one->second / word_total)
                     : std::log10(10. / (word_total * std::pow(10., length)));
-                auto candidate = search(p + length, prefix);
+                auto candidate = self(self, p + length, prefix);
                 candidate.score += score;
                 candidate.words.insert(candidate.words.begin(), std::move(prefix));
                 if (candidate.score > best.score || (candidate.score == best.score && candidate.words > best.words))
@@ -252,7 +251,7 @@ struct EnglishPhonemizer::Impl {
         for (size_t i = 0; i < remaining.size(); i += 250) {
             word = prefix + remaining.substr(i, 250);
             memo.clear();
-            auto words = search(0, "<s>").words;
+            auto words = search(search, 0, "<s>").words;
             size_t keep = std::min<size_t>(5, words.size());
             result.insert(result.end(), words.begin(), words.end() - keep);
             prefix.clear();
@@ -260,7 +259,7 @@ struct EnglishPhonemizer::Impl {
         }
         word = prefix;
         memo.clear();
-        auto tail = search(0, "<s>").words;
+        auto tail = search(search, 0, "<s>").words;
         result.insert(result.end(), tail.begin(), tail.end());
         return result;
     }

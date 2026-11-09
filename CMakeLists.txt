@@ -40,7 +40,6 @@ add_library(tts SHARED
   src/execution/model_runner.cpp
   src/inputs/token_inputs.cpp
   src/engine/engine.cpp
-  src/engine/request_executor.cpp
   src/engine/request_scheduler.cpp
   src/io/audio_io.cpp
   src/io/audio_speed.cpp
@@ -88,7 +87,7 @@ if(TTS_BUILD_HOPPER_KERNELS)
   target_sources(tts PRIVATE $<TARGET_OBJECTS:tts_quant_hopper>)
 endif()
 target_include_directories(tts PUBLIC include PRIVATE src "${PROJECT_SOURCE_DIR}")
-target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
   src/ops/kernels/tensor_kernels.cu
@@ -123,4 +122,23 @@ if(TTS_BUILD_PYTHON)
   include(cmake/Python.cmake)
 endif()
 install(TARGETS tts tts_cli)
+option(TTS_BUILD_TESTS "Build native engine integration checks (requires model weights to run)" OFF)
+if(TTS_BUILD_TESTS)
+  add_executable(tts_stream_tests tests/stream_ordering.cpp)
+  set_target_properties(tts_stream_tests PROPERTIES OUTPUT_NAME tts-stream-tests)
+  target_include_directories(tts_stream_tests PRIVATE src "${PROJECT_SOURCE_DIR}")
+  target_link_libraries(tts_stream_tests PRIVATE tts CUDA::cudart Threads::Threads)
+  add_executable(tts_scheduler_tests tests/scheduler_resources.cpp)
+  set_target_properties(tts_scheduler_tests PROPERTIES OUTPUT_NAME tts-scheduler-tests)
+  target_include_directories(tts_scheduler_tests PRIVATE src "${PROJECT_SOURCE_DIR}")
+  target_link_libraries(tts_scheduler_tests PRIVATE tts CUDA::cudart)
+  add_executable(tts_engine_tests tests/engine_lifecycle.cpp)
+  set_target_properties(tts_engine_tests PROPERTIES OUTPUT_NAME tts-engine-tests)
+  target_link_libraries(tts_engine_tests PRIVATE tts Threads::Threads)
+  if(TTS_ENABLE_GPT_SOVITS)
+    add_executable(tts_preparation_tests tests/engine_preparation.cpp)
+    set_target_properties(tts_preparation_tests PROPERTIES OUTPUT_NAME tts-preparation-tests)
+    target_link_libraries(tts_preparation_tests PRIVATE tts Threads::Threads)
+  endif()
+endif()
 install(DIRECTORY include/tts DESTINATION include FILES_MATCHING PATTERN "*.h")

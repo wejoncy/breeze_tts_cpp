@@ -118,6 +118,31 @@ GenerationSegment TokenInputs::encode(const Input &request, const GenerationOpti
     segment.seed = request_seed(options.seed, index);
     return segment;
 }
+class TokenInputs::Preparation final : public RequestPreparation {
+    const TokenInputs &owner_;
+    std::vector<Input> inputs_;
+    std::unique_ptr<RequestPlan> plan_ = std::make_unique<RequestPlan>();
+    size_t next_ = 0;
+  public:
+    Preparation(const TokenInputs &owner, std::vector<Input> inputs, GenerationOptions options)
+        : owner_(owner), inputs_(std::move(inputs)) { plan_->options = options; }
+    std::unique_ptr<PreparationTask> next() override {
+        if (ready()) return {};
+        const auto &input = inputs_[next_];
+        if (!input.text_split_method.empty() || input.fragment_interval != 0)
+            throw std::invalid_argument("token speech inputs do not define text segmentation controls");
+        GenerationInput planned;
+        planned.segments.push_back(owner_.encode(input, plan_->options, next_));
+        plan_->inputs.push_back(std::move(planned));
+        ++next_;
+        return {};
+    }
+    bool ready() const override { return next_ == inputs_.size(); }
+    std::unique_ptr<RequestPlan> finish() override {
+        if (!ready()) throw std::logic_error("token preparation is incomplete");
+        return std::move(plan_);
+    }
+};
 std::unique_ptr<RequestPreparation> TokenInputs::begin(const std::vector<Input> &requests,
                                                        const GenerationOptions &options) const {
     auto valid = [&](float temperature, int count, float probability) {
@@ -133,19 +158,10 @@ std::unique_ptr<RequestPreparation> TokenInputs::begin(const std::vector<Input> 
         throw std::invalid_argument("invalid generation options");
     if (options.speed_factor != 1 || options.sample_steps || options.cfg_rate != -1)
         throw std::invalid_argument("token speech inputs do not define acoustic speed or diffusion controls");
-    auto result = std::make_unique<RequestPlan>();
-    result->options = options;
-    for (size_t index = 0; index < requests.size(); ++index) {
-        if (!requests[index].text_split_method.empty() || requests[index].fragment_interval != 0)
-            throw std::invalid_argument("token speech inputs do not define text segmentation controls");
-        GenerationInput input;
-        input.segments.push_back(encode(requests[index], options, index));
-        result->inputs.push_back(std::move(input));
-    }
-    return std::make_unique<ImmediatePreparation>(std::move(result));
+    return std::make_unique<Preparation>(*this, requests, options);
 }
-std::unique_ptr<ReferencePlan> TokenInputs::prepare_reference(const std::vector<float> &mono,
-    std::string transcript, const PreparationExecutor &, const std::string &) const {
+std::unique_ptr<ReferencePreparation> TokenInputs::begin_reference(const std::vector<float> &mono,
+    std::string transcript, const std::string &) const {
     validate_text(transcript, 65536, "reference transcript");
     if (transcript.empty() || mono.empty() || mono.size() > size_t(config_.max_reference_frames) * config_.samples_per_frame)
         throw std::invalid_argument("invalid reference transcript or audio length");
@@ -159,7 +175,7 @@ std::unique_ptr<ReferencePlan> TokenInputs::prepare_reference(const std::vector<
     result->input.uploads.push_back({"waveform", storage->view()});
     result->input.owners.push_back(std::move(storage));
     result->outputs = {"codes"};
-    return result;
+    return std::make_unique<ImmediateReferencePreparation>(std::move(result));
 }
 std::shared_ptr<const Reference> TokenInputs::finish_reference(ReferencePlan &plan, HostResults outputs) const {
     const auto tensor = outputs.at("codes").view();

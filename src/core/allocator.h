@@ -1,5 +1,5 @@
 #pragma once
-#include "core/tensor_storage.h"
+#include "core/alignment.h"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -28,7 +28,7 @@ struct WorkspacePlan final : ScratchAllocator {
   public:
     size_t size = 0;
     void *allocate(size_t bytes) override {
-        bytes = Tensor::aligned(bytes);
+        bytes = aligned_storage_bytes(bytes);
         if (bytes > SIZE_MAX - cursor_) throw std::overflow_error("workspace size");
         cursor_ += bytes;
         size = std::max(size, cursor_);

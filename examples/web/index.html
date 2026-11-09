@@ -522,12 +522,6 @@
         }
         if (pending.byteLength || !job.samples) throw new Error("未收到完整音频，请重试。");
         const elapsed = ((performance.now() - job.startedAt) / 1000).toFixed(1);
-        const speechId = response.headers.get("X-SGLang-Omni-Speech-Id");
-        if (speechId) {
-          const outcome = await fetch(`/v1/audio/speech/${encodeURIComponent(speechId)}`, {cache: "no-store", signal: job.controller.signal});
-          if (outcome.ok && (await outcome.json()).finish_reason === "length")
-            job.completion = "播放完成 · 已达到生成时长上限，部分文字可能未读完";
-        }
         if (job.controller.signal.aborted) return;
         job.received = true;
         job.completion += ` · ${(job.samples / format.rate).toFixed(1)} 秒 · 用时 ${elapsed} 秒`;
