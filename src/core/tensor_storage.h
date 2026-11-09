@@ -1,7 +1,7 @@
 #pragma once
 #include "core/tensor.h"
 #include "core/device.h"
-#include <functional>
+#include "core/allocator.h"
 #include <memory>
 #include <utility>
 namespace tts {
@@ -32,6 +32,7 @@ class Tensor {
         int device() const { return device_; }
         template <class Value> Value *ptr() const { return static_cast<Value *>(data_); }
         TensorView view(int rows, int columns, Type dtype = Type::BF16, size_t offset = 0, int stride = 0) const;
+        Storage &copy_(TensorView source, bool non_blocking = false);
     };
     class Scope {
         BufferAllocator *previous_ = nullptr;
@@ -67,10 +68,14 @@ class Tensor {
     static Tensor zeros(TensorShape shape, Type dtype = Type::F32, Device device = Device::cpu());
     static TensorView scratch(TensorShape, Type);
     static void reserve(size_t bytes);
-    static size_t plan(const std::function<void()> &);
+    template <class Forward> static size_t plan(Forward &&forward) {
+        WorkspacePlan planning;
+        Scope scope(planning);
+        forward();
+        return planning.size;
+    }
     static size_t aligned(size_t bytes) {
-        if (bytes > SIZE_MAX - 255) throw std::overflow_error("tensor allocation size");
-        return (bytes + 255) & ~size_t(255);
+        return aligned_storage_bytes(bytes);
     }
     bool defined() const { return bool(storage_); }
     const TensorShape &shape() const { return tensor_; }

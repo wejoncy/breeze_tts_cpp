@@ -20,6 +20,7 @@ struct Model final : tts::Model {
     std::vector<TensorView> depth_heads;
     std::unique_ptr<ResidualCodebooks> residual_codebooks;
     Model(Weights &parameters, ModelConfig configuration);
+    void prepare_weights() const;
     void forward(std::string_view program, TensorInputs inputs, TensorOutputs outputs,
                   ForwardContext &context) const override;
 };

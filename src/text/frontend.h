@@ -16,8 +16,8 @@ struct TextInput {
     // not enter BERT. Offsets address the concatenated IDs/projection rows.
     std::vector<int> bert_offsets{0};
 };
-// CPU linguistic work lives on the scheduler. Only IDs/alignment cross into
-// the executor, where the model's BERT network produces GPU conditioning.
+// CPU linguistic work lives on the scheduler. Engine transfers IDs/alignment
+// to the runner, where the model's BERT network produces GPU conditioning.
 class TextFrontend {
     Tokenizer bert_tokenizer_, pronunciation_tokenizer_;
     text::ChinesePhonemizer chinese_;
@@ -53,7 +53,5 @@ class TextFrontend {
     TextFrontend(const std::string &directory, int max_bert_tokens);
     size_t max_characters() const { return size_t(max_bert_tokens_ - 2); }
     std::unique_ptr<Preparation> begin(const std::string &, const std::string &language = {}) const;
-    TextInput prepare(const std::string &, const PreparationExecutor &execute,
-                       const std::string &language = {}) const;
 };
 } // namespace tts::text

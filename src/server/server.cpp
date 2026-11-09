@@ -11,6 +11,7 @@
 #include <list>
 #include <mutex>
 #include <deque>
+#include <unordered_map>
 
 namespace tts::http {
 namespace {
@@ -50,6 +51,7 @@ void Config::validate() const {
 }
 
 struct Server::Impl {
+    // Every HTTP worker uses this same instance; Engine owns both queue directions.
     Engine &engine;
     Config config;
     AudioFormat audio;
@@ -57,6 +59,8 @@ struct Server::Impl {
     std::atomic<bool> stopping{false};
     // HTTP ownership only. Never hold this mutex across an Engine call or socket IO.
     std::mutex ownership;
+    struct Job;
+    std::unordered_map<std::string, Job *> connections;
     size_t active = 0;
     uint64_t sequence = 0;
     struct CachedReference {
@@ -65,13 +69,14 @@ struct Server::Impl {
     };
     std::list<CachedReference> references;
     size_t cached_bytes = 0;
-    std::deque<std::pair<std::string, Json>> outcomes;
 
     struct Job {
         Impl &owner;
         Request request;
         Clock::time_point deadline;
-        bool submitted = false, terminal = false;
+        bool submitted = false, terminal = false, output_failed = false;
+        std::deque<GenerationFrame> pending;
+        size_t pending_bytes = 0;
         Speech speech;
         Stats stats;
         std::string pcm;
@@ -85,6 +90,7 @@ struct Server::Impl {
                 throw RequestOverloaded("HTTP request capacity reached");
             request.request_id = "speech-" + std::to_string(++owner.sequence);
             ++owner.active;
+            owner.connections.emplace(request.request_id, this);
         }
         ~Job() {
             if (submitted && !terminal) {
@@ -96,9 +102,10 @@ struct Server::Impl {
                 }
             }
             std::lock_guard<std::mutex> guard(owner.ownership);
+            owner.connections.erase(request.request_id);
             --owner.active;
         }
-        void check(const std::function<bool()> &disconnected) const {
+        template <class Disconnected> void check(const Disconnected &disconnected) const {
             if (owner.stopping)
                 throw HttpError(503, "server is stopping");
             if (disconnected())
@@ -106,17 +113,11 @@ struct Server::Impl {
             if (Clock::now() >= deadline)
                 throw HttpError(504, "generation deadline exceeded");
         }
-        bool poll(int timeout, const std::function<bool()> &disconnected) {
+        template <class Disconnected> bool poll(int timeout, const Disconnected &disconnected) {
             check(disconnected);
             GenerationFrame frame;
-            try {
-                frame = owner.engine.read_result(request.request_id, timeout);
-            } catch (...) {
-                terminal = true;
-                throw;
-            } // Native terminal errors consume the ID.
-            if (!frame.ready)
-                return false;
+            if (!owner.receive(*this, frame, timeout)) return false;
+            if (frame.error) { terminal = true; std::rethrow_exception(frame.error); }
             terminal = frame.done;
             stats = frame.stats;
             if (frame.cancelled)
@@ -130,7 +131,7 @@ struct Server::Impl {
             pcm += speed->process(std::move(chunk), terminal);
             return true;
         }
-        void next(const std::function<bool()> &disconnected) {
+        template <class Disconnected> void next(const Disconnected &disconnected) {
             while (!poll(100, disconnected)) {
             }
         }
@@ -142,6 +143,53 @@ struct Server::Impl {
             return speech.format == "wav" ? "audio/wav" : "audio/pcm";
         }
     };
+
+    bool receive(Job &connection, GenerationFrame &frame, int timeout_ms) {
+        auto &queue = engine.output_queue();
+        std::unique_lock<std::mutex> queue_lock(queue.mutex);
+        auto take = [&] {
+            if (connection.pending.empty()) return false;
+            frame = std::move(connection.pending.front());
+            connection.pending.pop_front();
+            for (const auto &chunk : frame.chunks) connection.pending_bytes -= chunk.second.size() * sizeof(int16_t);
+            return true;
+        };
+        {
+            std::lock_guard<std::mutex> guard(ownership);
+            if (take()) return true;
+        }
+        if (queue.frames.empty() && !queue.closed && timeout_ms)
+            queue.available.wait_for(queue_lock, std::chrono::milliseconds(timeout_ms));
+        std::vector<std::string> cancelled;
+        bool dispatched = !queue.frames.empty(), received = false;
+        {
+            std::lock_guard<std::mutex> guard(ownership);
+            while (!queue.frames.empty()) {
+                auto output = std::move(queue.frames.front());
+                queue.frames.pop_front();
+                size_t bytes = 0;
+                for (const auto &chunk : output.chunks) bytes += chunk.second.size() * sizeof(int16_t);
+                queue.bytes -= bytes;
+                auto found = connections.find(output.request_id);
+                if (found == connections.end() || found->second->output_failed) continue;
+                auto &target = *found->second;
+                if (bytes > config.stream_buffer_bytes - target.pending_bytes) {
+                    target.pending.clear(); target.pending_bytes = 0; target.output_failed = true;
+                    output.chunks.clear(); output.done = true;
+                    output.error = std::make_exception_ptr(std::runtime_error("HTTP audio consumer exceeded its buffer limit"));
+                    cancelled.push_back(output.request_id);
+                } else target.pending_bytes += bytes;
+                target.pending.push_back(std::move(output));
+            }
+            received = take();
+        }
+        const bool closed = queue.closed;
+        queue_lock.unlock();
+        if (dispatched) queue.available.notify_all();
+        for (const auto &id : cancelled) engine.cancel_request(id);
+        if (!received && closed) throw HttpError(503, "engine is shut down");
+        return received;
+    }
 
     explicit Impl(Engine &native_engine, const Config &settings)
         : engine(native_engine), config(settings), audio(engine.audio_format()) {
@@ -201,22 +249,6 @@ struct Server::Impl {
                                                        {"object", "model"},
                                                        {"created", 0},
                                                        {"owned_by", "local"}}})}});
-        http.Get(R"(/v1/audio/speech/([A-Za-z0-9._:-]+))",
-                 [this](const httplib::Request &request, httplib::Response &response) {
-                     Json result;
-                     {
-                         std::lock_guard<std::mutex> guard(ownership);
-                         for (const auto &entry : outcomes)
-                             if (entry.first == request.matches[1].str()) {
-                                 result = entry.second;
-                                 break;
-                             }
-                     }
-                     if (result.is_null())
-                         json_reply(response, 404, error_json(404, "speech outcome not found"));
-                     else
-                         json_reply(response, 200, result);
-                 });
         for (const char *route : {"/v1/audio/speech", "/v1/audio/speech/batch"})
             http.Post(route, [this](const httplib::Request &request, httplib::Response &response) {
                 try {
@@ -284,8 +316,8 @@ struct Server::Impl {
         response.set_header("X-Samples-Per-Frame", std::to_string(audio.samples_per_frame));
     }
 
-    std::shared_ptr<Job> prepare(Json value, const std::string &uploaded,
-                                 const std::function<bool()> &disconnected) {
+    template <class Disconnected> std::shared_ptr<Job> prepare(Json value, const std::string &uploaded,
+                                 const Disconnected &disconnected) {
         auto specification = parse_speech(value, engine.default_options());
         auto model = text_field(value, "model", 1024, config.model_name);
         if (model != config.model_name)
@@ -299,19 +331,10 @@ struct Server::Impl {
         job->request.inputs.push_back(std::move(job->speech.input));
         return job;
     }
-    void start(Job &job, const std::function<bool()> &disconnected) {
+    template <class Disconnected> void start(Job &job, const Disconnected &disconnected) {
         job.check(disconnected);
         engine.add_request(job.request);
         job.submitted = true;
-    }
-    void record(const Job &job) {
-        Json outcome{{"request_id", job.request.request_id},
-                     {"finish_reason", finish_reason(job.stats)},
-                     {"usage", nullptr}};
-        std::lock_guard<std::mutex> guard(ownership);
-        outcomes.emplace_back(job.request.request_id, std::move(outcome));
-        if (outcomes.size() > 1024)
-            outcomes.pop_front();
     }
     void identity_headers(const httplib::Request &request, httplib::Response &response,
                           const std::string &id) const {
@@ -348,7 +371,6 @@ struct Server::Impl {
                             }
                             job->pcm.clear();
                             if (job->terminal) {
-                                record(*job);
                                 if (job->speech.sse &&
                                     !event({{"type", "speech.audio.done"},
                                             {"finish_reason", finish_reason(job->stats)},
@@ -483,7 +505,10 @@ void Server::bind() {
                                  std::to_string(impl_->config.port));
 }
 void Server::listen() {
-    impl_->engine.configure_serving(impl_->config.queue_limit, impl_->config.stream_buffer_bytes);
+    if (impl_->config.stream_buffer_bytes > SIZE_MAX / impl_->config.queue_limit)
+        throw std::invalid_argument("HTTP output capacity overflow");
+    impl_->engine.configure_serving(impl_->config.queue_limit,
+        impl_->config.stream_buffer_bytes * impl_->config.queue_limit);
     if (!impl_->http.listen_after_bind() && !impl_->stopping)
         throw std::runtime_error("HTTP listen failed");
 }

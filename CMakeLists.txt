@@ -40,7 +40,6 @@ add_library(tts SHARED
   src/execution/model_runner.cpp
   src/inputs/token_inputs.cpp
   src/engine/engine.cpp
-  src/engine/request_executor.cpp
   src/engine/request_scheduler.cpp
   src/io/audio_io.cpp
   src/io/audio_speed.cpp
@@ -88,7 +87,7 @@ if(TTS_BUILD_HOPPER_KERNELS)
   target_sources(tts PRIVATE $<TARGET_OBJECTS:tts_quant_hopper>)
 endif()
 target_include_directories(tts PUBLIC include PRIVATE src "${PROJECT_SOURCE_DIR}")
-target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_concurrentqueue tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(tts PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog_header_only tts_flash_attention tts_hf_tokenizer SndFile::sndfile soxr::soxr CUDA::cublas CUDA::cublasLt CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tts PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_source_files_properties(
   src/ops/kernels/tensor_kernels.cu

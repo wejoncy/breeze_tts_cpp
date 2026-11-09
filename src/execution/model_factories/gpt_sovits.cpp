@@ -27,6 +27,7 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
         *parts.parameters, loader.config(), read_json(loader.path("g2pw.json")), options.context);
     auto &model_instance = *model;
     parts.parameters->load();
+    model_instance.prepare_weights();
     parts.parameters->seal();
     parts.info = {"gpt_sovits_v5",
                   {model_instance.config.at("sample_rate"),
@@ -42,8 +43,7 @@ ModelComponents conditioned_model(DeviceContext &memory, const ModelLoader &load
     parts.defaults.max_frames = std::min(parts.info.max_output_frames, 2500);
     parts.defaults.sample_steps = model_instance.flow.sampling().steps;
     parts.defaults.cfg_rate = model_instance.flow.sampling().guidance;
-    parts.quantum_ms = 1000. / model_instance.config.at("semantic_rate").get<int>();
-    parts.planner = load_phoneme_inputs(loader, options.max_batch, options.context,
+    parts.inputs = std::make_unique<PhonemeInputs>(loader, options.max_batch, options.context,
                                         model_instance.semantic.type());
     parts.resources = std::make_unique<RunnerResources>(
         memory,

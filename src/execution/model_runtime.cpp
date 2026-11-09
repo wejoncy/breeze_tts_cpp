@@ -4,7 +4,6 @@
 #include "io/model_loader.h"
 #include "io/weights.h"
 #include "support/init_log.h"
-#include <cmath>
 
 namespace tts {
 struct ModelRuntime::Impl {
@@ -16,18 +15,19 @@ struct ModelRuntime::Impl {
         log::InitPhase phase("model construction and text frontend");
         parts = factory(gpu.memory, loader, options);
         const auto &info = parts.info;
-        if (!parts.network || !parts.planner || !parts.resources ||
+        if (!parts.network || !std::visit([](const auto &inputs) { return bool(inputs); }, parts.inputs) || !parts.resources ||
             info.model_type != loader.config().at("model_type").get<std::string>() ||
             info.audio.sample_rate < 1 || info.audio.samples_per_frame < 1 ||
-            info.max_output_frames < 1 || !std::isfinite(parts.quantum_ms) || parts.quantum_ms <= 0)
+            info.max_output_frames < 1)
             throw std::invalid_argument("invalid model execution description");
         phase.next("execution runner");
         parts.runner = std::make_unique<ModelRunner>(*parts.network, *parts.resources,
-            *parts.planner, parts.info, options.runtime_memory_bytes);
+            std::visit([](const auto &inputs) -> const InputDefinition & { return inputs->definition(); }, parts.inputs), parts.info, options.runtime_memory_bytes);
     }
     ~Impl() {
         cudaSetDevice(gpu.device);
         cudaStreamSynchronize(gpu.stream);
+        cudaStreamSynchronize(gpu.memory.copy_stream);
     }
 };
 ModelRuntime::ModelRuntime(const ModelLoader &loader, const ModelOptions &options,
@@ -36,14 +36,15 @@ ModelRuntime::ModelRuntime(const ModelLoader &loader, const ModelOptions &option
 ModelRuntime::~ModelRuntime() = default;
 const ModelInfo &ModelRuntime::info() const { return impl_->parts.info; }
 GenerationOptions ModelRuntime::default_options() const { return impl_->parts.defaults; }
-RequestPlanner &ModelRuntime::planner() { return *impl_->parts.planner; }
+ModelInputs ModelRuntime::take_inputs() { return std::move(impl_->parts.inputs); }
+PagedKVCache &ModelRuntime::kv_cache() { return impl_->parts.resources->kv; }
+RequestSlots &ModelRuntime::cache_slots() { return impl_->parts.resources->slots; }
 ModelRunner &ModelRuntime::runner() { return *impl_->parts.runner; }
-double ModelRuntime::scheduling_quantum_ms() const { return impl_->parts.quantum_ms; }
-std::function<void()> ModelRuntime::executor_initializer() {
-    return [this] { initialize_execution(impl_->gpu); };
-}
+DeviceContext &ModelRuntime::memory() { return impl_->gpu.memory; }
+void ModelRuntime::initialize_execution() { tts::initialize_execution(impl_->gpu); }
+void ModelRuntime::drain() { impl_->gpu.memory.sync(); }
 MemoryStats ModelRuntime::memory_stats() const {
-    impl_->gpu.memory.sync();
+    // Engine has observed a stream event before requesting this snapshot.
     return impl_->gpu.memory.stats();
 }
 } // namespace tts

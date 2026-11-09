@@ -29,6 +29,7 @@ class Model final : public tts::Model {
     const float mel_minimum, mel_maximum;
     Model(Weights &parameters, const Json &configuration, const Json &pronunciation_configuration,
            int context);
+    void prepare_weights() const;
     void forward(std::string_view program, TensorInputs inputs, TensorOutputs outputs,
                   ForwardContext &context) const override;
 };

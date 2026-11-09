@@ -1,4 +1,9 @@
 #pragma once
+#include "inputs/token_inputs.h"
+#if TTS_ENABLE_GPT_SOVITS
+#include "inputs/phoneme_inputs.h"
+#endif
+#include <variant>
 #include "execution/model_runner.h"
 #include "tts/memory_stats.h"
 #include "tts/quantization.h"
@@ -15,15 +20,20 @@ class DeviceContext;
 class ModelLoader;
 class Weights;
 struct RunnerResources;
+// A finite set of concrete CPU frontends; no orchestration interface or callbacks.
+using ModelInputs = std::variant<std::unique_ptr<TokenInputs>
+#if TTS_ENABLE_GPT_SOVITS
+    , std::unique_ptr<PhonemeInputs>
+#endif
+>;
 struct ModelComponents {
     ModelInfo info;
     std::unique_ptr<Weights> parameters;
     std::unique_ptr<Model> network;
-    std::unique_ptr<RequestPlanner> planner;
+    ModelInputs inputs;
     std::unique_ptr<RunnerResources> resources;
     std::unique_ptr<ModelRunner> runner;
     GenerationOptions defaults;
-    double quantum_ms = 0;
 };
 using ModelFactory = ModelComponents (*)(DeviceContext &, const ModelLoader &, const ModelOptions &);
 
@@ -36,11 +46,14 @@ class ModelRuntime {
     ~ModelRuntime();
     const ModelInfo &info() const;
     GenerationOptions default_options() const;
-    RequestPlanner &planner();
+    ModelInputs take_inputs();
+    PagedKVCache &kv_cache();
+    RequestSlots &cache_slots();
     ModelRunner &runner();
+    DeviceContext &memory();
     MemoryStats memory_stats() const;
-    double scheduling_quantum_ms() const;
-    std::function<void()> executor_initializer();
+    void initialize_execution();
+    void drain();
 };
 std::unique_ptr<ModelRuntime> load_model(const std::string &directory, const ModelOptions &);
 } // namespace tts

@@ -3,7 +3,7 @@
 #include <numeric>
 
 namespace tts {
-// Executor-owned fixed slot IDs. A lease holds stable init-time state storage;
+// Scheduler-reserved fixed slot IDs. A lease holds stable init-time state storage;
 // moving a request in a batch only changes metadata, never its slot or contents.
 class RequestSlots {
     std::vector<size_t> free_;
@@ -22,6 +22,7 @@ class RequestSlots {
         friend class RequestSlots;
         Lease(RequestSlots &owner, size_t i) : pool(owner), index(i) {}
     };
+    size_t available() const { return free_.size(); }
     std::unique_ptr<Lease> acquire() {
         if (free_.empty())
             throw RequestOverloaded("request state capacity exhausted");

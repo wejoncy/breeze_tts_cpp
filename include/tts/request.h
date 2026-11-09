@@ -2,12 +2,13 @@
 #include <cstdint>
 #include <utility>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
+#include <functional>
+#include <exception>
 namespace tts {
 struct RequestOverloaded : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -105,7 +106,10 @@ struct GenerationFrame {
     std::vector<std::pair<int, std::vector<int16_t>>> chunks;
     Stats stats;
     int batch_size = 0;
-    bool ready = true, done = false, cancelled = false;
+    std::exception_ptr error;
+    bool done = false, cancelled = false;
 };
+// Synchronous public C++ adapter: the caller invokes this sink on its own
+// thread. Kept for API/ABI compatibility; it never enters an engine message.
 using AudioCallback = std::function<bool(int, const int16_t *, size_t)>;
 } // namespace tts

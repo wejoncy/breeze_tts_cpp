@@ -1,14 +1,13 @@
 #pragma once
 #include "core/forward_context.h"
 #include "core/sequence_builder.h"
-#include "ops/storage.h"
 
 namespace tts {
 inline TensorView upload_metadata(ForwardContext &context, const void *source,
                                    TensorShape shape, Type type) {
     auto result = context.tensor(shape, type);
     if (context.mode == ForwardContext::Execute && result.size())
-        ops::upload_bytes(result, source, result.size());
+        result.copy_({const_cast<void *>(source), shape.rows, shape.cols, type}, true);
     return result;
 }
 inline SequenceLayout upload_sequence(ForwardContext &context, const SequenceBuilder &builder) {

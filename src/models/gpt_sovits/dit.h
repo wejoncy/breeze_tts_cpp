@@ -25,6 +25,7 @@ class DiT {
     std::vector<Block> blocks_;
     std::vector<Convolution> position_convs_;
     TensorView text_positions_, rotary_;
+    TensorView time_encoded_;
     Tensor final_time_modulation_;
     std::map<int, int> sampling_offsets_;
     Linear::Workspace::Capacity quantization_capacity_;
@@ -39,6 +40,7 @@ class DiT {
         TensorView mel_rows, retained_feature_rows;
     };
     DiT(Weights &, const std::string &prefix, const Json &, int max_time);
+    void prepare_weights() const;
     Type type() const {
         return type_;
     }

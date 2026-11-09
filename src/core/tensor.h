@@ -91,6 +91,9 @@ struct TensorView : TensorShape {
     template <typename T> T *ptr() const {
         return static_cast<T *>(data);
     }
+    // Explicit transfer into existing storage; the owner retains both views
+    // until completion when non_blocking is true.
+    const TensorView &copy_(TensorView source, bool non_blocking = false) const;
 
   private:
     void validate_layout() const {

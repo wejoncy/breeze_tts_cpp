@@ -34,6 +34,10 @@ Model::Model(Weights &weights, const Json &configuration,
         !std::isfinite(mel_maximum) || vocoder.samples(1) != config.at("samples_per_frame"))
         throw std::invalid_argument("inconsistent GPT-SoVITS synthesis configuration");
 }
+void Model::prepare_weights() const {
+    acoustic.prepare_weights();
+    flow.prepare_weights();
+}
 TensorView Model::text_features(TensorInputs inputs, ForwardContext &context) const {
     if (!inputs["input_ids"].numel()) return TensorView::metadata(0, semantic.hidden(), semantic.type());
     auto text_context = context;

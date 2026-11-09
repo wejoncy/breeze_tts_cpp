@@ -197,13 +197,4 @@ TextInput TextFrontend::Preparation::collect() {
     }
     return result;
 }
-TextInput TextFrontend::prepare(const std::string &input,
-                            const PreparationExecutor &execute, const std::string &language) const {
-    auto preparation = begin(input, language);
-    while (auto task = preparation->next()) {
-        if (!execute) throw std::logic_error("pronunciation requires the model executor");
-        preparation->accept(execute(std::move(task)));
-    }
-    return preparation->finish();
-}
 } // namespace tts::text

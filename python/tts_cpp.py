@@ -14,6 +14,22 @@ from tts_logging import check_not_in_callback, configure_logging  # noqa: F401 -
 QUANTIZATIONS = ("int8", "fp8", "group_int8", "group_fp8")
 
 
+class _OutputQueue:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def get(self, timeout=None):
+        """Pop the next result, regardless of request ID."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative or None")
+        frame = dict(self.owner._module.pop_output(
+            self.owner._native_handle(), -1 if timeout is None else int(timeout * 1000)))
+        if not frame:
+            raise TimeoutError
+        frame["chunks"] = [(int(c["index"]), bytes(c["pcm"])) for c in frame["chunks"]]
+        return frame
+
+
 class Reference:
     def __init__(self, module, handle):
         self._module, self._handle = module, handle
@@ -240,19 +256,10 @@ class Engine:
         )
         self._module.add_request(handle, request_id, native, options)
 
-    def read_result(self, request_id, timeout=None):
-        """Read by ID; terminal output/errors consume it."""
-        check_not_in_callback()
-        if timeout is not None and timeout < 0:
-            raise ValueError("timeout must be nonnegative or None")
-        handle = self._native_handle()
-        frame = dict(
-            self._module.read_result(
-                handle, request_id, -1 if timeout is None else int(timeout * 1000)
-            )
-        )
-        frame["chunks"] = [(int(c["index"]), bytes(c["pcm"])) for c in frame["chunks"]]
-        return frame
+    @property
+    def output_queue(self):
+        """The shared native audio queue; one application owns its consumption."""
+        return _OutputQueue(self)
 
     def cancel_request(self, request_id):
         """Post cancellation and return immediately; unknown IDs are ignored."""
@@ -264,29 +271,49 @@ class Engine:
         output = deliver or (lambda i, pcm: buffers[i].extend(pcm))
         request_id = uuid.uuid4().hex
         self.add_request(dict(request_id=request_id, inputs=requests, options=options))
+        cancelled = False
+        terminal = False
+        sink_error = None
         try:
             while True:
-                frame = self.read_result(request_id)
+                frame = self.output_queue.get()
+                if frame["request_id"] != request_id:
+                    raise RuntimeError("generate requires exclusive ownership of output_queue")
+                terminal = frame["done"]
+                if frame.get("error"):
+                    raise RuntimeError(frame["error"])
                 stats = {
                     k: v
                     for k, v in frame.items()
-                    if k not in ("request_id", "chunks", "ready", "done", "batch_size")
+                    if k not in ("request_id", "chunks", "done", "batch_size")
                 }
+                if cancelled:
+                    if terminal:
+                        stats["cancelled"] = True
+                        break
+                    continue
                 for index, pcm in frame["chunks"]:
                     self._callbacks.active = True
                     try:
                         keep = output(index, pcm) is not False
+                    except Exception as error:
+                        sink_error = error
+                        keep = False
                     finally:
                         self._callbacks.active = False
                     if not keep:
                         stats["cancelled"] = True
-                        return (
-                            stats if deliver else ([bytes(b) for b in buffers], stats)
-                        )
+                        cancelled = True
+                        if not terminal:
+                            self.cancel_request(request_id)
+                        break
                 if frame["done"]:
                     break
         finally:
-            self.cancel_request(request_id)
+            if not terminal:
+                self.cancel_request(request_id)
+        if sink_error is not None:
+            raise sink_error
         return stats if deliver else ([bytes(b) for b in buffers], stats)
 
     def warmup(self, batch=1, *, text="你好。", reference=None, **options):

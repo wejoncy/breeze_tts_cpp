@@ -36,26 +36,6 @@ Graph::~Graph() {
     if (graph)
         cudaGraphDestroy(graph);
 }
-void Graph::capture(cudaStream_t stream, const std::function<void()> &forward) {
-    if (executable)
-        throw std::logic_error("graph already captured");
-    if (graph) {
-        CUDA(cudaGraphDestroy(graph));
-        graph = nullptr;
-    }
-    CUDA(cudaStreamSynchronize(stream));
-    CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    try {
-        forward();
-    } catch (...) {
-        cudaStreamEndCapture(stream, &graph);
-        throw;
-    }
-    CUDA(cudaStreamEndCapture(stream, &graph));
-    CUDA(cudaGraphInstantiate(&executable, graph, 0));
-    CUDA(cudaGraphUpload(executable, stream));
-    CUDA(cudaStreamSynchronize(stream));
-}
 void Graph::run(cudaStream_t stream) const {
     CUDA(cudaGraphLaunch(executable, stream));
 }
@@ -126,18 +106,18 @@ struct CUDAGraphRunner::Impl {
             throw std::invalid_argument("invalid CUDA graph program/shape");
         programs_[nullptr][name].try_emplace(Shape(shape));
     }
-    void capture(const char *name, const std::function<void(const Shape &)> &forward) {
+    std::vector<Shape> capture_shapes(const char *name) {
         initializing();
-        if (!name || !*name)
-            throw std::invalid_argument("invalid CUDA graph program");
-        if (!program(nullptr, name))
+        if (!name || !*name || !program(nullptr, name))
             throw std::invalid_argument("CUDA graph program was not registered");
-        auto &family = programs_.at(nullptr).at(name);
-        GraphCaptureProgress progress(name, family.size());
-        for (auto it = family.rbegin(); it != family.rend(); ++it) {
-            it->second.graph.capture(stream_, [&] { forward(it->first); });
-            progress.advance();
-        }
+        std::vector<Shape> shapes;
+        const auto &family = programs_.at(nullptr).at(name);
+        for (auto it = family.rbegin(); it != family.rend(); ++it) shapes.push_back(it->first);
+        return shapes;
+    }
+    Graph &capture_target(const char *name, const Shape &shape) {
+        initializing();
+        return programs_.at(nullptr).at(name).at(shape).graph;
     }
     void seal() {
         for (const auto &owner : programs_)
@@ -181,7 +161,7 @@ struct CUDAGraphRunner::Impl {
         return false;
     }
 };
-CUDAGraphRunner::CUDAGraphRunner(cudaStream_t stream) : impl_(std::make_unique<Impl>(stream)) {}
+CUDAGraphRunner::CUDAGraphRunner(cudaStream_t stream) : impl_(std::make_unique<Impl>(stream)), stream_(stream) {}
 CUDAGraphRunner::~CUDAGraphRunner() = default;
 bool CUDAGraphRunner::sealed() const {
     return impl_->sealed();
@@ -192,8 +172,11 @@ void CUDAGraphRunner::clear() {
 void CUDAGraphRunner::register_shape(const char *name, std::initializer_list<int> shape) {
     impl_->register_shape(name, shape);
 }
-void CUDAGraphRunner::capture(const char *name, const std::function<void(const Shape &)> &forward) {
-    impl_->capture(name, forward);
+std::vector<CUDAGraphRunner::Shape> CUDAGraphRunner::capture_shapes(const char *name) {
+    return impl_->capture_shapes(name);
+}
+Graph &CUDAGraphRunner::capture_target(const char *name, const Shape &shape) {
+    return impl_->capture_target(name, shape);
 }
 void CUDAGraphRunner::seal() {
     impl_->seal();

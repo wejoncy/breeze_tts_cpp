@@ -32,7 +32,36 @@ BufferAllocator &allocator_for(Device device) {
     if (active_allocator && active_allocator->device_ordinal() == device.index()) return *active_allocator;
     return execution_context(device.index()).memory;
 }
+void copy_tensor(TensorView source, TensorView destination, bool non_blocking,
+                 DeviceContext *context = nullptr) {
+    if (source.type != destination.type || source.rows != destination.rows || source.cols != destination.cols)
+        throw std::invalid_argument("tensor copy requires matching shape and dtype");
+    if (!source.size()) return;
+    if (!source.data || !destination.data) throw std::invalid_argument("tensor copy has no storage");
+    if (source.data == destination.data && source.device == destination.device && source.ld() == destination.ld()) return;
+    if (source.device == destination.device && source.overlaps(destination))
+        throw std::invalid_argument("overlapping tensor copy requires an explicit clone");
+    if (source.device < 0 && destination.device < 0) {
+        for (int row = 0; row < source.rows; ++row)
+            std::memcpy(destination.ptr<char>() + size_t(row) * destination.ld() * bytes(destination.type),
+                        source.ptr<char>() + size_t(row) * source.ld() * bytes(source.type),
+                        size_t(source.cols) * bytes(source.type));
+        return;
+    }
+    const int ordinal = source.device >= 0 ? source.device : destination.device;
+    if (!context) context = dynamic_cast<DeviceContext *>(active_allocator);
+    if (!context || context->device != ordinal) context = &execution_context(ordinal).memory;
+    // Borrowed serving readbacks have an explicit owner until Sampler's ready
+    // event. Owned Tensor transfers below stay on the compute stream.
+    const bool readback = non_blocking && source.device >= 0 && destination.device < 0;
+    context->copy(source, destination, non_blocking, readback);
+}
 } // namespace
+
+const TensorView &TensorView::copy_(TensorView source, bool non_blocking) const {
+    copy_tensor(source, *this, non_blocking);
+    return *this;
+}
 
 Tensor::Storage::Storage(size_t bytes, BufferAllocator &allocator)
     : size_(bytes), allocator_(&allocator), owner_(allocator.lifetime()), device_(allocator.device_ordinal()) {
@@ -62,6 +91,11 @@ TensorView Tensor::Storage::view(int rows, int columns, Type dtype, size_t offse
     if (data_) result.data = static_cast<char *>(data_) + offset;
     return result;
 }
+Tensor::Storage &Tensor::Storage::copy_(TensorView source, bool non_blocking) {
+    copy_tensor(source, view(source.rows, source.cols, source.type), non_blocking,
+                dynamic_cast<DeviceContext *>(Tensor::resource(*this)));
+    return *this;
+}
 Tensor::Scope::Scope() {
     scratch_ = dynamic_cast<ScratchAllocator *>(&current_allocator());
     if (scratch_) position_ = scratch_->position();
@@ -82,12 +116,6 @@ TensorView Tensor::scratch(TensorShape shape, Type dtype) {
     return result;
 }
 void Tensor::reserve(size_t bytes) { current_allocator().allocate(bytes); }
-size_t Tensor::plan(const std::function<void()> &function) {
-    WorkspacePlan planning;
-    Scope scope(planning);
-    function();
-    return planning.size;
-}
 BufferAllocator *Tensor::resource(const Storage &storage) {
     return storage.owner_ ? storage.owner_.get() : storage.allocator_;
 }

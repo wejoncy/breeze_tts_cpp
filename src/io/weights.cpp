@@ -56,7 +56,8 @@ void Weights::copy_sources(TensorView destination, const std::vector<std::string
     for (const auto &name : parts) {
         const auto &source = files_.get(name);
         const int count = checkpoint_shape(source).rows;
-        ops::upload_bytes(destination.slice(row, count), source.data, source.size);
+        destination.slice(row, count).copy_(
+            {const_cast<void *>(source.data), count, destination.cols, source.type});
         row += count;
     }
 }
@@ -67,25 +68,35 @@ void Weights::load() {
     TTS_LOG(TTS_LOG_INFO, "engine.init",
             "loading weights={:.0f} MiB quantization={}", size() / (1024.0 * 1024.0),
             quantization_name(quantization_));
-    for (const auto &upload : uploads_)
-        upload();
-    phase.next("weight postprocessing and upload completion");
-    for (const auto &process : postprocess_)
-        process();
-    ops::synchronize(device_.index());
-    uploads_.clear();
-    postprocess_.clear();
+    for (const auto &upload : uploads_) {
+        switch (upload.kind) {
+        case Upload::Kind::Copy: copy_sources(upload.destination, upload.sources); break;
+        case Upload::Kind::Packed:
+            if (upload.packed.size() != upload.destination.size())
+                throw std::invalid_argument("packed weight size does not match tensor storage");
+            upload.destination.copy_({const_cast<char *>(upload.packed.data()),
+                upload.destination.rows, upload.destination.cols, upload.destination.type});
+            break;
+        case Upload::Kind::Quantize: {
+            const auto shape = joined_shape(upload.sources);
+            Tensor source(shape, shape.type, device_);
+            copy_sources(source.view(), upload.sources);
+            ops::quantize_rows(source.view(), upload.quantized);
+            ops::synchronize(device_.index());
+            break;
+        }
+        }
+    }
     phase_ = Phase::Loaded;
-}
-void Weights::after_loading(std::function<void()> process) {
-    require_registration();
-    postprocess_.push_back(std::move(process));
 }
 void Weights::seal() {
     require_loading();
     if (phase_ != Phase::Loaded)
         throw std::logic_error("model weights have not been loaded");
-    // load() has synchronized every upload and load-time transform.
+    // The model factory has submitted derived projections after load(). Keep
+    // checkpoint mappings and packed CPU uploads alive through their completion.
+    ops::synchronize(device_.index());
+    uploads_.clear();
     files_ = SafeTensors{};
     phase_ = Phase::Sealed;
 }
@@ -109,7 +120,7 @@ TensorView Weights::get(const std::string &name) {
     require_registration();
     const auto &source = files_.get(name);
     auto view = allocate(name, checkpoint_shape(source), source.type);
-    uploads_.push_back([this, view, name] { copy_sources(view, {name}); });
+    uploads_.push_back({Upload::Kind::Copy, view, {name}});
     return view;
 }
 TensorView Weights::optional(const std::string &name) {
@@ -138,13 +149,7 @@ RowScaledView Weights::quantized(const std::string &name, const std::vector<std:
                                   Type::F32),
                          layout.weight, layout.rotation};
     result.validate();
-    uploads_.push_back([this, parts, shape, result] {
-        Tensor source(shape, shape.type, device_);
-        copy_sources(source.view(), parts);
-        ops::quantize_rows(source.view(), result);
-        ops::synchronize(
-            device_.index()); // Reuse a single matrix's 16-bit source capacity during loading.
-    });
+    uploads_.push_back({Upload::Kind::Quantize, {}, parts, result});
     return result;
 }
 const SafeTensors::Entry &Weights::entry(const std::string &name) const {
@@ -160,7 +165,7 @@ TensorView Weights::fused(const std::string &name, const std::vector<std::string
     require_unique(name);
     const auto shape = joined_shape(parts);
     auto view = allocate(name, shape, shape.type);
-    uploads_.push_back([this, parts, view] { copy_sources(view, parts); });
+    uploads_.push_back({Upload::Kind::Copy, view, parts});
     return view;
 }
 TensorView Weights::custom(const std::string &name, const void *data, int rows, int cols,
@@ -171,9 +176,7 @@ TensorView Weights::custom(const std::string &name, const void *data, int rows, 
     auto view = allocate(name, {rows, cols}, type);
     std::vector<char> packed(view.size());
     std::memcpy(packed.data(), data, packed.size());
-    uploads_.push_back([this, view, packed = std::move(packed)] {
-        ops::upload_bytes(view, packed.data(), packed.size());
-    });
+    uploads_.push_back({Upload::Kind::Packed, view, {}, {}, std::move(packed)});
     return view;
 }
 TensorView Weights::matrix_columns(const std::string &name, const std::string &source, int first,

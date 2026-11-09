@@ -34,6 +34,7 @@ class Flow {
             !std::isfinite(guidance_))
             throw std::invalid_argument("invalid flow temperature/guidance");
     }
+    void prepare_weights() const { estimator_.prepare_weights(); }
     TensorBatch forward(const TensorBatch &features, TensorInputs, ForwardContext &) const;
   private:
     void update(TensorView noise, TensorView velocity, TensorView prefixes, int time,

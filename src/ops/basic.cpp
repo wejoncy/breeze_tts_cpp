@@ -65,16 +65,7 @@ void matmul(RowScaledView input, RowScaledView weight, TensorView output) {
     execution_context(output, {input.values, input.scales, weight.values, weight.scales})
         .quantization->linear(input, weight, output);
 }
-void upload_bytes(TensorView destination, const void *source, size_t bytes) {
-    if (!destination.dense() || bytes > destination.size() || (bytes && (!source || !destination.data)))
-        throw std::invalid_argument("upload exceeds dense tensor storage");
-    if (destination.device < 0) { if (bytes) std::memcpy(destination.data, source, bytes); }
-    else execution_context(destination).memory.upload(destination.data, source, bytes);
-}
 void synchronize(int device) { if (device >= 0) execution_context(device).memory.sync(); }
-void download_bytes(TensorView source, void *destination, size_t bytes) {
-    execution_context(source).memory.download(destination, source.data, bytes);
-}
 void quantize_rows(TensorView input, RowScaledView output) {
     output.validate();
     if ((input.type != Type::BF16 && input.type != Type::F16) ||

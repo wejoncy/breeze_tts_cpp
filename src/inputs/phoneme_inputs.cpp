@@ -18,7 +18,8 @@ struct PhonemeReference final : ReferenceFeatures {
     int frames = 0;
 };
 struct PhonemeReferencePlan final : ReferencePlan { text::TextInput text; };
-class PhonemeInputs final : public RequestPlanner {
+} // namespace
+struct PhonemeInputs::Impl {
     Json config_;
     text::TextFrontend frontend_;
     int context_, output_rate_, reference_rate_, speech_rate_, reference_frames_, hidden_;
@@ -32,7 +33,7 @@ class PhonemeInputs final : public RequestPlanner {
                             const GenerationOptions &, size_t index) const;
 
   public:
-    PhonemeInputs(const ModelLoader &loader, int batch, int context, Type type)
+    Impl(const ModelLoader &loader, int batch, int context, Type type)
         : config_(loader.config()), frontend_(loader.path(""), config_.at("bert").at("max_position_embeddings")),
           context_(context), output_rate_(config_.at("sample_rate")),
           reference_rate_(config_.at("reference").at("sampling_rate")),
@@ -114,13 +115,16 @@ class PhonemeInputs final : public RequestPlanner {
         definition_.programs.push_back({"reference", std::move(reference),
             {"codes", "style", "mel", "features", "waveform_condition", "reference_bert"}});
     }
-    const InputDefinition &definition() const override { return definition_; }
-    std::unique_ptr<RequestPreparation> begin(const std::vector<Input> &, const GenerationOptions &) const override;
-    std::unique_ptr<ReferencePlan> prepare_reference(const std::vector<float> &, std::string,
-        const PreparationExecutor &, const std::string &) const override;
-    std::shared_ptr<const Reference> finish_reference(ReferencePlan &, HostResults) const override;
+    const InputDefinition &definition() const { return definition_; }
+    std::unique_ptr<RequestPreparation> begin(const std::vector<Input> &, const GenerationOptions &) const;
+    class ReferencePreparation;
+    std::unique_ptr<tts::ReferencePreparation> begin_reference(const std::vector<float> &, std::string,
+        const std::string &) const;
+    std::unique_ptr<ReferencePlan> reference_plan(const std::vector<float> &, std::string,
+                                                text::TextInput) const;
+    std::shared_ptr<const Reference> finish_reference(ReferencePlan &, HostResults) const;
 };
-InputBatch PhonemeInputs::fields(const text::TextInput &text, const PhonemeReference &reference) const {
+InputBatch PhonemeInputs::Impl::fields(const text::TextInput &text, const PhonemeReference &reference) const {
     InputBatch input;
     auto upload = [&](const char *name, const std::vector<int> &values, int columns = 1) {
         input.uploads.push_back({name, own_integers(input, values, columns)});
@@ -163,7 +167,7 @@ InputBatch PhonemeInputs::fields(const text::TextInput &text, const PhonemeRefer
     input.limits = {1, prompt, row_capacity(prompt)};
     return input;
 }
-GenerationInput PhonemeInputs::encode(const Input &request, std::vector<text::TextInput> texts,
+GenerationInput PhonemeInputs::Impl::encode(const Input &request, std::vector<text::TextInput> texts,
     std::shared_ptr<const PhonemeReference> reference, const GenerationOptions &options, size_t index) const {
     GenerationInput result;
     result.rate = rate_;
@@ -212,8 +216,8 @@ GenerationInput PhonemeInputs::encode(const Input &request, std::vector<text::Te
     }
     return result;
 }
-class PhonemeInputs::Preparation final : public RequestPreparation {
-    const PhonemeInputs &owner_;
+class PhonemeInputs::Impl::Preparation final : public RequestPreparation {
+    const Impl &owner_;
     std::vector<Input> requests_;
     std::unique_ptr<RequestPlan> plan_ = std::make_unique<RequestPlan>();
     std::unique_ptr<text::TextFrontend::Preparation> pending_;
@@ -222,7 +226,7 @@ class PhonemeInputs::Preparation final : public RequestPreparation {
     std::vector<text::TextInput> texts_;
     size_t input_ = 0, segment_ = 0;
   public:
-    Preparation(const PhonemeInputs &owner, const std::vector<Input> &requests, GenerationOptions options)
+    Preparation(const Impl &owner, const std::vector<Input> &requests, GenerationOptions options)
         : owner_(owner), requests_(requests) { plan_->options = options; }
     std::unique_ptr<PreparationTask> next() override {
         while (input_ < requests_.size()) {
@@ -242,19 +246,21 @@ class PhonemeInputs::Preparation final : public RequestPreparation {
             }
             if (auto task = pending_->next()) return task;
             texts_.push_back(pending_->finish()); pending_.reset();
-            if (++segment_ < segments_.size()) continue;
+            if (++segment_ < segments_.size()) return {};
             plan_->inputs.push_back(owner_.encode(request, std::move(texts_), reference_, plan_->options, input_));
             texts_.clear(); segments_.clear(); reference_.reset(); segment_ = 0; ++input_;
+            return {};
         }
         return {};
     }
     void accept(std::unique_ptr<PreparationTask> task) override { pending_->accept(std::move(task)); }
+    bool ready() const override { return input_ == requests_.size() && !pending_; }
     std::unique_ptr<RequestPlan> finish() override {
         if (input_ != requests_.size() || pending_) throw std::logic_error("input preparation is incomplete");
         return std::move(plan_);
     }
 };
-std::unique_ptr<RequestPreparation> PhonemeInputs::begin(const std::vector<Input> &requests,
+std::unique_ptr<RequestPreparation> PhonemeInputs::Impl::begin(const std::vector<Input> &requests,
                                                        const GenerationOptions &options) const {
     SequenceRate::validate_speed(options.speed_factor);
     if (requests.empty() || options.max_frames < 1 || options.max_frames > rate_.frames(context_) ||
@@ -268,15 +274,37 @@ std::unique_ptr<RequestPreparation> PhonemeInputs::begin(const std::vector<Input
     resolved.sample_steps = sampling.steps; resolved.cfg_rate = sampling.guidance;
     return std::make_unique<Preparation>(*this, requests, resolved);
 }
-std::unique_ptr<ReferencePlan> PhonemeInputs::prepare_reference(const std::vector<float> &mono,
-    std::string transcript, const PreparationExecutor &execute, const std::string &language) const {
+class PhonemeInputs::Impl::ReferencePreparation final : public tts::ReferencePreparation {
+    const Impl &owner_;
+    std::vector<float> mono_;
+    std::string transcript_;
+    std::unique_ptr<text::TextFrontend::Preparation> text_;
+  public:
+    ReferencePreparation(const Impl &owner, std::vector<float> mono,
+                         std::string transcript, const std::string &language)
+        : owner_(owner), mono_(std::move(mono)), transcript_(std::move(transcript)),
+          text_(owner_.frontend_.begin(transcript_, language)) {}
+    std::unique_ptr<PreparationTask> next() override { return text_->next(); }
+    void accept(std::unique_ptr<PreparationTask> task) override { text_->accept(std::move(task)); }
+    std::unique_ptr<ReferencePlan> finish() override {
+        return owner_.reference_plan(mono_, std::move(transcript_), text_->finish());
+    }
+};
+std::unique_ptr<tts::ReferencePreparation> PhonemeInputs::Impl::begin_reference(const std::vector<float> &mono,
+    std::string transcript, const std::string &language) const {
     const auto &settings = config_.at("reference");
     const float minimum = settings.at("min_seconds"), maximum = settings.at("max_seconds");
     if (mono.size() < size_t(minimum * output_rate_) || mono.size() > size_t(maximum * output_rate_) ||
         std::any_of(mono.begin(), mono.end(), [](float value) { return !std::isfinite(value); }))
         throw std::invalid_argument("reference duration or samples outside input limits");
+    return std::make_unique<ReferencePreparation>(*this, mono, std::move(transcript), language);
+}
+std::unique_ptr<ReferencePlan> PhonemeInputs::Impl::reference_plan(const std::vector<float> &mono,
+    std::string transcript, text::TextInput text) const {
+    const auto &settings = config_.at("reference");
+    const float maximum = settings.at("max_seconds");
     auto result = std::make_unique<PhonemeReferencePlan>();
-    result->text = frontend_.prepare(transcript, execute, language);
+    result->text = std::move(text);
     if (result->text.phones.size() > size_t(context_) || result->text.bert_ids.size() > size_t(context_))
         throw std::invalid_argument("reference transcript exceeds context");
     result->transcript = std::move(transcript); result->program = "reference";
@@ -299,7 +327,7 @@ std::unique_ptr<ReferencePlan> PhonemeInputs::prepare_reference(const std::vecto
     result->outputs = {"codes", "style", "mel", "features", "waveform_condition", "reference_bert"};
     return result;
 }
-std::shared_ptr<const Reference> PhonemeInputs::finish_reference(ReferencePlan &base, HostResults outputs) const {
+std::shared_ptr<const Reference> PhonemeInputs::Impl::finish_reference(ReferencePlan &base, HostResults outputs) const {
     auto &plan = dynamic_cast<PhonemeReferencePlan &>(base);
     auto result = std::make_shared<PhonemeReference>();
     result->text = std::move(plan.text); result->type = type_;
@@ -311,8 +339,19 @@ std::shared_ptr<const Reference> PhonemeInputs::finish_reference(ReferencePlan &
     result->tensors = std::move(outputs);
     return std::make_shared<const Reference>(std::move(plan.transcript), std::move(result));
 }
-} // namespace
-std::unique_ptr<RequestPlanner> load_phoneme_inputs(const ModelLoader &loader, int batch, int context, Type type) {
-    return std::make_unique<PhonemeInputs>(loader, batch, context, type);
+PhonemeInputs::PhonemeInputs(const ModelLoader &loader, int batch, int context, Type type)
+    : impl_(std::make_unique<Impl>(loader, batch, context, type)) {}
+PhonemeInputs::~PhonemeInputs() = default;
+const InputDefinition &PhonemeInputs::definition() const { return impl_->definition(); }
+std::unique_ptr<RequestPreparation> PhonemeInputs::begin(const std::vector<Input> &inputs,
+                                                       const GenerationOptions &options) const {
+    return impl_->begin(inputs, options);
+}
+std::unique_ptr<ReferencePreparation> PhonemeInputs::begin_reference(const std::vector<float> &mono,
+    std::string transcript, const std::string &language) const {
+    return impl_->begin_reference(mono, std::move(transcript), language);
+}
+std::shared_ptr<const Reference> PhonemeInputs::finish_reference(ReferencePlan &plan, HostResults outputs) const {
+    return impl_->finish_reference(plan, std::move(outputs));
 }
 } // namespace tts

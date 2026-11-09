@@ -1,7 +1,7 @@
 #pragma once
 #include "runtime/execution_resources.h"
 #include "runtime/graph_shapes.h"
-#include "runtime/request_admission.h"
+#include "runtime/kv_cache.h"
 #include "runtime/request_slots.h"
 #include "runtime/state_pool.h"
 
@@ -16,7 +16,6 @@ struct RunnerResources {
     DeviceContext &memory;
     const int batch, context;
     PagedKVCache kv;
-    RequestAdmissionPool admissions;
     RequestSlots slots;
     StatePool states;
     GraphShapes shapes;
@@ -26,7 +25,7 @@ struct RunnerResources {
         : memory(device), batch(batch_capacity), context(context_capacity),
           kv(device, cache.layers, cache.channels, cache.type,
              batch_capacity * cache.sequences_per_input, context_capacity, page_tokens),
-          admissions(device, kv, batch_capacity), slots(batch_capacity), states(device), shapes(batch_capacity),
+          slots(batch_capacity), states(device), shapes(batch_capacity),
           execution(device) {}
 };
 } // namespace tts
