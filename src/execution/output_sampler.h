@@ -3,7 +3,6 @@
 #include "core/alignment.h"
 #include "runtime/device.h"
 #include "ops/cuda/cuda_check.h"
-#include "support/profiler.h"
 #include <cuda_runtime.h>
 
 namespace tts {
@@ -36,7 +35,6 @@ class OutputSampler {
     }
     OutputSampler(const OutputSampler &) = delete;
     void sample(const ForwardOutputs &outputs) {
-        Range trace("tts.sample.enqueue");
         if (pending_) throw std::logic_error("sample output is still in flight");
         sampled_.values.clear();
         recorded_ = false;
@@ -75,7 +73,6 @@ class OutputSampler {
     // Views remain valid until the next sample. Engine must commit them before
     // allowing the runner to retire the corresponding output-name storage.
     const SampledOutputs &collect() {
-        Range trace("tts.sample.collect");
         if (!pending_ || !ready()) throw std::logic_error("sample output is not ready");
         memory_.complete_transfers(transfer_checkpoint_);
         pending_ = false;

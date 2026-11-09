@@ -18,7 +18,7 @@ add_executable(tts_server src/server/main.cpp src/server/server.cpp
 set_target_properties(tts_server PROPERTIES OUTPUT_NAME tts-server)
 target_compile_definitions(tts_server PRIVATE TTS_ENTRY_POINT=run_server)
 target_include_directories(tts_server PRIVATE src)
-target_link_libraries(tts_server PRIVATE tts httplib::httplib CUDA::nvtx3
+target_link_libraries(tts_server PRIVATE tts httplib::httplib
   nlohmann_json::nlohmann_json spdlog::spdlog_header_only Threads::Threads)
 add_subdirectory(examples/web)
 tts_deploy_runtime(tts_server)

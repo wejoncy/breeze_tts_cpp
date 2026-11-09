@@ -6,7 +6,6 @@
 #include "ops/sampling.h"
 #include "ops/attention.h"
 #include "core/input_fields.h"
-#include "support/profiler.h"
 #include "support/init_log.h"
 #include "support/log.h"
 #include "runtime/memory_log.h"
@@ -888,7 +887,6 @@ bool ModelRunner::submit_next(const ExecutionBatch &batch) {
         auto found = i.states.find(row.id);
         if (row.create || (found != i.states.end() && !i.framewise(*found->second.value))) return false;
     }
-    Range trace("tts.runner.submit_next");
     i.submitted_frame = i.launch_frame(batch, &i.frame);
     return has_submitted();
 }
@@ -1205,7 +1203,6 @@ std::shared_ptr<ModelRunner::Cache> ModelRunner::prepare(RequestPlan &plan, cons
     return state;
 }
 ForwardOutputs ModelRunner::prefill_forward(const std::vector<Cache *> &requests) {
-    Range trace("tts.runner.prefill");
     auto &implementation = *impl_;
     std::vector<Impl::Cache *> rows;
     std::vector<const InputBatch *> sources;
@@ -1247,7 +1244,6 @@ ForwardOutputs ModelRunner::prefill_forward(const std::vector<Cache *> &requests
     return {{{"done", implementation.done.view(int(implementation.input_rows.size()), 1, Type::I32)}}};
 }
 ForwardOutputs ModelRunner::decode_forward() {
-    Range trace("tts.runner.decode");
     auto &implementation = *impl_;
     auto &rows = implementation.step_rows;
     auto &decode = implementation.decode_rows;

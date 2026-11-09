@@ -13,7 +13,6 @@
 #include <optional>
 #include <thread>
 #include "support/log.h"
-#include "support/profiler.h"
 #include <map>
 namespace tts {
 constexpr double bytes_per_mib = 1024.0 * 1024.0;
@@ -217,9 +216,7 @@ struct Engine::Impl {
                 fail(job, std::make_exception_ptr(std::runtime_error("audio output queue exceeded its buffer limit")));
                 return;
             }
-            const auto tag = frame_trace_id(output.request_id, uint32_t(output.stats.frames));
             outgoing.frames.push_back(std::move(output));
-            if (bytes) mark("tts.output.enqueue", tag);
             outgoing.bytes += bytes;
         }
         outgoing.available.notify_all();
@@ -281,7 +278,6 @@ struct Engine::Impl {
         // Yield to queue events after each CPU plan, keeping the runner fed
         // while other requests wait for GPU conditioning.
         if (!cpu_preparations.empty()) {
-            Range trace("tts.engine.plan");
             auto job = cpu_preparations.front();
             cpu_preparations.pop_front();
             if (job->aborted()) { retire(job); return; }
@@ -341,7 +337,6 @@ struct Engine::Impl {
     }
     ExecutionBatch schedule() {
         if (stopping || execution_error) return {};
-        Range trace("tts.engine.dispatch");
         auto selected = scheduler->schedule();
         ExecutionBatch batch;
         batch.rows = std::move(selected.rows);
@@ -359,7 +354,6 @@ struct Engine::Impl {
         return batch;
     }
     void complete(Completion &result) {
-        Range trace("tts.engine.complete");
         if (stopping) return;
         if (result.fatal) {
             scheduler->clear();
@@ -470,7 +464,6 @@ struct Engine::Impl {
     }
     ForwardOutputs forward(ExecutionBatch batch) {
         generation_due = false;
-        Range trace("tts.engine.batch_forward");
         auto &runner = model->runner();
         if (!runner.has_submitted()) {
             // Cancellation can arrive after selection. Never start a new cache

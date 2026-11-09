@@ -1,6 +1,5 @@
 #include "engine/request_scheduler.h"
 #include "tts/request.h"
-#include "support/profiler.h"
 #include <deque>
 #include <optional>
 #include <unordered_map>
@@ -118,17 +117,13 @@ ScheduledBatch RequestScheduler::schedule() {
     // Eligible waiting rows are admitted above. Execute every pending prefill
     // before decode rows; a busy decoder never spends their prefill budget.
     batch.rows.reserve(i.running.size());
-    size_t prefills = 0;
     for (bool prefilled : {false, true}) {
         for (auto &entry : i.running) {
             if (entry.prefilled != prefilled) continue;
             batch.rows.push_back(entry.row);
-            if (!prefilled) ++prefills;
             entry.row.create = false;
         }
     }
-    mark("tts.scheduler.prefill_rows", prefills);
-    mark("tts.scheduler.decode_rows", batch.rows.size() - prefills);
     return batch;
 }
 void RequestScheduler::update(uint64_t id, bool done, bool prefilled) {

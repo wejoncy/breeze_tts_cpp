@@ -5,7 +5,6 @@
 #include "io/audio_io.h"
 #include "io/audio_speed.h"
 #include "support/log.h"
-#include "support/profiler.h"
 #include <httplib.h>
 #include <atomic>
 #include <chrono>
@@ -151,7 +150,6 @@ struct Server::Impl {
         auto take = [&] {
             if (connection.pending.empty()) return false;
             frame = std::move(connection.pending.front());
-            if (!frame.chunks.empty()) mark("tts.http.dequeue", frame_trace_id(frame.request_id, uint32_t(frame.stats.frames)));
             connection.pending.pop_front();
             for (const auto &chunk : frame.chunks) connection.pending_bytes -= chunk.second.size() * sizeof(int16_t);
             return true;
@@ -370,7 +368,6 @@ struct Server::Impl {
                                         : sink.write(job->pcm.data(), job->pcm.size());
                                 if (!written)
                                     return false;
-                                mark("tts.http.sent", frame_trace_id(job->request.request_id, uint32_t(job->stats.frames)));
                             }
                             job->pcm.clear();
                             if (job->terminal) {
