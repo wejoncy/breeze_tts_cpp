@@ -97,8 +97,7 @@ struct Server::Impl {
                 try {
                     owner.engine.cancel_request(request.request_id);
                 } catch (const std::exception &error) {
-                    TTS_LOG(TTS_LOG_WARN, "http", "cancel {}: {}", request.request_id,
-                            error.what());
+                    TTS_LOG(TTS_LOG_WARN, "http", "cancel failed: {}", error.what());
                 }
             }
             std::lock_guard<std::mutex> guard(owner.ownership);

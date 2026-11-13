@@ -5,7 +5,6 @@
 #endif
 #include <variant>
 #include "execution/model_runner.h"
-#include "tts/memory_stats.h"
 #include "tts/quantization.h"
 #include "tts/model_info.h"
 #include "core/model.h"
@@ -51,7 +50,6 @@ class ModelRuntime {
     RequestSlots &cache_slots();
     ModelRunner &runner();
     DeviceContext &memory();
-    MemoryStats memory_stats() const;
     void initialize_execution();
     void drain();
 };

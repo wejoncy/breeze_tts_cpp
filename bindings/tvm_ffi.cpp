@@ -139,51 +139,14 @@ std::vector<Input> requests_from(const ffi::Array<Values> &input) {
     return requests;
 }
 GenerationOptions snapshot_options(const Options *options) {
-    // Snapshot options before releasing control to Python callbacks.
+    // Copy caller-owned options before enqueueing the request.
     GenerationOptions snapshot = *options;
     snapshot.synthesis_mode = parse_synthesis_mode(options->synthesis_mode_name);
     snapshot.seed = static_cast<uint64_t>(options->seed_bits);
     return snapshot;
 }
-Values generate(EngineHandle *handle, ffi::Array<Values> input, const Options *options,
-                ffi::Function deliver) {
-    auto requests = requests_from(input);
-    auto snapshot = snapshot_options(options);
-    Stats stats;
-    int status = handle->get()->generate(
-        requests, snapshot,
-        [&](int lane, const int16_t *pcm, size_t count) {
-            return deliver(lane,
-                           ffi::Bytes(reinterpret_cast<const char *>(pcm), count * sizeof(*pcm)))
-                .cast<bool>();
-        },
-        stats);
-    return {{"prefill_ms", stats.prefill_ms}, {"first_audio_ms", stats.first_audio_ms},
-            {"total_ms", stats.total_ms},     {"audio_seconds", stats.audio_seconds},
-            {"frames", stats.frames},         {"truncated", stats.truncated},
-            {"cancelled", status == 1}};
-}
-
-// Native log configuration serializes emission/replacement. Keep the previous
-// callable alive until replacement completes, including in-flight callbacks.
-void configure_logging(std::string level, std::string file, bool json,
-                       ffi::Optional<ffi::Function> callback) {
-    log::check_not_callback();
-    static std::mutex mutex;
-    static std::unique_ptr<ffi::Function> current;
-    auto next = callback ? std::make_unique<ffi::Function>(*callback) : nullptr;
-    tts_log_config config{log::parse_level(level), file.empty() ? nullptr : file.c_str(), int(json),
-                          nullptr, next.get()};
-    if (next) {
-        config.callback = [](void *user, const tts_log_record *r) {
-            (*static_cast<ffi::Function *>(user))(int(r->level), r->timestamp_us, r->engine_id,
-                                                  r->request_id, ffi::String(r->component),
-                                                  ffi::String(r->message));
-        };
-    }
-    std::lock_guard<std::mutex> lock(mutex);
-    log::configure(config);
-    current = std::move(next);
+void configure_logging(std::string level, std::string file, bool json) {
+    log::configure({log::parse_level(level), file.empty() ? nullptr : file.c_str(), int(json)});
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create, create);
@@ -218,19 +181,9 @@ Values pop_output(EngineHandle *handle, int timeout_ms) {
         chunks.push_back({{"index", lane},
                           {"pcm", ffi::Bytes(reinterpret_cast<const char *>(pcm.data()),
                                              pcm.size() * sizeof(int16_t))}});
-    const auto &s = frame.stats;
-    return {{"request_id", frame.request_id},
-            {"chunks", chunks},
-            {"error", error},
-            {"batch_size", frame.batch_size},
-            {"done", frame.done},
-            {"cancelled", frame.cancelled},
-            {"prefill_ms", s.prefill_ms},
-            {"first_audio_ms", s.first_audio_ms},
-            {"total_ms", s.total_ms},
-            {"audio_seconds", s.audio_seconds},
-            {"frames", s.frames},
-            {"truncated", s.truncated}};
+    return {{"request_id", frame.request_id}, {"chunks", chunks}, {"error", error},
+            {"batch_size", frame.batch_size}, {"done", frame.done},
+            {"cancelled", frame.cancelled}, {"truncated", frame.stats.truncated}};
 }
 void cancel_request(EngineHandle *handle, std::string request_id) {
     handle->get()->cancel_request(request_id);
@@ -249,7 +202,6 @@ void run_async(EngineHandle *handle) {
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_async, run_async);
 void close(EngineHandle *handle) {
-    log::check_not_callback();
     handle->engine->shutdown();
 }
 std::string version() {
@@ -269,13 +221,6 @@ Values audio_format(const EngineHandle *handle) {
             {"codebook_size", f.codebook_size}};
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(audio_format, audio_format);
-Values memory_stats(const EngineHandle *handle) {
-    auto s = with_errors([&] { return handle->get()->memory_stats(); });
-    return {{"used_bytes", s.used_bytes},
-            {"reserved_bytes", s.reserved_bytes},
-            {"peak_used_bytes", s.peak_used_bytes},
-            {"peak_reserved_bytes", s.peak_reserved_bytes}};
-}
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare_reference, reference);
 ffi::Map<ffi::String, ffi::Any> model_info(EngineHandle *handle) {
     const auto &info = handle->get()->model_info();
@@ -303,10 +248,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(close, close);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(version, version);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(default_options, default_options);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_options, copy_options);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(memory_stats, memory_stats);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(reference_from_codes, reference_from_codes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(reference_codes, reference_codes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(reference_frames, reference_frames);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(generate, generate);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure_logging, configure_logging);
 } // namespace tts::python

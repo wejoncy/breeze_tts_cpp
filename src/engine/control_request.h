@@ -1,14 +1,13 @@
 #pragma once
 #include "tts/request.h"
-#include "tts/memory_stats.h"
 #include <variant>
 
 namespace tts {
-using ControlResult = std::variant<std::monostate, MemoryStats, std::shared_ptr<const Reference>,
+using ControlResult = std::variant<std::monostate, std::shared_ptr<const Reference>,
                                    std::vector<int>, std::vector<float>>;
 struct ControlRequest {
-    enum class Kind { Memory, Reference, Encode, Decode, Configure };
-    Kind kind = Kind::Memory;
+    enum class Kind { Reference, Encode, Decode, Configure };
+    Kind kind = Kind::Reference;
     std::vector<float> mono;
     std::vector<int> codes;
     std::string transcript, language;

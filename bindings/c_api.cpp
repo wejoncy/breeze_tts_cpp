@@ -16,10 +16,7 @@ struct tts_engine {
         : impl(path, d, b, c, 128, quantization) {}
 };
 static void set_error(char *dst, size_t cap, const char *text) noexcept {
-    try {
-        TTS_LOG(TTS_LOG_ERROR, "api", "{}", text);
-    } catch (...) {
-    }
+    TTS_LOG(TTS_LOG_ERROR, "api", "{}", text);
     if (dst && cap) {
         std::strncpy(dst, text, cap - 1);
         dst[cap - 1] = 0;
@@ -57,8 +54,6 @@ tts_engine *tts_create(const char *path, int32_t device, int32_t batch, int32_t 
     });
 }
 void tts_destroy(tts_engine *e) {
-    if (tts::log::in_callback())
-        return;
     delete e;
 }
 int tts_run_async(tts_engine *e, char *error, size_t cap) {
@@ -85,16 +80,6 @@ int tts_get_audio_format(const tts_engine *e, tts_audio_format *out, char *error
     auto f = e->impl.audio_format();
     *out = {f.sample_rate, f.samples_per_frame, f.codebooks, f.codebook_size};
     return 0;
-}
-int tts_get_memory_stats(tts_engine *e, tts_memory_stats *out, char *error, size_t cap) {
-    return api_call(error, cap, "memory stats failed", [&] {
-        if (!e || !out)
-            throw std::invalid_argument("null memory stats argument");
-        auto stats = e->impl.memory_stats();
-        *out = {stats.used_bytes, stats.reserved_bytes, stats.peak_used_bytes,
-                stats.peak_reserved_bytes};
-        return 0;
-    });
 }
 }
 
@@ -186,9 +171,9 @@ void tts_reference_destroy(tts_reference *r) {
     delete r;
 }
 int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_options *options,
-                 tts_audio_callback cb, void *user, tts_stats *stats, char *error, size_t cap) {
+                 tts_audio_callback cb, void *user, char *error, size_t cap) {
     return api_call(error, cap, "unknown inference failure", [&] {
-        if (!e || !req || !n || !cb || !stats)
+        if (!e || !req || !n || !cb)
             throw std::invalid_argument("null argument or empty batch");
         if (options && options->abi_version != TTS_ABI_VERSION)
             throw std::invalid_argument("unsupported options ABI");
@@ -237,13 +222,10 @@ int tts_generate(tts_engine *e, const tts_request *req, size_t n, const tts_opti
                                 req[i].fragment_interval});
         }
         tts::Stats r;
-        int status = e->impl.generate(
+        return e->impl.generate(
             requests, native,
             [&](int i, const int16_t *pcm, size_t count) { return cb(user, i, pcm, count) == 0; },
             r);
-        *stats = {r.prefill_ms,    r.first_audio_ms, r.total_ms,
-                  r.audio_seconds, r.frames,         r.truncated};
-        return status;
     });
 }
 }

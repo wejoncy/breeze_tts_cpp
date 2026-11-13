@@ -17,6 +17,7 @@ class RequestScheduler {
     bool contains(uint64_t request) const;
     const ExecutionRow *row(uint64_t id) const;
     size_t available_rows() const;
+    std::pair<size_t, size_t> request_counts() const;
     ScheduledBatch schedule();
     void update(uint64_t row, bool done, bool prefilled);
     void clear();

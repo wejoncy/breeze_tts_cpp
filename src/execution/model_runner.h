@@ -5,7 +5,6 @@
 #include "core/model.h"
 #include "tts/model_info.h"
 #include <exception>
-#include <chrono>
 
 namespace tts {
 // Device execution and live request storage. Engine drives it through data
@@ -30,14 +29,10 @@ class ModelRunner {
     ModelRunner(const Model &, RunnerResources &, const InputDefinition &, const ModelInfo &,
                  size_t runtime_memory_bytes);
     ~ModelRunner();
-    struct CacheUsage {
-        size_t page_bytes, device_bytes, state_kv_bytes_per_row;
-        int used_pages, backed_pages, state_rows;
-    };
     // Initialization bounds for readbacks and per-row audio delivery.
     size_t max_step_samples() const;
     size_t max_readback_bytes() const;
-    void set_engine_id(uint64_t);
+    CacheUsage cache_usage() const;
     // Enqueue one successor while the current frame batch is still in flight.
     // EOS is collected afterwards; an extra frame for an ended row is discarded.
     // Engine retains the batch and passes it to forward() after collecting this one.

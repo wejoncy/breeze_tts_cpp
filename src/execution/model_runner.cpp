@@ -10,8 +10,8 @@
 #include "support/log.h"
 #include "runtime/memory_log.h"
 #include <array>
+#include <chrono>
 #include <cmath>
-#include <numeric>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,9 +19,6 @@
 namespace tts {
 namespace {
 using Clock = std::chrono::steady_clock;
-double milliseconds(Clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-}
 std::vector<NamedTensor> output_views(const std::vector<std::string> &names) {
     std::vector<NamedTensor> result;
     for (const auto &name : names) result.push_back({name, {}});
@@ -58,8 +55,6 @@ struct ModelRunner::Cache {
     StatePool::Row &data;
     GenerationOptions options;
     std::unique_ptr<PagedKVCache::Lease> kv;
-    Clock::time_point prefill_start = Clock::now();
-    double prefill_ms = 0;
     int emitted_frames = 0;
     bool truncated = false;
     bool finished = false, is_prefilled = false;
@@ -108,14 +103,9 @@ struct ModelRunner::Impl {
     size_t state_kv_bytes_per_row = 0;
     std::vector<int> host_layout;
     std::vector<int16_t> host_audio;
-    struct RequestRecord {
-        std::unique_ptr<RequestPlan> plan;
-        size_t cache_pages = 0, cache_rows = 0, peak_cache_bytes = 0;
-        bool cache_reported = false;
-    };
     struct LiveCache { uint64_t request; std::shared_ptr<Cache> value; };
     // All execution state belongs to the runner. Scheduler sees IDs and records.
-    std::unordered_map<uint64_t, RequestRecord> requests;
+    std::unordered_map<uint64_t, std::unique_ptr<RequestPlan>> requests;
     std::unordered_map<uint64_t, LiveCache> states;
     ExecutionBatch scheduled;
     Completion completion;
@@ -128,7 +118,6 @@ struct ModelRunner::Impl {
     ProgramSpec audio_execution;
     size_t audio_total = 0, readback_bytes = 0;
     std::unique_ptr<DeviceArena> input_arena;
-    Clock::time_point next_cache_log{};
     struct FrameRow {
         uint64_t id;
         std::shared_ptr<Cache> cache;
@@ -139,7 +128,6 @@ struct ModelRunner::Impl {
         int slot = -1;
     } frame, submitted_frame;
     std::array<Buffer, 2> frame_storage;
-    uint64_t engine_id = 0;
     ProgramSpec evaluation;
     HostResults evaluation_result;
     std::shared_ptr<AudioDecodeCache> audio_decode;
@@ -153,72 +141,9 @@ struct ModelRunner::Impl {
     }
     enum class Phase { Prefill, Decode, Audio, Frame, Preparation, Evaluation, Codes, Finish, Idle };
     Phase phase = Phase::Idle;
-    void log_cache_usage(bool changed) {
-        if (!log::enabled(TTS_LOG_INFO))
-            return;
-        const auto now = std::chrono::steady_clock::now();
-        const bool periodic = now >= next_cache_log;
-        if (!periodic && !changed)
-            return;
-        const auto usage = CacheUsage{runtime.kv.storage_page_bytes(), device_total_bytes,
-            state_kv_bytes_per_row, runtime.kv.capacity() - runtime.kv.available(),
-            runtime.kv.capacity(), capacity};
-        constexpr double mib = 1024.0 * 1024.0;
-        const auto percent = [](size_t used, size_t total) {
-            return total ? 100.0 * double(used) / double(total) : 0.0;
-        };
-        for (auto &entry : requests) {
-            entry.second.cache_pages = 0;
-            entry.second.cache_rows = 0;
-        }
-        for (const auto &entry : states) {
-            auto &request = requests.at(entry.second.request);
-            ++request.cache_rows;
-            if (const auto &cache = entry.second.value->kv)
-                request.cache_pages += cache->pages().size();
-        }
-        bool admitted = false;
-        for (auto &entry : requests) {
-            auto &request = entry.second;
-            const size_t used = request.cache_pages * usage.page_bytes +
-                request.cache_rows * usage.state_kv_bytes_per_row;
-            request.peak_cache_bytes = std::max(request.peak_cache_bytes, used);
-            const bool first = !request.cache_reported;
-            admitted |= first;
-            if ((first || periodic) && log::enabled(TTS_LOG_DEBUG)) {
-                log::Scope scope(engine_id, entry.first);
-                TTS_LOG(TTS_LOG_DEBUG, "request.kv",
-                        "{} used={:.0f} MiB paged_pages={} observed_peak={:.0f} MiB device_used={:.2f}%",
-                        first ? "admitted" : "active", used / mib, request.cache_pages,
-                        request.peak_cache_bytes / mib,
-                        percent(used, usage.device_bytes));
-            }
-            request.cache_reported = true;
-        }
-        if (periodic || admitted || changed) {
-            const size_t used = size_t(usage.used_pages) * usage.page_bytes +
-                states.size() * usage.state_kv_bytes_per_row;
-            const size_t paged_backed = size_t(usage.backed_pages) * usage.page_bytes;
-            const size_t backed = paged_backed + size_t(usage.state_rows) * usage.state_kv_bytes_per_row;
-            TTS_LOG(TTS_LOG_INFO, "engine.kv", "KV cache usage={:.1f}%", percent(used, backed));
-            next_cache_log = now + std::chrono::seconds(1);
-        }
-    }
-    void release_request(uint64_t id) {
-        const auto found = requests.find(id);
-        if (found == requests.end())
-            return;
-        log::Scope scope(engine_id, id);
-        TTS_LOG(TTS_LOG_DEBUG, "request.kv", "released observed_peak={:.0f} MiB",
-                found->second.peak_cache_bytes / (1024.0 * 1024.0));
-        requests.erase(found);
-    }
     void clear_requests() {
-        const bool changed = !states.empty() || !requests.empty();
         states.clear();
         requests.clear();
-        if (changed)
-            log_cache_usage(true);
     }
     int available(const Cache &state) const {
         return std::min(state.options.max_frames - state.segment_start_frames,
@@ -240,7 +165,7 @@ struct ModelRunner::Impl {
         return state.input.windows.mode == SynthesisMode::Offline && state.semantic_done &&
             state.rendered == available(state) && state.audio_rendered < state.rendered;
     }
-    void append_pcm(Cache &state, std::vector<int16_t> &output, const int16_t *audio, size_t count) const {
+    void append_pcm(Cache &state, std::vector<int16_t> &output, const int16_t *audio, size_t count) {
         if (!count || state.finished) return;
         const int frame_samples = info.audio.samples_per_frame;
         if (count % frame_samples || count / frame_samples > size_t(state.options.max_frames - state.emitted_frames))
@@ -248,6 +173,7 @@ struct ModelRunner::Impl {
         if (count > output.capacity() - output.size())
             throw std::logic_error("audio step exceeds initialized output capacity");
         output.insert(output.end(), audio, audio + count);
+        completion.stats.audio_samples += count;
         state.emitted_frames += int(count / frame_samples);
     }
     ProgramSpec audio_description(const std::vector<Cache *> &rows) const {
@@ -857,7 +783,12 @@ ModelRunner::ModelRunner(const Model &model, RunnerResources &resources, const I
     : impl_(std::make_unique<Impl>(model, resources, inputs, info, runtime_bytes)) {}
 ModelRunner::~ModelRunner() = default;
 size_t ModelRunner::max_readback_bytes() const { return impl_->readback_bytes; }
-void ModelRunner::set_engine_id(uint64_t id) { impl_->engine_id = id; }
+CacheUsage ModelRunner::cache_usage() const {
+    const auto &i = *impl_;
+    return {i.runtime.kv.storage_page_bytes(), i.device_total_bytes, i.state_kv_bytes_per_row,
+            i.runtime.kv.capacity() - i.runtime.kv.available(), i.runtime.kv.capacity(),
+            size_t(i.capacity) - i.runtime.slots.available(), size_t(i.capacity)};
+}
 bool ModelRunner::finished() const { return impl_->phase == Impl::Phase::Idle; }
 bool ModelRunner::has_batch() const { return impl_->completion.executed; }
 bool ModelRunner::preparing() const { return !impl_->preparation_batch.tasks.empty(); }
@@ -909,14 +840,15 @@ ForwardOutputs ModelRunner::forward(ExecutionBatch batch) {
     result.valid_rows = 0;
     result.fatal = {};
     result.decoded_rows = 0;
+    result.stats = {};
     result.executed = true;
     for (auto id : i.scheduled.release) {
         auto found = i.states.find(id);
         if (found != i.states.end()) { found->second.value->finished = true; i.states.erase(found); }
     }
-    for (auto id : i.scheduled.release_requests) i.release_request(id);
+    for (auto id : i.scheduled.release_requests) i.requests.erase(id);
     for (auto &request : i.scheduled.requests)
-        i.requests.emplace(request.id, Impl::RequestRecord{std::move(request.plan)});
+        i.requests.emplace(request.id, std::move(request.plan));
     std::unordered_map<uint64_t, std::exception_ptr> rejected;
     i.scheduled.rows.erase(std::remove_if(i.scheduled.rows.begin(), i.scheduled.rows.end(),
         [&](const ExecutionRow &row) { return !row.create && !i.states.count(row.id); }), i.scheduled.rows.end());
@@ -925,16 +857,13 @@ ForwardOutputs ModelRunner::forward(ExecutionBatch batch) {
     for (const auto &row : i.scheduled.rows) {
         auto &out = result.rows[result.valid_rows++];
         out.id = row.id;
-        out.stats = {};
         out.error = {};
-        out.done = out.prefilled = false;
+        out.done = out.prefilled = out.truncated = false;
         out.pcm.clear();
         if (rejected.count(row.request)) continue;
         if (!i.states.count(row.id)) {
             try {
-                log::Scope scope(i.engine_id, row.request);
-                auto &request = i.requests.at(row.request);
-                auto state = prepare(*request.plan, row);
+                auto state = prepare(*i.requests.at(row.request), row);
                 i.states.emplace(row.id, Impl::LiveCache{row.request, std::move(state)});
             } catch (const DeviceError &) { throw; }
             catch (...) { rejected[row.request] = std::current_exception(); }
@@ -993,16 +922,13 @@ ForwardOutputs ModelRunner::forward() {
     case Impl::Phase::Codes: return decode_codes_forward();
     case Impl::Phase::Finish:
         finish_step();
-        i.log_cache_usage(!i.scheduled.release.empty() || !i.scheduled.release_requests.empty());
+        i.completion.stats.cache = cache_usage();
         for (size_t index = 0; index < i.completion.valid_rows; ++index) {
             auto &out = i.completion.rows[index];
             auto found = i.states.find(out.id);
             if (found == i.states.end()) continue;
             auto &state = *found->second.value;
-            out.stats.prefill_ms = state.prefill_ms;
-            out.stats.frames = state.emitted_frames;
-            out.stats.audio_seconds = double(state.emitted_frames) * i.info.audio.samples_per_frame / i.info.audio.sample_rate;
-            out.stats.truncated = state.truncated;
+            out.truncated = state.truncated;
             out.prefilled = state.is_prefilled;
             out.done |= state.finished;
             if (out.done) i.states.erase(found);
@@ -1020,10 +946,7 @@ void ModelRunner::commit(const SampledOutputs &sampled) {
     switch (i.phase) {
     case Impl::Phase::Prefill:
         i.sampled(i.input_rows, values["done"]);
-        for (auto *state : i.input_rows) {
-            state->is_prefilled = true;
-            state->prefill_ms = milliseconds(state->prefill_start);
-        }
+        for (auto *state : i.input_rows) state->is_prefilled = true;
         i.input_arena.reset();
         // Return completed prefills to Scheduler before starting another model
         // step. Newly prepared waiting rows may now outrank existing decoders.
@@ -1190,7 +1113,7 @@ ResourceRequirements ModelRunner::requirements(const RequestPlan &plan) const {
 bool ModelRunner::release_if_idle(uint64_t id) {
     if (std::any_of(impl_->states.begin(), impl_->states.end(),
         [&](const auto &entry) { return entry.second.request == id; })) return false;
-    impl_->release_request(id);
+    impl_->requests.erase(id);
     return true;
 }
 std::shared_ptr<ModelRunner::Cache> ModelRunner::prepare(RequestPlan &plan, const ExecutionRow &row) {

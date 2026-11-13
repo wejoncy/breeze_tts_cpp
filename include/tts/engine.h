@@ -1,6 +1,5 @@
 #pragma once
 #include "tts/request.h"
-#include "tts/memory_stats.h"
 #include "tts/quantization.h"
 #include "tts/model_info.h"
 #include <memory>
@@ -26,7 +25,6 @@ class Engine {
     // Repeated starts while running are harmless; shutdown is terminal.
     void run_async();
     size_t weight_bytes() const;
-    MemoryStats memory_stats() const;
     int batch_capacity() const;
     AudioFormat audio_format() const;
     const ModelInfo &model_info() const;
@@ -54,8 +52,7 @@ class Engine {
     void cancel_request(const std::string &request_id);
     // Cancel outstanding work and join the engine thread; safe before start and on repeat.
     void shutdown();
-    // Compatibility overload. The sink is owned and invoked by the caller.
-    int generate(const std::vector<Input> &, const GenerationOptions &, AudioCallback, Stats &);
+    // The calling thread drains the output queue and invokes its own audio sink.
     template <class AudioSink> int generate(const std::vector<Input> &inputs,
                                             const GenerationOptions &options,
                                             AudioSink &&sink, Stats &stats) {

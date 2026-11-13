@@ -27,6 +27,7 @@ add_library(tts SHARED
   src/ops/tensor.cpp
   src/runtime/cuda_context.cpp
   src/runtime/cuda_graph_runner.cpp
+  src/runtime/inference_metrics.cpp
   src/ops/convolution.cpp
   src/ops/kernels/sequence/sequence_pointwise.cu
   src/ops/kernels/sequence/sequence_norm.cu
