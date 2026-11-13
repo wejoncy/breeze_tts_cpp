@@ -7,7 +7,6 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
-#include <functional>
 #include <exception>
 namespace tts {
 struct RequestOverloaded : std::runtime_error {
@@ -98,8 +97,8 @@ struct Request {
     GenerationOptions options;
 };
 struct Stats {
-    double prefill_ms = 0, first_audio_ms = 0, total_ms = 0, audio_seconds = 0;
-    int frames = 0, truncated = 0;
+    double total_ms = 0;
+    int truncated = 0;
 };
 struct GenerationFrame {
     std::string request_id;
@@ -109,7 +108,4 @@ struct GenerationFrame {
     std::exception_ptr error;
     bool done = false, cancelled = false;
 };
-// Synchronous public C++ adapter: the caller invokes this sink on its own
-// thread. Kept for API/ABI compatibility; it never enters an engine message.
-using AudioCallback = std::function<bool(int, const int16_t *, size_t)>;
 } // namespace tts

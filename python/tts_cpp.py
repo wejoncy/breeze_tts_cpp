@@ -2,14 +2,13 @@
 
 from array import array
 from pathlib import Path
-import threading
 import uuid
 
 import request_schema
 from model_source import resolve_model_dir
 from native_library import load_library
 from native_types import Options
-from tts_logging import check_not_in_callback, configure_logging  # noqa: F401 -- public API
+from tts_logging import configure_logging  # noqa: F401 -- public API
 
 QUANTIZATIONS = ("int8", "fp8", "group_int8", "group_fp8")
 
@@ -70,7 +69,6 @@ class Engine:
         runtime_memory_mb=0,
         memory_limit_mb=0,
     ):
-        check_not_in_callback()
         if quantization is not None and quantization not in QUANTIZATIONS:
             raise ValueError("quantization must be " + ", ".join(QUANTIZATIONS))
         if type(runtime_memory_mb) is not int or not 0 <= runtime_memory_mb < 2**43:
@@ -80,7 +78,6 @@ class Engine:
         self.quantization = quantization
         self._module = load_library(library)
         self.model = resolve_model_dir(model, revision)
-        self._callbacks = threading.local()
         self.max_batch, self.context = max_batch, context
         self._handle = self._module.create(
             str(self.model),
@@ -108,12 +105,9 @@ class Engine:
         return self._module.version()
 
     def _native_handle(self):
-        check_not_in_callback()
         handle = self._handle
         if handle is None:
             raise RuntimeError("engine is closed")
-        if getattr(self._callbacks, "active", False):
-            raise RuntimeError("cannot reenter engine from an audio callback")
         return handle
 
     def run_async(self):
@@ -121,9 +115,6 @@ class Engine:
         self._module.run_async(self._native_handle())
 
     def close(self):
-        check_not_in_callback()
-        if getattr(self._callbacks, "active", False):
-            raise RuntimeError("cannot reenter engine from an audio callback")
         handle = self._handle
         if handle is not None:
             self._module.close(handle)
@@ -138,13 +129,8 @@ class Engine:
     def default_options(self):
         return self._module.default_options(self._native_handle())
 
-    def memory_stats(self):
-        """Pool bytes between requests; excludes CUDA driver/library memory."""
-        return dict(self._module.memory_stats(self._native_handle()))
-
     def prepare_reference(self, audio, transcript, *, sample_rate=None, channels=1, language=""):
         """File/encoded bytes, or interleaved float PCM with sample_rate specified."""
-        check_not_in_callback()
         if not isinstance(language, str) or "\0" in language or len(language) > 32:
             raise ValueError("invalid reference language")
         if (
@@ -203,7 +189,6 @@ class Engine:
         )
 
     def _snapshot_generation(self, requests, options):
-        check_not_in_callback()
         if options is None or isinstance(options, dict):
             _, options = request_schema.validate(
                 dict(options or {}, requests=requests), True, self.default_options()
@@ -244,7 +229,6 @@ class Engine:
 
     def add_request(self, request):
         """Enqueue {request_id, inputs, options} without waiting for native scheduling."""
-        check_not_in_callback()
         if not isinstance(request, dict):
             raise TypeError("request must be a dictionary")
         request_id = request.get("request_id")
@@ -282,27 +266,20 @@ class Engine:
                 terminal = frame["done"]
                 if frame.get("error"):
                     raise RuntimeError(frame["error"])
-                stats = {
-                    k: v
-                    for k, v in frame.items()
-                    if k not in ("request_id", "chunks", "done", "batch_size")
-                }
+                completion = {"cancelled": frame["cancelled"], "truncated": frame["truncated"]}
                 if cancelled:
                     if terminal:
-                        stats["cancelled"] = True
+                        completion["cancelled"] = True
                         break
                     continue
                 for index, pcm in frame["chunks"]:
-                    self._callbacks.active = True
                     try:
                         keep = output(index, pcm) is not False
                     except Exception as error:
                         sink_error = error
                         keep = False
-                    finally:
-                        self._callbacks.active = False
                     if not keep:
-                        stats["cancelled"] = True
+                        completion["cancelled"] = True
                         cancelled = True
                         if not terminal:
                             self.cancel_request(request_id)
@@ -314,7 +291,7 @@ class Engine:
                 self.cancel_request(request_id)
         if sink_error is not None:
             raise sink_error
-        return stats if deliver else ([bytes(b) for b in buffers], stats)
+        return completion if deliver else ([bytes(b) for b in buffers], completion)
 
     def warmup(self, batch=1, *, text="你好。", reference=None, **options):
         return self.generate(

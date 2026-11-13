@@ -14,7 +14,6 @@ class Response:
         self.frames, self.events = deque(), deque()
         self.buffered_bytes = 0
         self.done = self.cancelled = self.output_failed = False
-        self.stats = {}
 
     def cancel(self):
         with self.owner.condition:
@@ -48,7 +47,6 @@ class Response:
         if frame.get("cancelled"):
             self.cancelled = True
             raise RuntimeError("generation cancelled")
-        self.stats = {k: v for k, v in frame.items() if k != "chunks"}
         self.events.extend(frame["chunks"])
         if self.events:
             return self.events.popleft()

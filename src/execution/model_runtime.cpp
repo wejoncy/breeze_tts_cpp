@@ -43,8 +43,4 @@ ModelRunner &ModelRuntime::runner() { return *impl_->parts.runner; }
 DeviceContext &ModelRuntime::memory() { return impl_->gpu.memory; }
 void ModelRuntime::initialize_execution() { tts::initialize_execution(impl_->gpu); }
 void ModelRuntime::drain() { impl_->gpu.memory.sync(); }
-MemoryStats ModelRuntime::memory_stats() const {
-    // Engine has observed a stream event before requesting this snapshot.
-    return impl_->gpu.memory.stats();
-}
 } // namespace tts

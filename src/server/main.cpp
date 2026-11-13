@@ -87,7 +87,7 @@ int run_server(int argc, const char *const *argv) {
                 found->second);
         }
         config.stream_buffer_bytes = mebibytes(stream_buffer_mb);
-        tts_log_config logging{tts::log::parse_level(log_level), nullptr, 0, nullptr, nullptr};
+        tts_log_config logging{tts::log::parse_level(log_level), nullptr, 0};
         if (model.empty())
             throw std::invalid_argument("--model is required");
         config.validate();

@@ -5,20 +5,9 @@
 
 namespace tts::log {
 bool enabled(tts_log_level) noexcept;
-bool in_callback() noexcept;
-void check_not_callback();
 tts_log_level parse_level(std::string_view);
 void configure(const tts_log_config &);
-void emit(tts_log_level, const char *component, const std::string &message) noexcept;
-uint64_t next_engine_id() noexcept;
-class Scope {
-    uint64_t engine_, request_;
-
-  public:
-    Scope(uint64_t engine, uint64_t request = 0) noexcept;
-    ~Scope();
-    Scope(const Scope &) = delete;
-};
+void emit(tts_log_level, const char *component, const std::string &message);
 template <typename... Args>
 void write(tts_log_level level, const char *component, fmt::format_string<Args...> format,
            Args &&...args) noexcept {

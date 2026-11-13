@@ -319,7 +319,6 @@ def make_handler(engine, responses):
                     except StopIteration:
                         break
                     deliver(index, pcm)
-                stats = job.stats
                 if streaming:
                     if not started:
                         self.reply(
@@ -351,7 +350,6 @@ def make_handler(engine, responses):
                     with zipfile.ZipFile(result, "w", zipfile.ZIP_STORED) as z:
                         for i, pcm in enumerate(buffers):
                             z.writestr(f"{i}.wav", wav(pcm, sample_rate))
-                        z.writestr("metrics.json", json.dumps(stats))
                     self.reply(200, result.getvalue(), "application/zip")
                 else:
                     self.reply(200, wav(buffers[0], sample_rate), "audio/wav")
@@ -439,14 +437,12 @@ def main():
     handler = logging.StreamHandler()
     handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s [%(levelname)s] [%(component)s] engine=%(engine_id)s request=%(request_id)s %(message)s",
-            defaults={"component": "http", "engine_id": 0, "request_id": 0},
+            "%(asctime)s [%(levelname)s] [%(component)s] %(message)s",
+            defaults={"component": "http"},
         )
     )
     logging.basicConfig(level=severity, handlers=[handler])
-    configure_logging(
-        args.log_level, logger=logging.getLogger("tts.native"), library=args.library
-    )
+    configure_logging(args.log_level, library=args.library)
     engine = Engine(
         args.library,
         args.model,

@@ -6,7 +6,6 @@
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <atomic>
 #include <cstring>
-#include <mutex>
 #include <filesystem>
 #include <exception>
 
@@ -33,22 +32,12 @@ void InitPhase::next(const char *name) {
 }
 namespace {
 std::atomic<int> threshold{TTS_LOG_INFO};
-std::atomic<uint64_t> engine_sequence{0};
-thread_local uint64_t engine_id = 0, request_id = 0;
-thread_local bool delivering = false;
 constexpr const char *names[] = {"trace", "debug", "info", "warn", "error", "off"};
-struct State {
-    std::mutex mutex;
-    std::shared_ptr<spdlog::logger> output;
-    tts_log_callback callback = nullptr;
-    void *user = nullptr;
-    bool json = false;
+struct Output {
+    std::shared_ptr<spdlog::logger> logger;
+    bool json;
 };
-State &state() {
-    static State s;
-    return s;
-}
-std::shared_ptr<spdlog::logger> output(const char *path, bool json) {
+std::shared_ptr<const Output> output(const char *path, bool json) {
     spdlog::sink_ptr sink;
     if (path)
         sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
@@ -59,18 +48,15 @@ std::shared_ptr<spdlog::logger> output(const char *path, bool json) {
     logger->set_level(spdlog::level::trace);
     logger->set_pattern(json ? "%v" : "%Y-%m-%dT%H:%M:%S.%e%z [%l] %v");
     logger->flush_on(spdlog::level::err);
-    return logger;
+    return std::make_shared<const Output>(Output{std::move(logger), json});
+}
+std::shared_ptr<const Output> &state() {
+    static auto current = output(nullptr, false);
+    return current;
 }
 } // namespace
-bool in_callback() noexcept {
-    return delivering;
-}
-void check_not_callback() {
-    if (delivering)
-        throw std::logic_error("cannot reenter engine/log configuration from a log callback");
-}
 bool enabled(tts_log_level level) noexcept {
-    return !delivering && level >= threshold.load(std::memory_order_relaxed) && level < TTS_LOG_OFF;
+    return level >= threshold.load(std::memory_order_relaxed) && level < TTS_LOG_OFF;
 }
 tts_log_level parse_level(std::string_view name) {
     for (int i = TTS_LOG_TRACE; i <= TTS_LOG_OFF; ++i)
@@ -79,81 +65,33 @@ tts_log_level parse_level(std::string_view name) {
     throw std::invalid_argument("log level must be trace, debug, info, warn, error or off");
 }
 void configure(const tts_log_config &config) {
-    check_not_callback();
     if (config.level < TTS_LOG_TRACE || config.level > TTS_LOG_OFF ||
-        (config.json != 0 && config.json != 1) || (config.callback && config.file_path) ||
+        (config.json != 0 && config.json != 1) ||
         (config.file_path && !config.file_path[0]))
         throw std::invalid_argument("invalid logging configuration");
-    auto next = config.callback ? nullptr : output(config.file_path, bool(config.json));
-    auto &s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (s.output)
-        s.output->flush();
-    s.output = std::move(next);
-    s.callback = config.callback;
-    s.user = config.user;
-    s.json = bool(config.json);
+    std::atomic_store(&state(), output(config.file_path, bool(config.json)));
     threshold.store(config.level, std::memory_order_relaxed);
 }
-uint64_t next_engine_id() noexcept {
-    return ++engine_sequence;
-}
-Scope::Scope(uint64_t engine, uint64_t request) noexcept
-    : engine_(engine_id), request_(request_id) {
-    engine_id = engine;
-    request_id = request;
-}
-Scope::~Scope() {
-    engine_id = engine_;
-    request_id = request_;
-}
-void emit(tts_log_level level, const char *component, const std::string &message) noexcept {
-    if (!enabled(level))
-        return;
-    try {
-        auto &s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        if (!enabled(level))
-            return;
-        auto now = spdlog::log_clock::now();
-        auto us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-        tts_log_record record{level, us, engine_id, request_id, component, message.c_str()};
-        if (s.callback) {
-            struct Guard {
-                Guard() {
-                    delivering = true;
-                }
-                ~Guard() {
-                    delivering = false;
-                }
-            } guard;
-            s.callback(s.user, &record);
-        } else {
-            if (!s.output)
-                s.output = output(nullptr, false);
-            std::string text;
-            if (s.json) {
-                Json fields{{"timestamp_us", us}, {"level", names[level]},
-                            {"component", component}, {"message", message}};
-                if (request_id)
-                    fields["request_id"] = request_id;
-                text = fields.dump(-1, ' ', false, Json::error_handler_t::replace);
-            } else {
-                text = request_id ? fmt::format("[{}] request={} {}", component, request_id, message)
-                                  : fmt::format("[{}] {}", component, message);
-            }
-            s.output->log(now, spdlog::source_loc{}, static_cast<spdlog::level::level_enum>(level),
-                          text);
-        }
-    } catch (...) { /* Includes sink/callback failures; inference keeps its original result. */
+void emit(tts_log_level level, const char *component, const std::string &message) {
+    const auto sink = std::atomic_load(&state());
+    auto now = spdlog::log_clock::now();
+    auto us =
+        std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    std::string text;
+    if (sink->json) {
+        Json fields{{"timestamp_us", us}, {"level", names[level]},
+                    {"component", component}, {"message", message}};
+        text = fields.dump(-1, ' ', false, Json::error_handler_t::replace);
+    } else {
+        text = fmt::format("[{}] {}", component, message);
     }
+    sink->logger->log(now, spdlog::source_loc{}, static_cast<spdlog::level::level_enum>(level), text);
 }
 } // namespace tts::log
 extern "C" int tts_configure_logging(const tts_log_config *config, char *error, size_t capacity) {
     try {
         tts::log::configure(config ? *config
-                                   : tts_log_config{TTS_LOG_INFO, nullptr, 0, nullptr, nullptr});
+                                   : tts_log_config{TTS_LOG_INFO, nullptr, 0});
         return 0;
     } catch (const std::exception &e) {
         if (error && capacity) {

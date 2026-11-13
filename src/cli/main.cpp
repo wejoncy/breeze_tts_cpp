@@ -17,7 +17,7 @@ int run_cli(int argc, const char *const *argv) {
                     codefile, encodefile, ref_audio, ref_text, speaker = "S0", quantization,
                     language, prompt_language, text_split_method;
         double fragment_interval = 0;
-        tts_log_config logging{TTS_LOG_INFO, nullptr, 0, nullptr, nullptr};
+        tts_log_config logging{TTS_LOG_INFO, nullptr, 0};
         std::string log_file;
         bool cfg_ref_set = false, cfg_ins_set = false;
         int device = 0, context = 2048, repeat = 1;

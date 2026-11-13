@@ -57,6 +57,15 @@ const ExecutionRow *RequestScheduler::row(uint64_t id) const {
 size_t RequestScheduler::available_rows() const {
     return std::min(impl_->capacity - impl_->running.size(), impl_->slots.available());
 }
+std::pair<size_t, size_t> RequestScheduler::request_counts() const {
+    // A multi-input request is running while any of its inputs is running.
+    const auto &rows = impl_->running;
+    size_t running = 0;
+    for (auto it = rows.begin(); it != rows.end(); ++it)
+        if (std::none_of(rows.begin(), it,
+            [&](const auto &row) { return row.row.request == it->row.request; })) ++running;
+    return {running, impl_->requests.size() - running};
+}
 ScheduledBatch RequestScheduler::schedule() {
     auto &i = *impl_;
     ScheduledBatch batch;

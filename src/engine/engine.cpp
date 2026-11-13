@@ -4,6 +4,7 @@
 #include "execution/model_runtime.h"
 #include "execution/output_sampler.h"
 #include "runtime/error.h"
+#include "runtime/inference_metrics.h"
 #include <mutex>
 #include <condition_variable>
 #include <deque>
@@ -17,7 +18,6 @@
 namespace tts {
 constexpr double bytes_per_mib = 1024.0 * 1024.0;
 struct Engine::Impl {
-    const uint64_t id;
     std::unique_ptr<ModelRuntime> model;
     ModelInputs inputs;
     int max_batch;
@@ -27,6 +27,7 @@ struct Engine::Impl {
     enum class State { Ready, Running, Stopped };
     std::atomic<State> state{State::Ready};
     using Clock = std::chrono::steady_clock;
+    InferenceMetrics metrics;
     struct Job {
         std::string request_id;
         std::vector<Input> requests;
@@ -35,16 +36,15 @@ struct Engine::Impl {
         std::unique_ptr<RequestPlan> plan;
         std::unique_ptr<RequestPreparation> preparation;
         std::unique_ptr<PreparationTask> task;
-        Stats stats;
-        std::vector<Stats> previous;
+        Clock::time_point submitted;
         std::exception_ptr error;
         size_t completed = 0;
-        bool done = false, cancelled = false, released = false;
-        Clock::time_point submitted = Clock::now();
-        double elapsed() const {
-            return std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
-        }
+        bool done = false, cancelled = false, released = false, truncated = false;
         bool aborted() const { return cancelled || error; }
+        Stats stats() const {
+            return {std::chrono::duration<double, std::milli>(Clock::now() - submitted).count(),
+                    int(truncated)};
+        }
     };
     // Registry and preparation continuations are Engine work. Only Scheduler
     // owns whether an input is waiting or belongs to a running generation batch.
@@ -76,11 +76,11 @@ struct Engine::Impl {
     std::shared_ptr<ModelRunner::AudioDecodeCache> audio_decode;
     std::exception_ptr execution_error;
     std::vector<Completion> output_pool;
-    Impl(const std::string &dir, const ModelOptions &options, uint64_t engine_id)
-        : id(engine_id), model(load_model(dir, options)), inputs(model->take_inputs()), max_batch(options.max_batch) {
+    Impl(const std::string &dir, const ModelOptions &options)
+        : model(load_model(dir, options)), inputs(model->take_inputs()), max_batch(options.max_batch),
+          metrics(model->info().audio.sample_rate) {
         scheduler = std::make_unique<RequestScheduler>(
             model->memory(), model->kv_cache(), model->cache_slots(), max_batch);
-        model->runner().set_engine_id(id);
         sampler = std::make_unique<OutputSampler>(model->memory(), model->runner().max_readback_bytes());
         output_pool.resize(2);
         for (auto &output : output_pool) {
@@ -160,9 +160,6 @@ struct Engine::Impl {
         auto found = jobs.find(job->request_id);
         if (found != jobs.end() && found->second == job) jobs.erase(found);
         release_slot();
-        log::Scope scope(id, job->execution_id);
-        TTS_LOG(TTS_LOG_INFO, "request", "complete batch={} frames={} total_ms={:.3f} cancelled={}",
-                job->requests.size(), job->stats.frames, job->elapsed(), job->cancelled);
     }
     void stop_work() {
         stopping = true;
@@ -190,11 +187,10 @@ struct Engine::Impl {
         if (!inserted) {
             release_slot();
             // A duplicate must not publish a terminal record for the live ID.
-            TTS_LOG(TTS_LOG_WARN, "request", "ignored duplicate request_id={}", job->request_id);
+            TTS_LOG(TTS_LOG_WARN, "request", "ignored duplicate request");
             return;
         }
         job->execution_id = ++execution_sequence;
-        job->previous.resize(job->requests.size());
         execution_jobs.emplace(job->execution_id, job);
         try {
             check_running();
@@ -227,10 +223,9 @@ struct Engine::Impl {
         job->error = failure;
         scheduler->remove(job->execution_id);
         job->done = true;
-        job->stats.total_ms = job->elapsed();
         GenerationFrame result;
         result.error = failure;
-        result.stats = job->stats;
+        result.stats = job->stats();
         result.done = true;
         result.cancelled = job->cancelled;
         retire(job);
@@ -241,7 +236,7 @@ struct Engine::Impl {
         job->cancelled = job->done = true;
         GenerationFrame result;
         result.done = result.cancelled = true;
-        result.stats = job->stats;
+        result.stats = job->stats();
         scheduler->remove(job->execution_id);
         for (auto *queue : {&cpu_preparations, &gpu_preparations})
             queue->erase(std::remove(queue->begin(), queue->end(), job), queue->end());
@@ -253,11 +248,8 @@ struct Engine::Impl {
             return;
         if (frame.chunks.empty() && job->completed != job->requests.size())
             return;
-        if (!job->stats.first_audio_ms && !frame.chunks.empty())
-            job->stats.first_audio_ms = job->elapsed();
-        job->stats.total_ms = job->elapsed();
-        frame.stats = job->stats;
         frame.done = job->completed == job->requests.size();
+        frame.stats = job->stats();
         job->done = frame.done;
         if (frame.done) retire(job);
         emit(job, std::move(frame));
@@ -375,12 +367,7 @@ struct Engine::Impl {
             if (std::find(updated.begin(), updated.end(), job) == updated.end()) updated.push_back(job);
             auto &frame = frames[job.get()];
             frame.batch_size = result.decoded_rows;
-            auto &previous = job->previous.at(row.input);
-            job->stats.prefill_ms += out.stats.prefill_ms - previous.prefill_ms;
-            job->stats.audio_seconds += out.stats.audio_seconds - previous.audio_seconds;
-            job->stats.frames = std::max(job->stats.frames, out.stats.frames);
-            job->stats.truncated |= out.stats.truncated;
-            previous = out.stats;
+            job->truncated |= out.truncated;
             if (!out.pcm.empty()) frame.chunks.emplace_back(int(row.input), out.pcm);
             if (out.done) ++job->completed;
             scheduler->update(out.id, out.done, out.prefilled);
@@ -390,6 +377,14 @@ struct Engine::Impl {
             publish(job, std::move(frames[job.get()]));
             retire(job);
         }
+        if (result.executed) metrics.record(result.stats);
+    }
+    void log_stats() {
+        const auto now = Clock::now();
+        const auto cache = model->runner().cache_usage();
+        if (!metrics.should_log(cache, now)) return;
+        const auto [running, waiting] = scheduler->request_counts();
+        metrics.log({running, waiting}, cache, now);
     }
     void finish_control(const std::shared_ptr<ControlRequest> &request,
                         ControlResult result = {}, std::exception_ptr error = {}) {
@@ -542,9 +537,6 @@ struct Engine::Impl {
                     audio_decode = runner.prepare_codes(active_control->codes);
             }
             switch (active_control->kind) {
-            case ControlRequest::Kind::Memory:
-                complete_active_control(model->memory_stats());
-                break;
             case ControlRequest::Kind::Configure:
                 configure(active_control->request_limit, active_control->output_bytes);
                 complete_active_control();
@@ -587,7 +579,6 @@ struct Engine::Impl {
     // One host thread drives scheduling and GPU launch. CUDA performs the
     // computation concurrently while prepare_next() builds the queued successor.
     void run() {
-        log::Scope scope(id);
         auto &runner = model->runner();
         std::optional<ExecutionBatch> next;
         try { model->initialize_execution(); }
@@ -628,6 +619,7 @@ struct Engine::Impl {
                     output_pool.push_back(std::move(result));
                     if (next && (runner.has_submitted() || !boundary_work_ready()))
                         forward_next(next);
+                    log_stats();
                     continue;
                 }
                 const bool control_boundary = runner.has_control() || (runner.preparing() && preparing_jobs.empty());
@@ -696,11 +688,9 @@ struct Engine::Impl {
     }
 };
 void Engine::run_async() {
-    log::check_not_callback();
     impl_->start();
 }
 void Engine::add_request(const Request &request) {
-    log::check_not_callback();
     if (impl_->state != Impl::State::Running) throw impl_->unavailable();
     if (request.request_id.empty() || request.request_id.find('\0') != std::string::npos)
         throw std::invalid_argument("request_id must be nonempty and contain no NUL");
@@ -712,7 +702,6 @@ void Engine::add_request(const Request &request) {
 }
 Engine::OutputQueue &Engine::output_queue() { return impl_->outgoing; }
 void Engine::cancel_request(const std::string &request_id) {
-    log::check_not_callback();
     if (impl_->state == Impl::State::Stopped) return;
     Impl::Command command;
     command.kind = Impl::Command::Kind::Cancel;
@@ -720,11 +709,9 @@ void Engine::cancel_request(const std::string &request_id) {
     impl_->post(std::move(command));
 }
 void Engine::shutdown() {
-    log::check_not_callback();
     impl_->stop();
 }
 void Engine::configure_serving(size_t request_limit, size_t output_buffer_bytes) {
-    log::check_not_callback();
     if (!request_limit || !output_buffer_bytes) throw std::invalid_argument("serving limits must be positive");
     ControlRequest request;
     request.kind = ControlRequest::Kind::Configure;
@@ -734,15 +721,12 @@ void Engine::configure_serving(size_t request_limit, size_t output_buffer_bytes)
 }
 Engine::Engine(const std::string &dir, int device, int batch, int context, int page,
                Quantization quantization, size_t runtime_memory_bytes, size_t memory_limit_bytes) {
-    log::check_not_callback();
-    auto id = log::next_engine_id();
-    log::Scope scope(id);
     auto start = std::chrono::steady_clock::now();
     TTS_LOG(TTS_LOG_INFO, "engine",
             "loading device={} batch_capacity={} context={} quantization={}", device, batch,
             context, quantization_name(quantization));
     impl_ = std::make_unique<Impl>(dir, ModelOptions{device, batch, context, page, quantization,
-                                                   runtime_memory_bytes, memory_limit_bytes}, id);
+                                                   runtime_memory_bytes, memory_limit_bytes});
     if (log::enabled(TTS_LOG_INFO)) {
         auto ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -754,10 +738,6 @@ Engine::Engine(const std::string &dir, int device, int batch, int context, int p
 Engine::~Engine() = default;
 size_t Engine::weight_bytes() const {
     return impl_->model->info().weight_bytes;
-}
-MemoryStats Engine::memory_stats() const {
-    log::check_not_callback();
-    return std::get<MemoryStats>(impl_->call({ControlRequest::Kind::Memory}));
 }
 AudioFormat Engine::audio_format() const {
     return impl_->model->info().audio;
@@ -775,23 +755,15 @@ size_t Engine::max_reference_samples() const {
     return impl_->model->info().max_reference_samples;
 }
 std::string Engine::begin_generation(const std::vector<Input> &requests, const GenerationOptions &options) {
-    log::check_not_callback();
     if (requests.empty()) throw std::invalid_argument("empty request batch");
-    Request request{"offline:" + std::to_string(impl_->id) + ":" +
-                    std::to_string(++impl_->request_sequence), requests, options};
+    Request request{"offline:" + std::to_string(++impl_->request_sequence), requests, options};
     auto id = request.request_id;
     add_request(request);
     return id;
 }
-int Engine::generate(const std::vector<Input> &inputs, const GenerationOptions &options,
-                     AudioCallback sink, Stats &stats) {
-    return generate<AudioCallback &>(inputs, options, sink, stats);
-}
-
 std::shared_ptr<const Reference> Engine::prepare_reference(const std::vector<float> &mono,
                                                          std::string transcript,
                                                          const std::string &language) {
-    log::check_not_callback();
     ControlRequest request;
     request.kind = ControlRequest::Kind::Reference;
     request.mono = mono;
@@ -800,7 +772,6 @@ std::shared_ptr<const Reference> Engine::prepare_reference(const std::vector<flo
     return std::get<std::shared_ptr<const Reference>>(impl_->call(std::move(request)));
 }
 std::vector<int> Engine::encode_audio(const std::vector<float> &mono) {
-    log::check_not_callback();
     if (impl_->model->info().audio.codebooks <= 0)
         throw std::invalid_argument("loaded model does not expose discrete audio encoding");
     ControlRequest request;
@@ -809,7 +780,6 @@ std::vector<int> Engine::encode_audio(const std::vector<float> &mono) {
     return std::get<std::vector<int>>(impl_->call(std::move(request)));
 }
 std::vector<float> Engine::decode_codes(const std::vector<int> &codes) {
-    log::check_not_callback();
     if (impl_->model->info().audio.codebooks <= 0)
         throw std::invalid_argument("loaded model does not expose discrete audio decoding");
     ControlRequest request;
