@@ -1,11 +1,23 @@
 #include "runtime/inference_metrics.h"
 #include "support/log.h"
+#include "tts/request.h"
 
 namespace tts {
+void InferenceMetrics::record_output(uint64_t request, const GenerationFrame &frame) {
+    auto &samples = request_audio_samples_[request];
+    for (const auto &chunk : frame.chunks) samples += chunk.second.size();
+    // A request can end at EOS without emitting audio; its RTF is undefined.
+    if (frame.done && samples) {
+        request_rtf_sum_ += frame.stats.total_ms / 1000 * sample_rate_ / double(samples);
+        ++completed_requests_;
+    }
+}
+
 void InferenceMetrics::log(const SchedulerStats &scheduler, const CacheUsage &cache,
                            Clock::time_point now) {
     const double seconds = std::chrono::duration<double>(now - last_log_).count();
-    const bool activity = audio_samples_ || scheduler.running_requests || scheduler.waiting_requests;
+    const bool activity = audio_samples_ || completed_requests_ ||
+                          scheduler.running_requests || scheduler.waiting_requests;
     const auto level = activity || last_activity_ ? TTS_LOG_INFO : TTS_LOG_DEBUG;
     const size_t used = size_t(cache.used_pages) * cache.page_bytes + cache.active_rows * cache.state_bytes;
     const size_t backed = size_t(cache.backed_pages) * cache.page_bytes + cache.state_rows * cache.state_bytes;
@@ -14,14 +26,18 @@ void InferenceMetrics::log(const SchedulerStats &scheduler, const CacheUsage &ca
     const auto percent = [](size_t used, size_t total) {
         return total ? 100.0 * double(used) / double(total) : 0.0;
     };
+    const auto rtf = completed_requests_
+        ? fmt::format("{:.4f}", request_rtf_sum_ / completed_requests_) : "n/a";
     TTS_LOG(level, "engine.metrics",
-            "Avg audio throughput: {:.2f} audio s/s, "
+            "Avg audio throughput: {:.2f} audio s/s, Avg RTF: {}, "
             "Running: {} reqs, Waiting: {} reqs, GPU KV cache usage: {:.1f}%, "
             "used={:.0f} MiB observed_peak={:.0f} MiB device_used={:.2f}%",
-            double(audio_samples_) / sample_rate_ / seconds,
+            double(audio_samples_) / sample_rate_ / seconds, rtf,
             scheduler.running_requests, scheduler.waiting_requests, percent(used, backed),
             used / mib, peak_bytes_ / mib, percent(used, cache.device_bytes));
     audio_samples_ = 0;
+    request_rtf_sum_ = 0;
+    completed_requests_ = 0;
     last_active_rows_ = cache.active_rows;
     last_activity_ = activity;
     last_log_ = now;

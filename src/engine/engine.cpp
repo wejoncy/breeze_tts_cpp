@@ -152,6 +152,7 @@ struct Engine::Impl {
             scheduler->contains(job->execution_id))
             return;
         job->released = true;
+        metrics.retire(job->execution_id);
         model->runner().release_if_idle(job->execution_id);
         execution_jobs.erase(job->execution_id);
         job->plan.reset();
@@ -251,6 +252,7 @@ struct Engine::Impl {
         frame.done = job->completed == job->requests.size();
         frame.stats = job->stats();
         job->done = frame.done;
+        metrics.record_output(job->execution_id, frame);
         if (frame.done) retire(job);
         emit(job, std::move(frame));
     }
