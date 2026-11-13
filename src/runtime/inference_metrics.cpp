@@ -1,7 +1,18 @@
 #include "runtime/inference_metrics.h"
 #include "support/log.h"
+#include "tts/request.h"
 
 namespace tts {
+void InferenceMetrics::record_output(uint64_t request, const GenerationFrame &frame) {
+    auto &samples = request_audio_samples_[request];
+    for (const auto &chunk : frame.chunks) samples += chunk.second.size();
+    // A request can end at EOS without emitting audio; its RTF is undefined.
+    if (frame.done && samples) {
+        request_rtf_sum_ += frame.stats.total_ms / 1000 * sample_rate_ / double(samples);
+        ++completed_requests_;
+    }
+}
+
 void InferenceMetrics::log(const SchedulerStats &scheduler, const CacheUsage &cache,
                            Clock::time_point now) {
     const double seconds = std::chrono::duration<double>(now - last_log_).count();

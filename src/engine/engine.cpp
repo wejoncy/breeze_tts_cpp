@@ -37,7 +37,6 @@ struct Engine::Impl {
         std::unique_ptr<RequestPreparation> preparation;
         std::unique_ptr<PreparationTask> task;
         Clock::time_point submitted;
-        uint64_t audio_samples = 0;
         std::exception_ptr error;
         size_t completed = 0;
         bool done = false, cancelled = false, released = false, truncated = false;
@@ -153,6 +152,7 @@ struct Engine::Impl {
             scheduler->contains(job->execution_id))
             return;
         job->released = true;
+        metrics.retire(job->execution_id);
         model->runner().release_if_idle(job->execution_id);
         execution_jobs.erase(job->execution_id);
         job->plan.reset();
@@ -252,10 +252,8 @@ struct Engine::Impl {
         frame.done = job->completed == job->requests.size();
         frame.stats = job->stats();
         job->done = frame.done;
-        if (frame.done) {
-            metrics.finish_request(frame.stats.total_ms / 1000, job->audio_samples);
-            retire(job);
-        }
+        metrics.record_output(job->execution_id, frame);
+        if (frame.done) retire(job);
         emit(job, std::move(frame));
     }
     void continue_preparation(const std::shared_ptr<Job> &job) {
@@ -372,7 +370,6 @@ struct Engine::Impl {
             auto &frame = frames[job.get()];
             frame.batch_size = result.decoded_rows;
             job->truncated |= out.truncated;
-            job->audio_samples += out.pcm.size();
             if (!out.pcm.empty()) frame.chunks.emplace_back(int(row.input), out.pcm);
             if (out.done) ++job->completed;
             scheduler->update(out.id, out.done, out.prefilled);

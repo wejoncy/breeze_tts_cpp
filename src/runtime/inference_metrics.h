@@ -3,8 +3,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 
 namespace tts {
+struct GenerationFrame;
 struct CacheUsage {
     size_t page_bytes = 0, device_bytes = 0, state_bytes = 0;
     int used_pages = 0, backed_pages = 0;
@@ -18,7 +20,7 @@ struct IterationStats {
     uint64_t audio_samples = 0;
     CacheUsage cache;
 };
-// Engine-thread aggregate counters. No request identities, callbacks or transport objects.
+// Engine-thread metrics. Request bookkeeping and aggregation stay in this collector.
 class InferenceMetrics {
   public:
     using Clock = std::chrono::steady_clock;
@@ -27,6 +29,7 @@ class InferenceMetrics {
     Clock::time_point last_log_;
     const int sample_rate_;
     uint64_t audio_samples_ = 0;
+    std::unordered_map<uint64_t, uint64_t> request_audio_samples_;
     double request_rtf_sum_ = 0;
     size_t completed_requests_ = 0;
     size_t peak_bytes_ = 0;
@@ -46,12 +49,8 @@ class InferenceMetrics {
         peak_bytes_ = std::max(peak_bytes_, size_t(cache.used_pages) * cache.page_bytes +
                               cache.active_rows * cache.state_bytes);
     }
-    void finish_request(double elapsed_seconds, uint64_t audio_samples) {
-        // A request can end at EOS without emitting audio; its RTF is undefined.
-        if (!audio_samples) return;
-        request_rtf_sum_ += elapsed_seconds * sample_rate_ / double(audio_samples);
-        ++completed_requests_;
-    }
+    void record_output(uint64_t request, const GenerationFrame &);
+    void retire(uint64_t request) { request_audio_samples_.erase(request); }
     void log(const SchedulerStats &, const CacheUsage &, Clock::time_point now);
 };
 } // namespace tts
