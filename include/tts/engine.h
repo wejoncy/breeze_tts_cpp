@@ -45,7 +45,7 @@ class Engine {
     // Snapshot and enqueue without waiting for the scheduler. Full queues reject
     // immediately. Results and errors enter the shared output queue.
     // IDs must remain unique until the caller consumes their terminal output.
-    // Repeated active IDs are ignored and logged.
+    // Repeated active IDs are ignored.
     void add_request(const Request &);
     // Post cancellation without waiting. Already queued output stays in FIFO order.
     // Active work ends with a cancelled terminal frame; unknown IDs are ignored.

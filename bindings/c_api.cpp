@@ -1,5 +1,4 @@
 #include "tts/engine.h"
-#include "support/log.h"
 #include "io/audio_io.h"
 #include "tts/tts.h"
 #include <algorithm>
@@ -16,7 +15,6 @@ struct tts_engine {
         : impl(path, d, b, c, 128, quantization) {}
 };
 static void set_error(char *dst, size_t cap, const char *text) noexcept {
-    TTS_LOG(TTS_LOG_ERROR, "api", "{}", text);
     if (dst && cap) {
         std::strncpy(dst, text, cap - 1);
         dst[cap - 1] = 0;

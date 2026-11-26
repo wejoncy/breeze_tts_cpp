@@ -187,7 +187,6 @@ struct Engine::Impl {
         if (!inserted) {
             release_slot();
             // A duplicate must not publish a terminal record for the live ID.
-            TTS_LOG(TTS_LOG_WARN, "request", "ignored duplicate request");
             return;
         }
         job->execution_id = ++execution_sequence;

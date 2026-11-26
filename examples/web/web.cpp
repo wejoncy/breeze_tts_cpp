@@ -2,7 +2,6 @@
 #include "voice_presets.h"
 #include "web_page.h"
 #include "server/protocol.h"
-#include "support/log.h"
 #include <httplib.h>
 #include <memory>
 
@@ -44,7 +43,6 @@ void mount_web_ui(httplib::Server &http, const std::string &voice_presets_file) 
         } catch (const Json::exception &error) {
             reply(response, 400, error_json(400, error.what()));
         } catch (const std::exception &error) {
-            TTS_LOG(TTS_LOG_ERROR, "http", "voice presets: {}", error.what());
             reply(response, 500, error_json(500, error.what()));
         }
     };

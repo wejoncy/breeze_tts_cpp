@@ -2,9 +2,9 @@
 #include "server/protocol.h"
 #include "web.h"
 #include "tts/engine.h"
+#include "tts/tts.h"
 #include "io/audio_io.h"
 #include "io/audio_speed.h"
-#include "support/log.h"
 #include <httplib.h>
 #include <atomic>
 #include <chrono>
@@ -36,7 +36,6 @@ Json api_error(std::exception_ptr error) {
     } catch (const std::invalid_argument &failure) {
         return error_json(400, failure.what());
     } catch (const std::exception &failure) {
-        TTS_LOG(TTS_LOG_ERROR, "http", "inference: {}", failure.what());
         return error_json(422, failure.what());
     } catch (...) {
         return error_json(500, "internal server error");
@@ -96,9 +95,7 @@ struct Server::Impl {
             if (submitted && !terminal) {
                 try {
                     owner.engine.cancel_request(request.request_id);
-                } catch (const std::exception &error) {
-                    TTS_LOG(TTS_LOG_WARN, "http", "cancel failed: {}", error.what());
-                }
+                } catch (const std::exception &) {} // Best effort during teardown.
             }
             std::lock_guard<std::mutex> guard(owner.ownership);
             owner.connections.erase(request.request_id);
@@ -202,9 +199,6 @@ struct Server::Impl {
         http.set_read_timeout(30);
         http.set_write_timeout(30);
         http.set_keep_alive_timeout(5);
-        http.set_start_handler([this] {
-            TTS_LOG(TTS_LOG_INFO, "http", "ready on http://{}:{}", config.host, config.port);
-        });
         http.set_default_headers(
             {{"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}});
         http.set_error_handler([](const httplib::Request &, httplib::Response &response) {
@@ -213,13 +207,8 @@ struct Server::Impl {
                            error_json(response.status, httplib::status_message(response.status)));
         });
         http.set_exception_handler(
-            [](const httplib::Request &, httplib::Response &response, std::exception_ptr error) {
-                try {
-                    std::rethrow_exception(error);
-                } catch (const std::exception &failure) {
-                    TTS_LOG(TTS_LOG_ERROR, "http", "{}", failure.what());
-                    json_reply(response, 500, error_json(500, "internal server error"));
-                }
+            [](const httplib::Request &, httplib::Response &response, std::exception_ptr) {
+                json_reply(response, 500, error_json(500, "internal server error"));
             });
         mount_web_ui(http, config.voice_presets_file);
         http.Get("/health", [this](const httplib::Request &, httplib::Response &response) {

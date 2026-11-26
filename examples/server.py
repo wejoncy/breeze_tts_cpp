@@ -11,7 +11,6 @@ POST /v1/audio/batch: JSON {requests:[{text,instruction?},...], ...options}
 import argparse
 import io
 import json
-import logging
 import threading
 import select
 import socket
@@ -169,10 +168,7 @@ def make_handler(engine, responses):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, format, *args):
-            logging.getLogger("tts.http").info(format, *args)
-
-        def log_error(self, format, *args):
-            logging.getLogger("tts.http").error(format, *args)
+            pass
 
         def setup(self):
             super().setup()
@@ -362,7 +358,6 @@ def make_handler(engine, responses):
                     self.reply(400, {"error": str(exc), "detail": str(exc)})
                 self.close_connection = True
             except Exception as exc:  # noqa: BLE001 -- HTTP request error boundary
-                self.log_error("inference error: %s", exc)
                 if not started:
                     self.reply(422, {"error": str(exc)})
                 self.close_connection = True
@@ -384,6 +379,9 @@ class Server(ThreadingHTTPServer):
         except BaseException:
             self.responses.close()
             raise
+
+    def handle_error(self, request, client_address):
+        pass
 
     def server_close(self):
         self.responses.close()
@@ -426,22 +424,6 @@ def main():
         default="info",
     )
     args = parser.parse_args()
-    severity = {
-        "trace": 5,
-        "debug": 10,
-        "info": 20,
-        "warn": 30,
-        "error": 40,
-        "off": 100,
-    }[args.log_level]
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] [%(component)s] %(message)s",
-            defaults={"component": "http"},
-        )
-    )
-    logging.basicConfig(level=severity, handlers=[handler])
     configure_logging(args.log_level, library=args.library)
     engine = Engine(
         args.library,
@@ -464,7 +446,6 @@ def main():
         buffer_bytes=args.stream_buffer_mb * 1024 * 1024,
     )
     server.daemon_threads = False
-    logging.getLogger("tts.http").info("ready on http://%s:%s", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
