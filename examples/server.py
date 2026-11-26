@@ -169,7 +169,7 @@ def make_handler(engine, responses):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, format, *args):
-            pass
+            logging.getLogger("tts.http").info(format, *args)
 
         def log_error(self, format, *args):
             logging.getLogger("tts.http").error(format, *args)
