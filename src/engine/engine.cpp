@@ -213,7 +213,8 @@ struct Engine::Impl {
                 fail(job, std::make_exception_ptr(std::runtime_error("audio output queue exceeded its buffer limit")));
                 return;
             }
-            const auto &queued = outgoing.frames.emplace_back(std::move(output));
+            auto &queued = outgoing.frames.emplace_back(std::move(output));
+            queued.stats = job->stats();
             outgoing.bytes += bytes;
             metrics.record_output(job->execution_id, samples, queued);
         }
@@ -227,7 +228,6 @@ struct Engine::Impl {
         job->done = true;
         GenerationFrame result;
         result.error = failure;
-        result.stats = job->stats();
         result.done = true;
         result.cancelled = job->cancelled;
         retire(job);
@@ -238,7 +238,6 @@ struct Engine::Impl {
         job->cancelled = job->done = true;
         GenerationFrame result;
         result.done = result.cancelled = true;
-        result.stats = job->stats();
         scheduler->remove(job->execution_id);
         for (auto *queue : {&cpu_preparations, &gpu_preparations})
             queue->erase(std::remove(queue->begin(), queue->end(), job), queue->end());
@@ -251,7 +250,6 @@ struct Engine::Impl {
         if (frame.chunks.empty() && job->completed != job->requests.size())
             return;
         frame.done = job->completed == job->requests.size();
-        frame.stats = job->stats();
         job->done = frame.done;
         if (frame.done) retire(job);
         emit(job, std::move(frame));
@@ -668,6 +666,7 @@ struct Engine::Impl {
         try { runner.abort(); } catch (...) {}
         sampler->discard_after_drain();
         finish_shutdown();
+        log_stats();
         state = State::Stopped;
         Command command;
         while (take_command(command)) execute(std::move(command));

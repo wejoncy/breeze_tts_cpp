@@ -124,8 +124,10 @@ context and quantization options. `--repeat 3` separates cold and warm requests.
 Metrics go to stderr. A request's RTF is the elapsed time since submission divided
 by the duration of PCM emitted so far across its inputs. Each `Avg RTF` report
 averages that ratio across requests with audio that are still in progress or
-finished successfully during the interval. Keep an engine process alive to reuse
-weights, memory and graphs.
+finished successfully during the interval. `Avg TTFA` is the mean time from submission
+to the first nonempty PCM entering the engine output queue, across requests that
+produced their first audio during the reporting interval.
+Keep an engine process alive to reuse weights, memory and graphs.
 
 ## HTTP
 
