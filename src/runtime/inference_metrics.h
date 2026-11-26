@@ -31,7 +31,7 @@ class InferenceMetrics {
     uint64_t audio_samples_ = 0;
     std::unordered_map<uint64_t, uint64_t> request_audio_samples_;
     double request_rtf_sum_ = 0;
-    size_t completed_requests_ = 0;
+    size_t measured_requests_ = 0;
     size_t peak_bytes_ = 0;
     size_t last_active_rows_ = 0;
     bool last_activity_ = false;
@@ -49,8 +49,8 @@ class InferenceMetrics {
         peak_bytes_ = std::max(peak_bytes_, size_t(cache.used_pages) * cache.page_bytes +
                               cache.active_rows * cache.state_bytes);
     }
-    void record_output(uint64_t request, const GenerationFrame &);
-    void retire(uint64_t request) { request_audio_samples_.erase(request); }
+    void record_output(uint64_t request, size_t samples, const GenerationFrame &frame);
+    void record_rtf(uint64_t request, double elapsed_ms);
     void log(const SchedulerStats &, const CacheUsage &, Clock::time_point now);
 };
 } // namespace tts
