@@ -32,6 +32,8 @@ class InferenceMetrics {
     std::unordered_map<uint64_t, uint64_t> request_audio_samples_;
     double request_rtf_sum_ = 0;
     size_t measured_requests_ = 0;
+    double first_audio_ms_sum_ = 0;
+    size_t first_audio_requests_ = 0;
     size_t peak_bytes_ = 0;
     size_t last_active_rows_ = 0;
     bool last_activity_ = false;
@@ -41,7 +43,8 @@ class InferenceMetrics {
         : last_log_(now), sample_rate_(sample_rate) {}
     Clock::time_point next_log() const { return last_log_ + std::chrono::seconds(1); }
     bool should_log(const CacheUsage &cache, Clock::time_point now) const {
-        return now >= next_log() || cache.active_rows != last_active_rows_;
+        return now >= next_log() || cache.active_rows != last_active_rows_ ||
+               (first_audio_requests_ && request_audio_samples_.empty());
     }
     void record(const IterationStats &stats) {
         audio_samples_ += stats.audio_samples;
