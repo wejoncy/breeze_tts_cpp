@@ -41,8 +41,8 @@ struct Engine::Impl {
         size_t completed = 0;
         bool done = false, cancelled = false, released = false, truncated = false;
         bool aborted() const { return cancelled || error; }
-        Stats stats() const {
-            return {std::chrono::duration<double, std::milli>(Clock::now() - submitted).count(),
+        Stats stats(Clock::time_point now = Clock::now()) const {
+            return {std::chrono::duration<double, std::milli>(now - submitted).count(),
                     int(truncated)};
         }
     };
@@ -152,7 +152,6 @@ struct Engine::Impl {
             scheduler->contains(job->execution_id))
             return;
         job->released = true;
-        metrics.retire(job->execution_id);
         model->runner().release_if_idle(job->execution_id);
         execution_jobs.erase(job->execution_id);
         job->plan.reset();
@@ -204,8 +203,9 @@ struct Engine::Impl {
     }
     void emit(const std::shared_ptr<Job> &job, GenerationFrame output) {
         output.request_id = job->request_id;
-        size_t bytes = 0;
-        for (const auto &chunk : output.chunks) bytes += chunk.second.size() * sizeof(int16_t);
+        size_t samples = 0;
+        for (const auto &chunk : output.chunks) samples += chunk.second.size();
+        const size_t bytes = samples * sizeof(int16_t);
         {
             std::unique_lock<std::mutex> lock(outgoing.mutex);
             if (bytes > outgoing.limit - std::min(outgoing.bytes, outgoing.limit)) {
@@ -213,8 +213,9 @@ struct Engine::Impl {
                 fail(job, std::make_exception_ptr(std::runtime_error("audio output queue exceeded its buffer limit")));
                 return;
             }
-            outgoing.frames.push_back(std::move(output));
+            const auto &queued = outgoing.frames.emplace_back(std::move(output));
             outgoing.bytes += bytes;
+            metrics.record_output(job->execution_id, samples, queued);
         }
         outgoing.available.notify_all();
     }
@@ -252,7 +253,6 @@ struct Engine::Impl {
         frame.done = job->completed == job->requests.size();
         frame.stats = job->stats();
         job->done = frame.done;
-        metrics.record_output(job->execution_id, frame);
         if (frame.done) retire(job);
         emit(job, std::move(frame));
     }
@@ -386,6 +386,8 @@ struct Engine::Impl {
         const auto cache = model->runner().cache_usage();
         if (!metrics.should_log(cache, now)) return;
         const auto [running, waiting] = scheduler->request_counts();
+        for (const auto &[id, job] : execution_jobs)
+            metrics.record_rtf(id, job->stats(now).total_ms);
         metrics.log({running, waiting}, cache, now);
     }
     void finish_control(const std::shared_ptr<ControlRequest> &request,

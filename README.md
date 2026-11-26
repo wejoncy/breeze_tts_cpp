@@ -120,8 +120,12 @@ Batch output is `batch.0.wav`, `batch.1.wav`, etc.; lanes have independent EOS.
 Add `--instruction TEXT --cfg-scale 3` for instruction guidance, or
 `--cfg-scale-ref 2 --cfg-scale-ins 3` for independent reference/instruction guidance.
 `--temperature 0` enables greedy sampling. `--help` lists sampling, logging,
-context and quantization options. `--repeat 3` separates cold and warm requests;
-metrics go to stderr. Keep an engine process alive to reuse weights, memory and graphs.
+context and quantization options. `--repeat 3` separates cold and warm requests.
+Metrics go to stderr. A request's RTF is the elapsed time since submission divided
+by the duration of PCM emitted so far across its inputs. Each `Avg RTF` report
+averages that ratio across requests with audio that are still in progress or
+finished successfully during the interval. Keep an engine process alive to reuse
+weights, memory and graphs.
 
 ## HTTP
 
